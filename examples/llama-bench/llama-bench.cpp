@@ -270,6 +270,8 @@ struct cmd_params {
     bool mqkv = false;
     bool muge = false;
     bool rcache = false;
+    bool sas = false;
+    bool print_overrides = false;
     output_formats output_format;
     output_formats output_format_stderr;
 };
@@ -313,6 +315,8 @@ static const cmd_params cmd_params_defaults = {
     /* mqkv                 */ false,
     /* muge                 */ false,
     /* rcache               */ false,
+    /* sas                  */ false,
+    /* print_overrides      */ false,
     /* output_format        */ MARKDOWN,
     /* output_format_stderr */ NONE,
 };
@@ -364,6 +368,8 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -ger, --grouped-expert-routing <0|1>(default: %s)\n", cmd_params_defaults.ger ? "1" : "0");
     printf("  -no-fug, --no-fused-up-gate <0|1>   (default: %s)\n", cmd_params_defaults.no_fug? "1" : "0");
     printf("  -no-ooae, --no-offload-only-active-experts <0|1>   (default: %s)\n", cmd_params_defaults.no_ooae? "1" : "0");
+    printf("  -sas, --scheduler-async <0|1>       (default: %s)\n", cmd_params_defaults.sas ? "1" : "0");
+    printf("        --print-overrides <0|1>       (default: %s)\n", cmd_params_defaults.print_overrides ? "1" : "0");
     printf("\n");
     printf("Multiple values can be given for each parameter by separating them with ',' or by specifying the parameter multiple times.\n");
 }
@@ -798,6 +804,12 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 break;
             }
             params.muge = std::stoi(argv[i]);
+        } else if (arg == "-sas" || arg == "--scheduler-async") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            params.sas = std::stoi(argv[i]);
         } else if (arg == "-rcache" || arg == "--rope-cache") {
             if (++i >= argc) {
                 invalid_param = true;
@@ -853,6 +865,12 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 invalid_param = true;
                 break;
             }
+        } else if (arg == "--print-overrides") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            params.print_overrides = std::stoi(argv[i]);
         } else {
             invalid_param = true;
             break;
@@ -937,6 +955,7 @@ struct cmd_params_instance {
     bool mqkv = false;
     bool muge = false;
     bool rcache = false;
+    bool sas = false;
     const llama_model_tensor_buft_override* buft_overrides;
 
     llama_model_params to_llama_mparams() const {
@@ -996,6 +1015,7 @@ struct cmd_params_instance {
         cparams.thresh_experts = ser.second;
         cparams.embeddings = embeddings;
         cparams.cuda_params = (void *)cuda_params.data();
+        cparams.scheduler_async = sas;
 
         return cparams;
     }
@@ -1061,6 +1081,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .mqkv         = */ params.mqkv,
                 /* .muge         = */ params.muge,
                 /* .rcache       = */ params.rcache,
+                /* .sas          = */ params.sas,
                 /* .buft_overrides=*/ params.buft_overrides.data(),
             };
             instances.push_back(instance);
@@ -1103,6 +1124,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .mqkv         = */ params.mqkv,
                 /* .muge         = */ params.muge,
                 /* .rcache       = */ params.rcache,
+                /* .sas          = */ params.sas,
                 /* .buft_overrides=*/ params.buft_overrides.data(),
             };
             instances.push_back(instance);
@@ -1145,6 +1167,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .mqkv         = */ params.mqkv,
                 /* .muge         = */ params.muge,
                 /* .rcache       = */ params.rcache,
+                /* .sas          = */ params.sas,
                 /* .buft_overrides=*/ params.buft_overrides.data(),
             };
             instances.push_back(instance);
@@ -1187,6 +1210,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .mqkv         = */ params.mqkv,
                 /* .muge         = */ params.muge,
                 /* .rcache       = */ params.rcache,
+                /* .sas          = */ params.sas,
                 /* .buft_overrides=*/ params.buft_overrides.data(),
             };
             instances.push_back(instance);
@@ -1240,6 +1264,7 @@ struct test {
     bool mqkv = false;
     bool muge = false;
     bool rcache = false;
+    bool sas = false;
     std::string override_tensor;
     int n_prompt;
     int n_gen;
@@ -1280,6 +1305,7 @@ struct test {
         fmoe = inst.fmoe;
         ger = inst.ger;
         rcache = inst.rcache;
+        sas = inst.sas;
         no_fug = inst.no_fug;
         use_thp = inst.use_thp;
         no_ooae = inst.no_ooae;
@@ -1376,25 +1402,6 @@ struct test {
         return "CPU";
     }
 
-    static const std::vector<std::string> & get_fields() {
-        static const std::vector<std::string> fields = {
-            "build_commit", "build_number",
-            "cuda", "vulkan", "kompute", "metal", "sycl", "rpc", "gpu_blas", "blas",
-            "cpu_info", "gpu_info",
-            "model_filename", "model_type", "model_size", "model_n_params",
-            "n_batch", "n_ubatch",
-            "n_threads", "type_k", "type_v",
-            "n_gpu_layers", "split_mode",
-            "main_gpu", "no_kv_offload", "flash_attn", "mla_attn", "attn_max_batch", "ser", "reuse",
-            "tensor_split", "use_mmap", "embeddings", "repack", "mqkv", "muge", "fused_moe", "grouped_er",
-            "no_fused_up_gate", "use_thp", "no_ooae", "rcache", "cuda_params", "override_tensor",
-            "n_prompt", "n_gen", "test_time",
-            "avg_ns", "stddev_ns",
-            "avg_ts", "stddev_ts", "test",
-        };
-        return fields;
-    }
-
     enum field_type {STRING, BOOL, INT, FLOAT};
 
     static field_type get_field_type(const std::string & field) {
@@ -1410,7 +1417,7 @@ struct test {
             field == "gpu_blas" || field == "blas" || field == "sycl" || field == "no_kv_offload" ||
             field == "flash_attn" || field == "use_mmap" || field == "embeddings" || field == "repack" || field == "use_thp" ||
             field == "fused_moe" || field == "grouped_er" || field == "no_fused_up_gate" || field == "no_ooae" || field == "mqkv" ||
-            field == "rcache" || field == "reuse" || field == "muge") {
+            field == "rcache" || field == "reuse" || field == "muge" || field == "sas") {
             return BOOL;
         }
         if (field == "avg_ts" || field == "stddev_ts") {
@@ -1454,7 +1461,7 @@ struct test {
             std::to_string(mla_attn), std::to_string(attn_max_batch), ser_to_string(ser), std::to_string(reuse),
             tensor_split_str, std::to_string(use_mmap), std::to_string(embeddings),
             std::to_string(repack), std::to_string(mqkv), std::to_string(muge), std::to_string(fmoe), std::to_string(ger),
-            std::to_string(no_fug), std::to_string(use_thp), std::to_string(no_ooae), std::to_string(rcache),
+            std::to_string(no_fug), std::to_string(use_thp), std::to_string(no_ooae), std::to_string(rcache), std::to_string(sas),
             cuda_params, override_tensor,
             std::to_string(n_prompt), std::to_string(n_gen), test_time,
             std::to_string(avg_ns()), std::to_string(stdev_ns()),
@@ -1462,6 +1469,25 @@ struct test {
             test_label
         };
         return values;
+    }
+
+    static const std::vector<std::string> & get_fields() {
+        static const std::vector<std::string> fields = {
+            "build_commit", "build_number",
+            "cuda", "vulkan", "kompute", "metal", "sycl", "rpc", "gpu_blas", "blas",
+            "cpu_info", "gpu_info",
+            "model_filename", "model_type", "model_size", "model_n_params",
+            "n_batch", "n_ubatch",
+            "n_threads", "type_k", "type_v",
+            "n_gpu_layers", "split_mode",
+            "main_gpu", "no_kv_offload", "flash_attn", "mla_attn", "attn_max_batch", "ser", "reuse",
+            "tensor_split", "use_mmap", "embeddings", "repack", "mqkv", "muge", "fused_moe", "grouped_er",
+            "no_fused_up_gate", "use_thp", "no_ooae", "rcache", "sas", "cuda_params", "override_tensor",
+            "n_prompt", "n_gen", "test_time",
+            "avg_ns", "stddev_ns",
+            "avg_ts", "stddev_ts", "test",
+        };
+        return fields;
     }
 
     std::map<std::string, std::string> get_map() const {
@@ -1586,6 +1612,7 @@ struct json_printer : public printer {
 
 struct markdown_printer : public printer {
     std::vector<std::string> fields;
+    bool skipped_overrides = false;
 
     static int get_field_width(const std::string & field) {
         if (field == "model") {
@@ -1641,6 +1668,9 @@ struct markdown_printer : public printer {
         }
         if (field == "muge") {
             return 4;
+        }
+        if (field == "sas") {
+            return 3;
         }
         if (field == "use_thp") {
             return 3;
@@ -1711,6 +1741,9 @@ struct markdown_printer : public printer {
         }
         if (field == "muge") {
             return "muge";
+        }
+        if (field == "sas") {
+            return "sas";
         }
         if (field == "use_thp") {
             return "thp";
@@ -1807,13 +1840,20 @@ struct markdown_printer : public printer {
             fields.emplace_back("cuda_params");
         }
         if (!(params.buft_overrides == cmd_params_defaults.buft_overrides)) {
-            fields.emplace_back("override_tensor");
+            if (params.print_overrides) {
+                fields.emplace_back("override_tensor");
+            } else {
+                skipped_overrides = true;
+            }
         }
         if (params.repack != cmd_params_defaults.repack) {
             fields.emplace_back("repack");
         }
         if (params.mqkv != cmd_params_defaults.mqkv) {
             fields.emplace_back("mqkv");
+        }
+        if (params.sas != cmd_params_defaults.sas) {
+            fields.emplace_back("sas");
         }
         if (params.muge != cmd_params_defaults.muge) {
             fields.emplace_back("muge");
@@ -1857,6 +1897,9 @@ struct markdown_printer : public printer {
 
         fprintf(fout, "|");
         for (const auto & field : fields) {
+            if (skipped_overrides && field == "override_tensor") {
+                continue;
+            }
             std::string value;
             char buf[128];
             if (field == "model") {
