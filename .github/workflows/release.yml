@@ -53,7 +53,6 @@ jobs:
             -DCMAKE_INSTALL_RPATH='@loader_path' \
             -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
             -DLLAMA_FATAL_WARNINGS=OFF \
-            -DBUILD_SHARED_LIBS=OFF \
             -DGGML_OPENMP=ON \
             -DGGML_METAL_USE_BF16=ON \
             -DGGML_METAL_EMBED_LIBRARY=ON \
@@ -70,6 +69,7 @@ jobs:
         id: pack_artifacts
         run: |
           cp LICENSE ./build/bin/
+          find build -type f -name "*.dylib" -exec mv {} ./build/bin/ \;
           zip -r llama-${{ steps.tag.outputs.name }}-bin-macos-arm64.zip ./build/bin/*
 
       - name: Upload artifacts
@@ -116,7 +116,6 @@ jobs:
             -DCMAKE_INSTALL_RPATH='@loader_path' \
             -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
             -DLLAMA_FATAL_WARNINGS=OFF \
-            -DBUILD_SHARED_LIBS=OFF \
             -DGGML_OPENMP=ON \
             -DGGML_AVX=${{ matrix.instr == 'avx' && 'ON' || 'OFF' }} \
             -DGGML_AVX2=${{ (matrix.instr == 'avx2' || matrix.instr == 'avx512' || matrix.instr == 'avx512_vnni' || matrix.instr == 'avx512_vnni_vbmi' || matrix.instr == 'avx512_vnni_bf16' || matrix.instr == 'avx512_vnni_vbmi_bf16') && 'ON' || 'OFF' }} \
@@ -140,6 +139,7 @@ jobs:
         id: pack_artifacts
         run: |
           cp LICENSE ./build/bin/
+          find build -type f -name "*.dylib" -exec mv {} ./build/bin/ \;
           zip -r llama-${{ steps.tag.outputs.name }}-bin-macos-x64-${{ matrix.instr }}.zip ./build/bin/*
 
       - name: Upload artifacts
@@ -188,7 +188,6 @@ jobs:
             -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
             -DGGML_NATIVE=OFF \
             -DLLAMA_FATAL_WARNINGS=OFF \
-            -DBUILD_SHARED_LIBS=OFF \
             -DGGML_OPENMP=ON \
             -DGGML_AVX=${{ matrix.instr == 'avx' && 'ON' || 'OFF' }} \
             -DGGML_AVX2=${{ (matrix.instr == 'avx2' || matrix.instr == 'avx512' || matrix.instr == 'avx512_vnni' || matrix.instr == 'avx512_vnni_vbmi' || matrix.instr == 'avx512_vnni_bf16' || matrix.instr == 'avx512_vnni_vbmi_bf16') && 'ON' || 'OFF' }} \
@@ -242,6 +241,7 @@ jobs:
         id: pack_artifacts
         run: |
           cp LICENSE ./build/bin/
+          find build -type f -name "*.so" -exec mv {} ./build/bin/ \;
           zip -r llama-${{ steps.tag.outputs.name }}-bin-ubuntu-${{ matrix.build }}-${{ matrix.instr }}.zip ./build/bin/*
 
       - name: Upload artifacts
@@ -293,7 +293,6 @@ jobs:
             -DGGML_BACKEND_DL=ON \
             -DGGML_NATIVE=OFF \
             -DLLAMA_FATAL_WARNINGS=OFF \
-            -DBUILD_SHARED_LIBS=OFF \
             -DGGML_OPENMP=ON \
             -DGGML_AVX=${{ matrix.instr == 'avx' && 'ON' || 'OFF' }} \
             -DGGML_AVX2=${{ (matrix.instr == 'avx2' || matrix.instr == 'avx512' || matrix.instr == 'avx512_vnni' || matrix.instr == 'avx512_vnni_vbmi' || matrix.instr == 'avx512_vnni_bf16' || matrix.instr == 'avx512_vnni_vbmi_bf16') && 'ON' || 'OFF' }} \
@@ -349,6 +348,7 @@ jobs:
         id: pack_artifacts
         run: |
           cp LICENSE ./build/bin/
+          find build -type f -name "*.so" -exec mv {} ./build/bin/ \;
           zip -r llama-${{ steps.tag.outputs.name }}-bin-ubuntu-vulkan-${{ matrix.build }}-${{ matrix.instr }}.zip ./build/bin/*
 
       - name: Upload artifacts
@@ -401,7 +401,6 @@ jobs:
             -DGGML_NATIVE=OFF \
             -DGGML_BACKEND_DL=ON \
             -DLLAMA_FATAL_WARNINGS=OFF \
-            -DBUILD_SHARED_LIBS=OFF \
             -DGGML_OPENMP=ON \
             -DGGML_AVX=${{ matrix.instr == 'avx' && 'ON' || 'OFF' }} \
             -DGGML_AVX2=${{ (matrix.instr == 'avx2' || matrix.instr == 'avx512' || matrix.instr == 'avx512_vnni' || matrix.instr == 'avx512_vnni_vbmi' || matrix.instr == 'avx512_vnni_bf16' || matrix.instr == 'avx512_vnni_vbmi_bf16') && 'ON' || 'OFF' }} \
@@ -459,6 +458,7 @@ jobs:
         id: pack_artifacts
         run: |
           cp LICENSE ./build/bin/
+          find build -type f -name "*.so" -exec mv {} ./build/bin/ \;
           zip -r llama-${{ steps.tag.outputs.name }}-bin-ubuntu-cuda-${{ matrix.cuda }}-${{ matrix.build }}-${{ matrix.instr }}.zip ./build/bin/*
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
