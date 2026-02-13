@@ -647,6 +647,12 @@ struct kv_receiver_service::impl {
             }
             return false;
         }
+        if (cfg.slot_id < 0) {
+            if (error) {
+                *error = "invalid kv receiver slot id: " + std::to_string(cfg.slot_id);
+            }
+            return false;
+        }
 
         {
             std::lock_guard<std::mutex> lock(runtime_mutex);
@@ -673,6 +679,8 @@ struct kv_receiver_service::impl {
 #else
         config = cfg;
         config.transport_mode = normalized_mode;
+        config.max_connections = std::max<int32_t>(1, config.max_connections);
+        config.idle_timeout_sec = std::max<int32_t>(1, config.idle_timeout_sec);
         config.output_dir = default_output_dir(config);
 
         std::error_code ec;
