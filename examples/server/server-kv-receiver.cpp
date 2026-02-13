@@ -90,6 +90,7 @@ struct session_state {
     uint64_t bytes_received = 0;
     uint64_t chunks_received = 0;
     uint64_t bad_crc_chunks = 0;
+    uint64_t expected_chunks = 0;
     uint64_t first_frame_unix_us = 0;
     uint64_t last_frame_unix_us = 0;
 
@@ -863,6 +864,7 @@ struct kv_receiver_service::impl {
             ss.bytes_received = s->bytes_received;
             ss.chunks_received = s->chunks_received;
             ss.bad_crc_chunks = s->bad_crc_chunks;
+            ss.expected_chunks = s->expected_chunks;
             ss.expected_streams = s->expected_streams;
             ss.seen_streams = (int32_t) s->seen_stream_ids.size();
             ss.done_streams = (int32_t) s->done_stream_ids.size();
@@ -1085,29 +1087,54 @@ struct kv_receiver_service::impl {
             return false;
         }
 
-        if (header.payload_size > bytes.size()) {
+        const uint64_t payload_u64 = header.payload_size;
+        if (payload_u64 > bytes.size()) {
             if (error) {
                 *error = "artifact payload_size exceeds file size";
             }
             return false;
         }
-        const size_t payload_offset = bytes.size() - (size_t) header.payload_size;
-        if (payload_offset > bytes.size()) {
-            if (error) {
-                *error = "invalid payload offset";
+        const size_t payload_size = (size_t) payload_u64;
+
+        std::vector<size_t> offsets;
+        offsets.reserve(4);
+        offsets.push_back(sizeof(ik_kva_header_t));
+        offsets.push_back(44u); // RTX fixed header
+        offsets.push_back(48u); // RTX padded header
+        offsets.push_back(bytes.size() - payload_size);
+
+        std::string last_err = "no valid payload offset candidate";
+        for (size_t off : offsets) {
+            if (off > bytes.size() || payload_size > bytes.size() - off) {
+                continue;
             }
-            return false;
-        }
-        const uint8_t * payload_ptr = bytes.data() + payload_offset;
-        const size_t payload_size = (size_t) header.payload_size;
-        if (!ik_kv_source_validate_payload(&header, payload_ptr, payload_size)) {
-            if (error) {
-                *error = "payload CRC/size validation failed";
+
+            const uint8_t * payload_ptr = bytes.data() + off;
+            const size_t available = bytes.size() - off;
+
+            if (!ik_kv_source_validate_payload(&header, payload_ptr, available)) {
+                last_err = "payload CRC/size validation failed";
+                continue;
             }
-            return false;
+
+            ik_kv_source_descriptor_t src_desc = {};
+            ik_kv_compat_reject_reason_t src_reject = IK_KV_COMPAT_REJECT_NONE;
+            const ik_kv_compat_convert_result_t src_rc = ik_kv_source_parse_prefill_seq_state(
+                &header, payload_ptr, available, &src_desc, &src_reject);
+            if (src_rc != IK_KV_COMPAT_CONVERT_OK) {
+                last_err = "payload parse failed at candidate offset " + std::to_string(off) +
+                           ": rc=" + std::string(ik_kv_compat_result_str(src_rc)) +
+                           ", reject=" + std::string(ik_kv_compat_reject_str(src_reject));
+                continue;
+            }
+
+            return true;
         }
 
-        return true;
+        if (error) {
+            *error = last_err;
+        }
+        return false;
     }
 
     void write_session_summary(const std::shared_ptr<session_state> & session) {
@@ -1118,6 +1145,7 @@ struct kv_receiver_service::impl {
             ss.bytes_received = session->bytes_received;
             ss.chunks_received = session->chunks_received;
             ss.bad_crc_chunks = session->bad_crc_chunks;
+            ss.expected_chunks = session->expected_chunks;
             ss.expected_streams = session->expected_streams;
             ss.seen_streams = (int32_t) session->seen_stream_ids.size();
             ss.done_streams = (int32_t) session->done_stream_ids.size();
@@ -1143,6 +1171,7 @@ struct kv_receiver_service::impl {
             {"bytes_received", ss.bytes_received},
             {"chunks_received", ss.chunks_received},
             {"bad_crc_chunks", ss.bad_crc_chunks},
+            {"expected_chunks", ss.expected_chunks},
             {"expected_streams", ss.expected_streams},
             {"seen_streams", ss.seen_streams},
             {"done_streams", ss.done_streams},
@@ -1217,6 +1246,16 @@ struct kv_receiver_service::impl {
                 *error = "no chunk files available for session";
             }
             return false;
+        }
+        {
+            std::lock_guard<std::mutex> lock(session->mutex);
+            if (session->expected_chunks > 0 && chunk_files.size() < session->expected_chunks) {
+                if (error) {
+                    *error = "incomplete chunk set: got " + std::to_string(chunk_files.size()) +
+                             " expected " + std::to_string(session->expected_chunks);
+                }
+                return false;
+            }
         }
 
         const fs::path temp_path = session->artifact_path.string() + ".tmp";
@@ -1438,7 +1477,28 @@ struct kv_receiver_service::impl {
                 }
             } break;
             case TBP_MSG_KV_SEGMENT_END:
-                break;
+            {
+                const auto kv = parse_sc_kv(frame.payload);
+                uint64_t parsed_chunks_sent = 0;
+
+                auto parse_chunks = [&](const char * key) {
+                    auto it = kv.find(key);
+                    if (it == kv.end()) {
+                        return false;
+                    }
+                    try {
+                        parsed_chunks_sent = (uint64_t) std::stoull(it->second);
+                        return true;
+                    } catch (...) {
+                        return false;
+                    }
+                };
+
+                if (parse_chunks("chunks_sent") || parse_chunks("chunks")) {
+                    std::lock_guard<std::mutex> lock(session->mutex);
+                    session->expected_chunks = std::max(session->expected_chunks, parsed_chunks_sent);
+                }
+            } break;
             case TBP_MSG_KV_DONE:
             {
                 {

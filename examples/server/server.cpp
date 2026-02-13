@@ -783,6 +783,7 @@ int main(int argc, char ** argv) {
                 {"bytes_received", ss.bytes_received},
                 {"chunks_received", ss.chunks_received},
                 {"bad_crc_chunks", ss.bad_crc_chunks},
+                {"expected_chunks", ss.expected_chunks},
                 {"expected_streams", ss.expected_streams},
                 {"seen_streams", ss.seen_streams},
                 {"done_streams", ss.done_streams},
