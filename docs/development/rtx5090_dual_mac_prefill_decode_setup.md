@@ -226,4 +226,5 @@ Operational notes:
 
 1. `prefill-worker` advances jobs to `artifact_ready`; `handoff-worker` drains `artifact_ready` one-at-a-time.
 2. Handoff retry does not recompute prefill; it reuses persisted artifact path.
-3. Current Phase-2 handoff script replays via TCP (`tbp_replay_to_kv_receiver.py`); for strict live RDMA-path validation, keep using direct prefill sender handoff flow.
+3. Phase-2 handoff replay supports `--kv-transport auto|rdma|tcp|mixed` plus fallback control, and maps `rdma` mode to RDMA endpoint/bind-address environment (`LLAMA_PREFILL_KV_RDMA_*`).
+4. For strict live kernel-level RDMA-verbs validation, keep using direct prefill sender handoff flow.

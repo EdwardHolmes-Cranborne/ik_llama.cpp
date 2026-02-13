@@ -245,5 +245,6 @@ cd /path/to/ik_llama.cpp
 3. Transport/crossover consistency check:
 
 - Submit with `--kv-transport tcp`, then `rdma`, then `auto`.
+- For strict mode checks, include `--no-kv-transport-fallback`; then repeat with fallback enabled.
 - Keep `--prefill-min-stream-batch-tokens -1`.
 - Verify expected state progression and no compatibility regressions (`N_STREAM_UNSUPPORTED`, graph-split restore errors).

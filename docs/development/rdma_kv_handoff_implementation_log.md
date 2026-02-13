@@ -79,6 +79,11 @@
      `scripts/test_prefill_decode_phase2_pipeline.sh`.
    - Added new operator guide:
      `docs/development/prefill_decode_phase2_pipeline.md`.
+18. Added transport-aware replay controls for Phase-2 artifact handoff:
+   - `scripts/tbp_replay_to_kv_receiver.py` now supports `--transport-mode auto|rdma|tcp|mixed|disabled` and `--transport-fallback`.
+   - Replay now resolves mode-specific endpoints/bind addresses (`LLAMA_PREFILL_KV_RDMA_*`, `LLAMA_PREFILL_KV_TCP_*`, `LLAMA_PREFILL_KV_*`) and reports resolved transport metadata.
+   - Queue submit now tracks `kv_transport_fallback`; Phase-2 prefill/handoff wrappers consume and enforce both mode and fallback.
+   - Phase-2 self-test now validates handoff flag propagation for `rdma` mode and no-fallback path.
 
 ### Commits produced
 
@@ -123,4 +128,4 @@
 3. Decode quality and first-token parity reporting against local baseline.
 4. Throughput and latency baselining for `tcp` vs `rdma` mode selection on the real USB4/TB fabric.
 5. Execute and archive the single-machine buffered suite on real model artifacts (requires local socket/model runtime; not runnable in this sandbox).
-6. Add native RDMA replay client path for Phase-2 artifact handoff (current replay helper is TCP socket based).
+6. Add kernel-verbs-native RDMA replay client path for Phase-2 artifact handoff (current replay helper uses TBP socket transport with RDMA-mode endpoint/bind semantics).

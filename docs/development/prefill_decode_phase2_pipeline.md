@@ -83,8 +83,9 @@ Submit additional prompts while decode is busy; they can advance to `artifact_re
    - keep `--kv-streams 1`
    - for decode `--split-mode graph`, keep `--flash-attn` enabled
 3. Phase-2 handoff stage uses replay utility `scripts/tbp_replay_to_kv_receiver.py`.
-   - Current replay utility is TCP socket based.
-   - For strict live RDMA path validation, continue using direct prefill handoff flow (Phase-1 wrapper / direct sender path).
+   - Replay now accepts `--transport-mode auto|rdma|tcp|mixed` plus `--transport-fallback`.
+   - `rdma` mode uses RDMA endpoint/bind-address resolution semantics (`LLAMA_PREFILL_KV_RDMA_*`) with TBP socket transport.
+   - For strict live kernel-level RDMA-verbs validation, continue using direct prefill handoff flow (Phase-1 wrapper / direct sender path).
 
 ## Test
 
