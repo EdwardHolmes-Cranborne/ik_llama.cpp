@@ -26,6 +26,12 @@
    - `GET /kv-receiver/status` endpoint
 6. Added receiver transport validation mode:
    - `--kv-recv-dry-run` reassembles/validates artifacts without consuming slot restore.
+7. Added receiver artifact/header compatibility and chunk integrity hardening:
+   - Accepts RTX/IK header layout variants during payload validation.
+   - Parses `chunks_sent` from `TBP_MSG_KV_SEGMENT_END` and enforces expected chunk count.
+8. Added receiver payload-byte completeness enforcement:
+   - Parses expected payload bytes from session/segment metadata.
+   - Verifies reassembled artifact byte size before validation/restore queueing.
 
 ### Commits produced
 
@@ -34,6 +40,8 @@
 - `45be6445` Validate KV receiver slot and sanitize runtime limits
 - `e4a059d9` Add KV receiver dry-run mode and status telemetry endpoint
 - `aec132a0` Add RTX5090 dual-Mac deployment and test guides
+- `6844c1fb` Harden KV receiver chunk completeness and payload parsing
+- `9979071b` Track expected KV payload bytes for receiver validation
 
 ### Verification completed
 
