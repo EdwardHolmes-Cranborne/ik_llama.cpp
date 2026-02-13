@@ -127,6 +127,8 @@ Built-in self-test:
 - Worker lock enforces one active job.
 - Queue size and spool-byte limits can be enforced via `config.json`.
 - Runner logs are persisted under `runs/<job_id>/worker_stream.log`.
+- Worker launch exceptions are captured and persisted in `result.runner_exception`
+  with `return_code=127`; jobs retry/fail cleanly instead of being left active.
 - External command mode guardrails (enabled by default):
   - reject `--kv-streams` values other than `1`
   - reject `--split-mode graph` unless `--flash-attn` is present

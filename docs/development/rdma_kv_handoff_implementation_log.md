@@ -65,6 +65,10 @@
    - Added queue-mode usage and validation sections to dual-Mac setup/test guides.
    - Buffered E2E runner now supports threshold-preserving prefill mode selection:
      `--prefill-min-stream-batch-tokens` (default `-1`, runtime crossover logic).
+16. Hardened Phase-1 queue worker launch-failure handling:
+   - Worker now catches external runner launch exceptions (e.g. missing binary) and records error context.
+   - Failed launch paths now store `result.runner_exception`, persist worker stream logs, and transition to retry/failed states correctly.
+   - Queue self-test now covers unlaunchable command path to prevent regressions.
 
 ### Commits produced
 
@@ -93,6 +97,7 @@
    - `python3 -m py_compile scripts/tbp_replay_to_kv_receiver.py` passes.
    - `bash -n scripts/run_single_machine_buffered_e2e.sh` passes.
    - `scripts/* --help` smoke checks pass.
+   - `scripts/test_prefill_decode_job_queue.sh` passes including launch-failure state transition checks.
 
 ### Remaining work for full gate closure
 
