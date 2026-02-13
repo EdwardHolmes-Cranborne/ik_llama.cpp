@@ -36,6 +36,9 @@
    - When `--kv-recv-no-nack-on-crc-bad` is set, receiver no longer sends false positive ACKs on CRC-bad chunks.
 10. Tightened chunk-set completeness enforcement:
    - Receiver now enforces exact chunk-count match (`got == expected`) when `chunks_sent` metadata is present.
+11. Improved ACK semantics and persistence safety:
+   - Receiver now honors sender `ack_required` metadata and can suppress ACK/NACK chatter for no-ack sessions.
+   - Receiver now returns `nack=io` when chunk persistence fails, allowing sender retransmit instead of silent bad ACK.
 
 ### Commits produced
 
@@ -48,6 +51,7 @@
 - `9979071b` Track expected KV payload bytes for receiver validation
 - `efcd76cf` Avoid false ACKs on CRC failures when NACKs are disabled
 - `d3e9e38c` Enforce strict expected chunk count on KV reassembly
+- `eaed6ee0` Honor sender ACK policy and NACK on chunk persistence errors
 
 ### Verification completed
 
