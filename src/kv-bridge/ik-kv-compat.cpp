@@ -867,7 +867,7 @@ void ik_kv_bridge_get_config(ik_kv_bridge_config_t * config) {
 }
 
 //
-// Source parsing (KVB-002) - Stub implementation
+// Source parsing (KVB-002)
 //
 
 ik_kv_compat_convert_result_t ik_kv_source_parse_kva_header(
@@ -979,7 +979,7 @@ bool ik_kv_source_validate_payload(
 }
 
 //
-// Destination introspection (KVB-003) - Stub implementation
+// Destination introspection (KVB-003)
 //
 
 ik_kv_compat_convert_result_t ik_kv_dest_introspect_from_ctx(
@@ -1050,7 +1050,7 @@ ik_kv_compat_convert_result_t ik_kv_dest_introspect_from_model(
 }
 
 //
-// Compatibility plan key and fingerprinting (KVB-004) - Stub
+// Compatibility plan key and fingerprinting (KVB-004)
 //
 
 ik_kv_compat_convert_result_t ik_kv_compat_plan_key_build(
@@ -1139,7 +1139,7 @@ int ik_kv_fingerprint_compare(
 }
 
 //
-// Plan building (KVB-005) - Stub
+// Plan building (KVB-005)
 //
 
 ik_kv_compat_convert_result_t ik_kv_compat_plan_build_strict_v1(
@@ -1281,7 +1281,7 @@ bool ik_kv_compat_plan_validate(
 }
 
 //
-// Plan cache (KVB-006) - Stub
+// Plan cache (KVB-006)
 //
 
 ik_kv_compat_convert_result_t ik_kv_plan_cache_load(
@@ -1453,7 +1453,7 @@ void ik_kv_plan_cache_clear(void) {
 }
 
 //
-// Conversion runtime (KVB-007) - Stub
+// Conversion runtime (KVB-007)
 //
 
 ik_kv_compat_convert_result_t ik_kv_convert_prefill_to_ik_seq_blob(
@@ -1522,7 +1522,7 @@ size_t ik_kv_convert_get_output_size(
 }
 
 //
-// Decode import hook (KVB-008) - Stub
+// Decode import hook (KVB-008)
 //
 
 ik_kv_compat_convert_result_t ik_kv_import_into_context(
