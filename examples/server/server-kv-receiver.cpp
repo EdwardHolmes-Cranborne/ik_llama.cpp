@@ -622,8 +622,13 @@ struct kv_receiver_service::impl {
     int listen_fd = -1;
     std::thread accept_thread;
 
+    struct worker_entry {
+        std::thread worker;
+        std::shared_ptr<std::atomic<bool>> done;
+    };
+
     std::mutex workers_mutex;
-    std::vector<std::thread> workers;
+    std::vector<worker_entry> workers;
 
     std::mutex conn_mutex;
     std::set<int> active_connections;
@@ -757,9 +762,9 @@ struct kv_receiver_service::impl {
 
         {
             std::lock_guard<std::mutex> lock(workers_mutex);
-            for (auto & t : workers) {
-                if (t.joinable()) {
-                    t.join();
+            for (auto & entry : workers) {
+                if (entry.worker.joinable()) {
+                    entry.worker.join();
                 }
             }
             workers.clear();
@@ -778,11 +783,27 @@ struct kv_receiver_service::impl {
     }
 
 #ifndef _WIN32
+    void release_connection_fd(int fd) {
+        bool should_close = false;
+        {
+            std::lock_guard<std::mutex> lock(conn_mutex);
+            auto it = active_connections.find(fd);
+            if (it != active_connections.end()) {
+                active_connections.erase(it);
+                should_close = true;
+            }
+        }
+        if (should_close) {
+            close_fd(fd);
+        }
+    }
+
     void close_active_connections() {
         std::vector<int> fds;
         {
             std::lock_guard<std::mutex> lock(conn_mutex);
             fds.assign(active_connections.begin(), active_connections.end());
+            active_connections.clear();
         }
 
         for (int fd : fds) {
@@ -791,8 +812,25 @@ struct kv_receiver_service::impl {
         }
     }
 
+    void reap_worker_threads() {
+        std::lock_guard<std::mutex> lock(workers_mutex);
+        auto it = workers.begin();
+        while (it != workers.end()) {
+            if (it->done && it->done->load()) {
+                if (it->worker.joinable()) {
+                    it->worker.join();
+                }
+                it = workers.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
     void accept_loop() {
         while (!stop_requested.load()) {
+            reap_worker_threads();
+
             const int current_listen_fd = listen_fd;
             if (current_listen_fd < 0) {
                 break;
@@ -851,8 +889,15 @@ struct kv_receiver_service::impl {
 
                 configure_accepted_socket(fd, config);
 
+                auto done = std::make_shared<std::atomic<bool>>(false);
                 std::lock_guard<std::mutex> lock(workers_mutex);
-                workers.emplace_back([this, fd]() { connection_loop(fd); });
+                workers.push_back(worker_entry{
+                    std::thread([this, fd, done]() {
+                        connection_loop(fd);
+                        done->store(true);
+                    }),
+                    done,
+                });
             }
         }
     }
@@ -1147,11 +1192,7 @@ struct kv_receiver_service::impl {
             process_frame(fd, frame);
         }
 
-        {
-            std::lock_guard<std::mutex> lock(conn_mutex);
-            active_connections.erase(fd);
-        }
-        close_fd(fd);
+        release_connection_fd(fd);
     }
 
 #endif
