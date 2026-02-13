@@ -50,6 +50,16 @@ Expected:
 - `artifacts_validated` increases
 - `restore_tasks_skipped_dry_run` increases
 - `sessions[].validation_ok == true`
+- `sessions[].expected_chunks > 0`
+- `sessions[].expected_payload_bytes > 0`
+- `sessions[].expected_payload_bytes == sessions[].bytes_received` for no-retransmit runs
+
+Inspect latest session quickly:
+
+```bash
+curl -s http://10.40.0.20:8080/kv-receiver/status \
+  | jq '.sessions | sort_by(.session_id) | last'
+```
 
 ## 3. Full handoff validation (restore enabled)
 
@@ -66,6 +76,7 @@ Expected:
 - `restore_tasks_enqueued` increases
 - `sessions[].restore_enqueued == true`
 - no new `validation_error`
+- `sessions[].expected_chunks` / `sessions[].expected_payload_bytes` stay non-zero
 
 Also verify decode server still responds:
 
