@@ -32,7 +32,8 @@
 - `47115392` Add KV handoff receiver transport config and server listener
 - `a81fac07` Harden KV receiver worker lifecycle and socket shutdown
 - `45be6445` Validate KV receiver slot and sanitize runtime limits
-- `<pending in working tree>` receiver dry-run/stats/status endpoint/docs
+- `e4a059d9` Add KV receiver dry-run mode and status telemetry endpoint
+- `aec132a0` Add RTX5090 dual-Mac deployment and test guides
 
 ### Verification completed
 
