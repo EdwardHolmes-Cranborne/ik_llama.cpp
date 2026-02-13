@@ -31,6 +31,8 @@ From `ik_llama.cpp` repo root:
   --rtx-repo /path/to/RTX_ACCELERATED_MAC_PREFILL_LLAMA
 ```
 
+By default the runner uses `--prefill-min-stream-batch-tokens -1` to preserve runtime crossover/threshold behavior.
+
 ## Outputs
 
 The suite writes a timestamped output directory under `/tmp/ik_rtx_single_machine_buffered_e2e_*` containing:

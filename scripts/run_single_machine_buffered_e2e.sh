@@ -16,6 +16,7 @@ BUFFER_PORT=29001
 CTX_SIZE=8192
 PREFILL_N_PREDICT=8
 DECODE_N_PREDICT=16
+PREFILL_MIN_STREAM_BATCH_TOKENS=-1
 KV_CHUNK_BYTES=$((4 * 1024 * 1024))
 KV_MAX_INFLIGHT=$((256 * 1024 * 1024))
 LOOPBACK_IDLE_TIMEOUT=20
@@ -40,6 +41,8 @@ Optional:
   --buffer-port N             loopback disk-buffer port (default: 29001)
   --ctx-size N                context size for both runs (default: 8192)
   --prefill-n-predict N       prefill CLI generation tokens (default: 8)
+  --prefill-min-stream-batch-tokens N
+                              prefill streaming threshold (-1 = runtime auto/crossover)
   --decode-n-predict N        decode validation request tokens (default: 16)
   --kv-chunk-bytes N          replay/send chunk size (default: 4194304)
   --kv-max-inflight N         sender in-flight window bytes (default: 268435456)
@@ -73,6 +76,7 @@ while [[ $# -gt 0 ]]; do
         --buffer-port) BUFFER_PORT="$2"; shift 2 ;;
         --ctx-size) CTX_SIZE="$2"; shift 2 ;;
         --prefill-n-predict) PREFILL_N_PREDICT="$2"; shift 2 ;;
+        --prefill-min-stream-batch-tokens) PREFILL_MIN_STREAM_BATCH_TOKENS="$2"; shift 2 ;;
         --decode-n-predict) DECODE_N_PREDICT="$2"; shift 2 ;;
         --kv-chunk-bytes) KV_CHUNK_BYTES="$2"; shift 2 ;;
         --kv-max-inflight) KV_MAX_INFLIGHT="$2"; shift 2 ;;
@@ -208,7 +212,7 @@ LLAMA_PREFILL_TB_ENABLE=1 \
   -c "${CTX_SIZE}" \
   -n "${PREFILL_N_PREDICT}" \
   -ps --prefill-overlap \
-  --prefill-min-stream-batch-tokens 1 \
+  --prefill-min-stream-batch-tokens "${PREFILL_MIN_STREAM_BATCH_TOKENS}" \
   --decode-mode split_thunderbolt \
   --decode-remote-layers 1 \
   --prefill-decode-transport-required \

@@ -52,6 +52,11 @@
    - New replay utility: `scripts/tbp_replay_to_kv_receiver.py`
    - New guide: `docs/development/single_machine_buffered_e2e.md`
    - Receiver validation upgraded to assert `artifacts_reassembled`, `artifacts_validated`, `restore_tasks_enqueued`, and finalized validated session state.
+15. Started Phase-1 single-flight handoff queue implementation (external tooling):
+   - New persistent queue worker: `scripts/prefill_decode_job_queue.py`
+   - New operator guide: `docs/development/prefill_decode_phase1_queue.md`
+   - Buffered E2E runner now supports threshold-preserving prefill mode selection:
+     `--prefill-min-stream-batch-tokens` (default `-1`, runtime crossover logic).
 
 ### Commits produced
 
