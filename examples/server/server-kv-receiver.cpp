@@ -92,6 +92,7 @@ struct session_state {
     uint64_t bad_crc_chunks = 0;
     uint64_t expected_chunks = 0;
     uint64_t expected_payload_bytes = 0;
+    bool ack_required = true;
     uint64_t first_frame_unix_us = 0;
     uint64_t last_frame_unix_us = 0;
 
@@ -133,6 +134,17 @@ std::string lower_copy(std::string s) {
         return (char) std::tolower(c);
     });
     return s;
+}
+
+bool parse_boolish(const std::string & raw, bool fallback) {
+    const std::string v = lower_copy(string_strip(raw));
+    if (v == "1" || v == "true" || v == "yes" || v == "on") {
+        return true;
+    }
+    if (v == "0" || v == "false" || v == "no" || v == "off") {
+        return false;
+    }
+    return fallback;
 }
 
 std::string normalize_transport_mode(const std::string & mode_raw) {
@@ -867,6 +879,7 @@ struct kv_receiver_service::impl {
             ss.bad_crc_chunks = s->bad_crc_chunks;
             ss.expected_chunks = s->expected_chunks;
             ss.expected_payload_bytes = s->expected_payload_bytes;
+            ss.ack_required = s->ack_required;
             ss.expected_streams = s->expected_streams;
             ss.seen_streams = (int32_t) s->seen_stream_ids.size();
             ss.done_streams = (int32_t) s->done_stream_ids.size();
@@ -1149,6 +1162,7 @@ struct kv_receiver_service::impl {
             ss.bad_crc_chunks = session->bad_crc_chunks;
             ss.expected_chunks = session->expected_chunks;
             ss.expected_payload_bytes = session->expected_payload_bytes;
+            ss.ack_required = session->ack_required;
             ss.expected_streams = session->expected_streams;
             ss.seen_streams = (int32_t) session->seen_stream_ids.size();
             ss.done_streams = (int32_t) session->done_stream_ids.size();
@@ -1176,6 +1190,7 @@ struct kv_receiver_service::impl {
             {"bad_crc_chunks", ss.bad_crc_chunks},
             {"expected_chunks", ss.expected_chunks},
             {"expected_payload_bytes", ss.expected_payload_bytes},
+            {"ack_required", ss.ack_required},
             {"expected_streams", ss.expected_streams},
             {"seen_streams", ss.seen_streams},
             {"done_streams", ss.done_streams},
@@ -1451,6 +1466,12 @@ struct kv_receiver_service::impl {
                     } catch (...) {
                     }
                 }
+
+                auto ack_it = kv.find("ack_required");
+                if (ack_it != kv.end()) {
+                    std::lock_guard<std::mutex> lock(session->mutex);
+                    session->ack_required = parse_boolish(ack_it->second, session->ack_required);
+                }
             } break;
             case TBP_MSG_KV_SEGMENT_BEGIN:
             {
@@ -1469,16 +1490,7 @@ struct kv_receiver_service::impl {
             {
                 const uint32_t calc_crc = frame.payload.empty() ? 0u : crc32_u32(frame.payload.data(), frame.payload.size());
                 const bool crc_ok = calc_crc == frame.payload_crc;
-
-                {
-                    std::lock_guard<std::mutex> lock(session->mutex);
-                    if (crc_ok) {
-                        session->chunks_received += 1;
-                        session->bytes_received += frame.payload.size();
-                    } else {
-                        session->bad_crc_chunks += 1;
-                    }
-                }
+                bool chunk_persisted = false;
 
                 if (crc_ok) {
                     std::string write_err;
@@ -1486,13 +1498,42 @@ struct kv_receiver_service::impl {
                         mark_session_error(session, write_err);
                         KVR_WRN("persist chunk failed sid=%" PRIu64 " seq=%" PRIu64 " err=%s\n",
                                 frame.session_id, frame.seq_no, write_err.c_str());
+                    } else {
+                        chunk_persisted = true;
                     }
                 }
 
-                if (config.ack_enabled) {
-                    const bool send_crc_failure_response = crc_ok || config.nack_on_crc_bad;
-                    if (send_crc_failure_response) {
-                        const std::string ack_payload = (!crc_ok) ? "nack=crc" : "ack=1";
+                {
+                    std::lock_guard<std::mutex> lock(session->mutex);
+                    if (crc_ok && chunk_persisted) {
+                        session->chunks_received += 1;
+                        session->bytes_received += frame.payload.size();
+                    } else if (!crc_ok) {
+                        session->bad_crc_chunks += 1;
+                    }
+                }
+
+                bool session_ack_required = true;
+                {
+                    std::lock_guard<std::mutex> lock(session->mutex);
+                    session_ack_required = session->ack_required;
+                }
+
+                if (config.ack_enabled && session_ack_required) {
+                    bool should_send_response = false;
+                    std::string ack_payload;
+                    if (crc_ok && chunk_persisted) {
+                        ack_payload = "ack=1";
+                        should_send_response = true;
+                    } else if (!crc_ok && config.nack_on_crc_bad) {
+                        ack_payload = "nack=crc";
+                        should_send_response = true;
+                    } else if (crc_ok && !chunk_persisted) {
+                        ack_payload = "nack=io";
+                        should_send_response = true;
+                    }
+
+                    if (should_send_response) {
                         std::string ack_err;
                         if (!send_tbp_frame(fd,
                                             TBP_MSG_KV_ACK,

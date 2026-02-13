@@ -785,6 +785,7 @@ int main(int argc, char ** argv) {
                 {"bad_crc_chunks", ss.bad_crc_chunks},
                 {"expected_chunks", ss.expected_chunks},
                 {"expected_payload_bytes", ss.expected_payload_bytes},
+                {"ack_required", ss.ack_required},
                 {"expected_streams", ss.expected_streams},
                 {"seen_streams", ss.seen_streams},
                 {"done_streams", ss.done_streams},
