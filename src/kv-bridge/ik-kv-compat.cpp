@@ -792,6 +792,268 @@ static ik_kv_compat_convert_result_t convert_rtx_seq_blob_to_ik(
         reject_reason);
 }
 
+struct ik_stream_layer_layout_t {
+    size_t k_offset = 0;
+    size_t k_size = 0;
+    size_t v_offset = 0;
+    size_t v_size = 0;
+    uint32_t k_row_size = 0;
+    uint32_t v_row_size = 0;
+};
+
+struct ik_stream_layout_t {
+    uint32_t n_layers = 0;
+    uint32_t cell_count = 0;
+    uint8_t v_trans = 0xFFu;
+    size_t total_size = 0;
+    std::vector<ik_stream_layer_layout_t> layers;
+};
+
+static bool mul_size_overflow(size_t a, size_t b, size_t * out) {
+    if (!out) {
+        return true;
+    }
+    if (a != 0 && b > SIZE_MAX / a) {
+        return true;
+    }
+    *out = a * b;
+    return false;
+}
+
+static bool parse_ik_stream_layout(
+        const uint8_t * payload,
+        size_t payload_size,
+        ik_stream_layout_t * layout_out) {
+    if (!payload || !layout_out || payload_size < sizeof(uint32_t)) {
+        return false;
+    }
+
+    *layout_out = {};
+
+    size_t off = 0;
+    const uint32_t cell_count = rd_u32_le(payload + off);
+    off += sizeof(uint32_t);
+
+    for (uint32_t i = 0; i < cell_count; ++i) {
+        if (off + sizeof(llama_pos) + sizeof(uint32_t) > payload_size) {
+            return false;
+        }
+        off += sizeof(llama_pos);
+
+        const uint32_t n_seq_id = rd_u32_le(payload + off);
+        off += sizeof(uint32_t);
+
+        size_t seq_bytes = 0;
+        if (mul_size_overflow((size_t) n_seq_id, sizeof(llama_seq_id), &seq_bytes)) {
+            return false;
+        }
+        if (off + seq_bytes > payload_size) {
+            return false;
+        }
+        off += seq_bytes;
+    }
+
+    layout_out->cell_count = cell_count;
+    if (cell_count == 0) {
+        if (off != payload_size) {
+            return false;
+        }
+        layout_out->n_layers = 0;
+        layout_out->v_trans = 0xFFu;
+        layout_out->total_size = off;
+        return true;
+    }
+
+    if (off + sizeof(uint32_t) + sizeof(uint32_t) > payload_size) {
+        return false;
+    }
+    const uint32_t v_state = rd_u32_le(payload + off);
+    off += sizeof(uint32_t);
+    const uint32_t n_layer = rd_u32_le(payload + off);
+    off += sizeof(uint32_t);
+    if (n_layer > IK_KV_MAX_LAYERS) {
+        return false;
+    }
+
+    layout_out->layers.assign(n_layer, ik_stream_layer_layout_t{});
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        ik_stream_layer_layout_t & layer = layout_out->layers[il];
+        layer.k_offset = off;
+
+        if (off + sizeof(uint32_t) + sizeof(uint64_t) > payload_size) {
+            return false;
+        }
+        off += sizeof(uint32_t); // type
+        const uint64_t row_size = rd_u64_le(payload + off);
+        off += sizeof(uint64_t);
+
+        size_t bytes = 0;
+        if (mul_size_overflow((size_t) cell_count, (size_t) row_size, &bytes)) {
+            return false;
+        }
+        if (off + bytes > payload_size) {
+            return false;
+        }
+        off += bytes;
+
+        layer.k_size = sizeof(uint32_t) + sizeof(uint64_t) + bytes;
+        layer.k_row_size = saturating_u32(row_size);
+    }
+
+    if (v_state == 0) {
+        layout_out->v_trans = 0;
+        for (uint32_t il = 0; il < n_layer; ++il) {
+            ik_stream_layer_layout_t & layer = layout_out->layers[il];
+            layer.v_offset = off;
+
+            if (off + sizeof(uint32_t) + sizeof(uint64_t) > payload_size) {
+                return false;
+            }
+            off += sizeof(uint32_t); // type
+            const uint64_t row_size = rd_u64_le(payload + off);
+            off += sizeof(uint64_t);
+
+            size_t bytes = 0;
+            if (mul_size_overflow((size_t) cell_count, (size_t) row_size, &bytes)) {
+                return false;
+            }
+            if (off + bytes > payload_size) {
+                return false;
+            }
+            off += bytes;
+
+            layer.v_size = sizeof(uint32_t) + sizeof(uint64_t) + bytes;
+            layer.v_row_size = saturating_u32(row_size);
+        }
+    } else if (v_state == 1) {
+        layout_out->v_trans = 1;
+        for (uint32_t il = 0; il < n_layer; ++il) {
+            ik_stream_layer_layout_t & layer = layout_out->layers[il];
+            layer.v_offset = off;
+
+            if (off + sizeof(uint32_t) + sizeof(uint32_t) + sizeof(uint32_t) > payload_size) {
+                return false;
+            }
+            off += sizeof(uint32_t); // type
+            const uint32_t v_size_el = rd_u32_le(payload + off);
+            off += sizeof(uint32_t);
+            const uint32_t n_embd_v_gqa = rd_u32_le(payload + off);
+            off += sizeof(uint32_t);
+
+            size_t per_row = 0;
+            size_t bytes = 0;
+            if (mul_size_overflow((size_t) v_size_el, (size_t) n_embd_v_gqa, &per_row) ||
+                    mul_size_overflow((size_t) cell_count, per_row, &bytes)) {
+                return false;
+            }
+            if (off + bytes > payload_size) {
+                return false;
+            }
+            off += bytes;
+
+            layer.v_size = sizeof(uint32_t) + sizeof(uint32_t) + sizeof(uint32_t) + bytes;
+            layer.v_row_size = saturating_u32(per_row);
+        }
+    } else if (v_state == 2) {
+        layout_out->v_trans = 0xFFu;
+    } else {
+        return false;
+    }
+
+    if (off != payload_size) {
+        return false;
+    }
+
+    layout_out->n_layers = n_layer;
+    layout_out->total_size = off;
+    return true;
+}
+
+static void populate_plan_mappings_from_layout(
+        const ik_stream_layout_t & layout,
+        ik_kv_compat_plan_t * plan_out,
+        uint8_t needs_v_trans) {
+    if (!plan_out) {
+        return;
+    }
+
+    if (plan_out->n_layers == 0) {
+        plan_out->n_layers = std::min<uint32_t>((uint32_t) layout.layers.size(), IK_KV_MAX_LAYERS);
+    }
+    const uint32_t n_layers = std::min<uint32_t>(plan_out->n_layers, (uint32_t) layout.layers.size());
+
+    for (uint32_t il = 0; il < n_layers; ++il) {
+        const ik_stream_layer_layout_t & src = layout.layers[il];
+        ik_kv_layer_mapping_t & dst = plan_out->layer_mappings[il];
+        memset(&dst, 0, sizeof(dst));
+        dst.layer_idx = il;
+        dst.k_row_size = saturating_u32(src.k_size);
+        dst.v_row_size = saturating_u32(src.v_size);
+        dst.k_offset = saturating_u32(src.k_offset);
+        dst.v_offset = saturating_u32(src.v_offset);
+        dst.dst_k_offset = saturating_u32(src.k_offset);
+        dst.dst_v_offset = saturating_u32(src.v_offset);
+        dst.needs_scatter = 0;
+        dst.needs_v_trans = needs_v_trans;
+    }
+}
+
+static bool analyze_source_payload_layout(
+        const ik_kv_source_descriptor_t * src,
+        ik_stream_layout_t * layout_out,
+        size_t * dst_size_out,
+        ik_kv_compat_reject_reason_t * reject_reason) {
+    if (!src || !layout_out || !dst_size_out || !src->payload) {
+        return false;
+    }
+
+    *layout_out = {};
+    *dst_size_out = 0;
+    if (reject_reason) {
+        *reject_reason = IK_KV_COMPAT_REJECT_NONE;
+    }
+
+    if (src->source_format == IK_KV_SOURCE_FORMAT_IK_KVA) {
+        if (!parse_ik_stream_layout(src->payload, (size_t) src->payload_size, layout_out)) {
+            if (reject_reason) {
+                *reject_reason = IK_KV_COMPAT_REJECT_HEADER_MALFORMED;
+            }
+            return false;
+        }
+        *dst_size_out = layout_out->total_size;
+        return true;
+    }
+
+    if (src->source_format == IK_KV_SOURCE_FORMAT_RTX_KVARTIF1) {
+        std::vector<uint8_t> converted((size_t) src->payload_size);
+        size_t bytes_written = 0;
+        ik_kv_compat_reject_reason_t reject = IK_KV_COMPAT_REJECT_NONE;
+        const ik_kv_compat_convert_result_t rc = convert_rtx_seq_blob_to_ik(
+            src->payload,
+            (size_t) src->payload_size,
+            converted.data(),
+            converted.size(),
+            &bytes_written,
+            &reject);
+        if (rc != IK_KV_COMPAT_CONVERT_OK) {
+            if (reject_reason) {
+                *reject_reason = reject;
+            }
+            return false;
+        }
+        if (!parse_ik_stream_layout(converted.data(), bytes_written, layout_out)) {
+            if (reject_reason) {
+                *reject_reason = IK_KV_COMPAT_REJECT_HEADER_MALFORMED;
+            }
+            return false;
+        }
+        *dst_size_out = bytes_written;
+        return true;
+    }
+
+    return false;
+}
+
 } // namespace
 
 //
@@ -1041,10 +1303,31 @@ ik_kv_compat_convert_result_t ik_kv_dest_introspect_from_model(
     }
 
     memset(desc_out, 0, sizeof(*desc_out));
+    llama_model_params model_params = llama_model_default_params();
+    model_params.vocab_only = true;
 
-    // This path is used for precomputation only. We cannot inspect runtime KV layout
-    // from model_path without opening the model; keep deterministic placeholder values.
-    (void) model_path;
+    struct llama_model * model = llama_load_model_from_file(model_path, model_params);
+    if (!model) {
+        return IK_KV_COMPAT_CONVERT_ERR_DST_MISMATCH;
+    }
+
+    const llama_hparams & hp = model->hparams;
+    desc_out->n_layers = hp.n_layer;
+    desc_out->n_ctx = (uint32_t) std::max(0, llama_n_ctx_train(model));
+    desc_out->n_head_kv = hp.n_head_kv(0);
+    desc_out->n_embd_head = hp.n_embd_head_k;
+    desc_out->n_stream = 1;
+    desc_out->v_trans = 0;
+    // Runtime context controls KV cache dtype; precompute path assumes default f16 cache.
+    desc_out->type_k = IK_KV_TYPE_F16;
+    desc_out->type_v = IK_KV_TYPE_F16;
+
+    const ik_kv_compat_convert_result_t fp_rc = ik_kv_model_fingerprint_build(
+        model_path, desc_out->model_fingerprint);
+    llama_free_model(model);
+    if (fp_rc != IK_KV_COMPAT_CONVERT_OK) {
+        return fp_rc;
+    }
 
     return IK_KV_COMPAT_CONVERT_OK;
 }
@@ -1230,30 +1513,50 @@ ik_kv_compat_convert_result_t ik_kv_compat_plan_build_strict_v1(
     }
 
     const uint64_t src_size = src->payload_size;
-    const uint64_t dst_size = ik_kv_convert_get_output_size(src, dst);
-    plan_out->total_src_size = saturating_u32(src_size);
-    plan_out->total_dst_size = saturating_u32(dst_size);
+    uint64_t dst_size = (uint64_t) ik_kv_convert_get_output_size(src, dst);
 
     const uint8_t needs_v_trans =
         (src->v_trans <= 1 && dst->v_trans <= 1 && src->v_trans != dst->v_trans) ? 1u : 0u;
 
-    for (uint32_t il = 0; il < plan_out->n_layers; ++il) {
-        const uint64_t src_begin = (src_size * il) / plan_out->n_layers;
-        const uint64_t src_end   = (src_size * (il + 1)) / plan_out->n_layers;
-        const uint64_t dst_begin = (dst_size * il) / plan_out->n_layers;
-
-        ik_kv_layer_mapping_t & m = plan_out->layer_mappings[il];
-        memset(&m, 0, sizeof(m));
-        m.layer_idx = il;
-        m.k_row_size = saturating_u32(src_end - src_begin);
-        m.v_row_size = saturating_u32(src_end - src_begin);
-        m.k_offset = saturating_u32(src_begin);
-        m.v_offset = saturating_u32(src_begin);
-        m.dst_k_offset = saturating_u32(dst_begin);
-        m.dst_v_offset = saturating_u32(dst_begin);
-        m.needs_scatter = 0;
-        m.needs_v_trans = needs_v_trans;
+    bool mapped_from_layout = false;
+    if (src->payload && src_size > 0) {
+        ik_stream_layout_t layout = {};
+        size_t analyzed_dst_size = 0;
+        ik_kv_compat_reject_reason_t reject = IK_KV_COMPAT_REJECT_NONE;
+        if (analyze_source_payload_layout(src, &layout, &analyzed_dst_size, &reject)) {
+            dst_size = (uint64_t) analyzed_dst_size;
+            populate_plan_mappings_from_layout(layout, plan_out, needs_v_trans);
+            mapped_from_layout = !layout.layers.empty();
+        } else if (src->source_format == IK_KV_SOURCE_FORMAT_RTX_KVARTIF1 &&
+                   reject != IK_KV_COMPAT_REJECT_NONE) {
+            plan_out->is_compatible = false;
+            plan_out->reject_reason = reject;
+            return IK_KV_COMPAT_CONVERT_OK;
+        }
     }
+
+    if (!mapped_from_layout) {
+        for (uint32_t il = 0; il < plan_out->n_layers; ++il) {
+            const uint64_t src_begin = (src_size * il) / std::max<uint32_t>(1, plan_out->n_layers);
+            const uint64_t src_end   = (src_size * (il + 1)) / std::max<uint32_t>(1, plan_out->n_layers);
+            const uint64_t dst_begin = (dst_size * il) / std::max<uint32_t>(1, plan_out->n_layers);
+
+            ik_kv_layer_mapping_t & m = plan_out->layer_mappings[il];
+            memset(&m, 0, sizeof(m));
+            m.layer_idx = il;
+            m.k_row_size = saturating_u32(src_end - src_begin);
+            m.v_row_size = saturating_u32(src_end - src_begin);
+            m.k_offset = saturating_u32(src_begin);
+            m.v_offset = saturating_u32(src_begin);
+            m.dst_k_offset = saturating_u32(dst_begin);
+            m.dst_v_offset = saturating_u32(dst_begin);
+            m.needs_scatter = 0;
+            m.needs_v_trans = needs_v_trans;
+        }
+    }
+
+    plan_out->total_src_size = saturating_u32(src_size);
+    plan_out->total_dst_size = saturating_u32(dst_size);
     
     return IK_KV_COMPAT_CONVERT_OK;
 }
@@ -1456,6 +1759,64 @@ void ik_kv_plan_cache_clear(void) {
 // Conversion runtime (KVB-007)
 //
 
+static ik_kv_compat_convert_result_t convert_ik_seq_blob_with_plan(
+    const ik_kv_source_descriptor_t * src,
+    const ik_kv_compat_plan_t * plan,
+    uint8_t * output_buf,
+    size_t output_size,
+    size_t * bytes_written,
+    ik_kv_compat_reject_reason_t * reject_reason
+) {
+    if (!src || !plan || !output_buf || !bytes_written) {
+        return IK_KV_COMPAT_CONVERT_ERR_INVALID_ARG;
+    }
+    *bytes_written = 0;
+    if (reject_reason) {
+        *reject_reason = IK_KV_COMPAT_REJECT_NONE;
+    }
+
+    const size_t src_size = (size_t) src->payload_size;
+    if (output_size < src_size) {
+        return IK_KV_COMPAT_CONVERT_ERR_SIZE;
+    }
+
+    memcpy(output_buf, src->payload, src_size);
+    size_t max_dst_end = src_size;
+    bool used_mapping = false;
+
+    const uint32_t n_layers = std::min<uint32_t>(plan->n_layers, IK_KV_MAX_LAYERS);
+    for (uint32_t il = 0; il < n_layers; ++il) {
+        const ik_kv_layer_mapping_t & m = plan->layer_mappings[il];
+
+        auto copy_section = [&](uint32_t src_off, uint32_t dst_off, uint32_t bytes) -> bool {
+            if (bytes == 0) {
+                return true;
+            }
+            const size_t src_offset = (size_t) src_off;
+            const size_t dst_offset = (size_t) dst_off;
+            const size_t n_bytes = (size_t) bytes;
+            if (src_offset + n_bytes > src_size || dst_offset + n_bytes > output_size) {
+                return false;
+            }
+            memcpy(output_buf + dst_offset, src->payload + src_offset, n_bytes);
+            max_dst_end = std::max(max_dst_end, dst_offset + n_bytes);
+            used_mapping = true;
+            return true;
+        };
+
+        if (!copy_section(m.k_offset, m.dst_k_offset, m.k_row_size) ||
+                !copy_section(m.v_offset, m.dst_v_offset, m.v_row_size)) {
+            if (reject_reason) {
+                *reject_reason = IK_KV_COMPAT_REJECT_INCOMPATIBLE_PROFILE;
+            }
+            return IK_KV_COMPAT_CONVERT_ERR_CONVERT;
+        }
+    }
+
+    *bytes_written = used_mapping ? max_dst_end : src_size;
+    return IK_KV_COMPAT_CONVERT_OK;
+}
+
 ik_kv_compat_convert_result_t ik_kv_convert_prefill_to_ik_seq_blob(
     ik_kv_convert_ctx_t * ctx
 ) {
@@ -1476,8 +1837,12 @@ ik_kv_compat_convert_result_t ik_kv_convert_prefill_to_ik_seq_blob(
         return ctx->result;
     }
     
+    const size_t required_output = ctx->plan->total_dst_size > 0
+        ? (size_t) ctx->plan->total_dst_size
+        : ik_kv_convert_get_output_size(ctx->src, ctx->dst);
+
     // Check output buffer
-    if (!ctx->output_buf || ctx->output_size < ctx->src->payload_size) {
+    if (!ctx->output_buf || ctx->output_size < required_output) {
         ctx->result = IK_KV_COMPAT_CONVERT_ERR_SIZE;
         ctx->reject = IK_KV_COMPAT_REJECT_NONE;
         return ctx->result;
@@ -1498,8 +1863,19 @@ ik_kv_compat_convert_result_t ik_kv_convert_prefill_to_ik_seq_blob(
             return ctx->result;
         }
     } else {
-        memcpy(ctx->output_buf, ctx->src->payload, (size_t) ctx->src->payload_size);
-        ctx->bytes_written = (size_t) ctx->src->payload_size;
+        ik_kv_compat_reject_reason_t reject = IK_KV_COMPAT_REJECT_NONE;
+        const ik_kv_compat_convert_result_t rc = convert_ik_seq_blob_with_plan(
+            ctx->src,
+            ctx->plan,
+            ctx->output_buf,
+            ctx->output_size,
+            &ctx->bytes_written,
+            &reject);
+        if (rc != IK_KV_COMPAT_CONVERT_OK) {
+            ctx->result = rc;
+            ctx->reject = reject;
+            return ctx->result;
+        }
     }
 
     ctx->result = IK_KV_COMPAT_CONVERT_OK;
@@ -1517,7 +1893,16 @@ size_t ik_kv_convert_get_output_size(
     }
     GGML_UNUSED(dst);
 
-    // Worst-case conversion output never exceeds source payload size.
+    if (src->source_format == IK_KV_SOURCE_FORMAT_RTX_KVARTIF1 && src->payload && src->payload_size > 0) {
+        ik_stream_layout_t layout = {};
+        size_t dst_size = 0;
+        ik_kv_compat_reject_reason_t reject = IK_KV_COMPAT_REJECT_NONE;
+        if (analyze_source_payload_layout(src, &layout, &dst_size, &reject)) {
+            return dst_size;
+        }
+    }
+
+    // Fallback: conversion output never exceeds source payload size.
     return (size_t) src->payload_size;
 }
 
@@ -1635,7 +2020,11 @@ ik_kv_compat_convert_result_t ik_kv_import_into_context(
     }
 
     // Convert source payload to destination sequence-state blob.
-    std::vector<uint8_t> converted((size_t) src_desc.payload_size);
+    const size_t converted_size = ik_kv_convert_get_output_size(&src_desc, &dst_desc);
+    if (converted_size == 0) {
+        return finalize(IK_KV_COMPAT_CONVERT_ERR_SIZE, IK_KV_COMPAT_REJECT_INCOMPATIBLE_PROFILE);
+    }
+    std::vector<uint8_t> converted(converted_size);
     ik_kv_convert_ctx_t cvt = {};
     cvt.src = &src_desc;
     cvt.dst = &dst_desc;

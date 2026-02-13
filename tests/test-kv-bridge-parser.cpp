@@ -576,6 +576,143 @@ TEST(kvb_ut_017_rtx_multistream_multiple_active_rejected) {
     tests_passed++;
 }
 
+TEST(kvb_ut_018_rtx_output_size_tracks_converted_payload) {
+    ik_kv_bridge_init();
+
+    const std::vector<uint8_t> payload = build_rtx_payload_single_stream();
+    const std::vector<uint8_t> artifact = build_rtx_artifact(48, payload, /*token_count=*/13);
+
+    ik_kva_header_t header = {};
+    ik_kv_compat_reject_reason_t reject = IK_KV_COMPAT_REJECT_UNKNOWN;
+    ik_kv_compat_convert_result_t result = ik_kv_source_parse_kva_header(
+        artifact.data(), artifact.size(), &header, &reject);
+    ASSERT_EQ(result, IK_KV_COMPAT_CONVERT_OK);
+
+    ik_kv_source_descriptor_t src = {};
+    result = ik_kv_source_parse_prefill_seq_state(
+        &header, artifact.data() + 48, payload.size(), &src, &reject);
+    ASSERT_EQ(result, IK_KV_COMPAT_CONVERT_OK);
+    ASSERT_EQ(src.source_format, IK_KV_SOURCE_FORMAT_RTX_KVARTIF1);
+
+    ik_kv_dest_descriptor_t dst = {};
+    dst.n_layers = src.n_layers;
+    dst.n_ctx = src.n_ctx;
+    dst.type_k = src.type_k;
+    dst.type_v = src.type_v;
+    dst.v_trans = 0;
+    dst.n_stream = 1;
+
+    const size_t out_size = ik_kv_convert_get_output_size(&src, &dst);
+    ASSERT_EQ((int) out_size, (int) (payload.size() - 8));
+
+    ik_kv_bridge_shutdown();
+    tests_passed++;
+}
+
+TEST(kvb_ut_019_ik_conversion_uses_plan_layer_mappings) {
+    ik_kv_bridge_init();
+
+    const std::vector<uint8_t> rtx_payload = build_rtx_payload_single_stream();
+    const std::vector<uint8_t> artifact = build_rtx_artifact(48, rtx_payload, /*token_count=*/17);
+
+    ik_kva_header_t header = {};
+    ik_kv_compat_reject_reason_t reject = IK_KV_COMPAT_REJECT_UNKNOWN;
+    ik_kv_compat_convert_result_t result = ik_kv_source_parse_kva_header(
+        artifact.data(), artifact.size(), &header, &reject);
+    ASSERT_EQ(result, IK_KV_COMPAT_CONVERT_OK);
+
+    ik_kv_source_descriptor_t rtx_src = {};
+    result = ik_kv_source_parse_prefill_seq_state(
+        &header, artifact.data() + 48, rtx_payload.size(), &rtx_src, &reject);
+    ASSERT_EQ(result, IK_KV_COMPAT_CONVERT_OK);
+
+    ik_kv_dest_descriptor_t dst = {};
+    dst.n_layers = rtx_src.n_layers;
+    dst.n_ctx = rtx_src.n_ctx;
+    dst.type_k = rtx_src.type_k;
+    dst.type_v = rtx_src.type_v;
+    dst.v_trans = 0;
+    dst.n_stream = 1;
+
+    ik_kv_compat_plan_t rtx_plan = {};
+    result = ik_kv_compat_plan_build_strict_v1(&rtx_src, &dst, &rtx_plan);
+    ASSERT_EQ(result, IK_KV_COMPAT_CONVERT_OK);
+    ASSERT_TRUE(rtx_plan.is_compatible);
+
+    std::vector<uint8_t> ik_payload(rtx_payload.size(), 0);
+    ik_kv_convert_ctx_t rtx_cvt = {};
+    rtx_cvt.src = &rtx_src;
+    rtx_cvt.dst = &dst;
+    rtx_cvt.plan = &rtx_plan;
+    rtx_cvt.output_buf = ik_payload.data();
+    rtx_cvt.output_size = ik_payload.size();
+    result = ik_kv_convert_prefill_to_ik_seq_blob(&rtx_cvt);
+    ASSERT_EQ(result, IK_KV_COMPAT_CONVERT_OK);
+    ik_payload.resize(rtx_cvt.bytes_written);
+
+    ik_kv_source_descriptor_t ik_src = {};
+    ik_src.n_layers = 1;
+    ik_src.n_ctx = rtx_src.n_ctx;
+    ik_src.n_head_kv = rtx_src.n_head_kv;
+    ik_src.type_k = rtx_src.type_k;
+    ik_src.type_v = rtx_src.type_v;
+    ik_src.v_trans = 0;
+    ik_src.n_stream = 1;
+    ik_src.source_format = IK_KV_SOURCE_FORMAT_IK_KVA;
+    ik_src.payload_size = (uint64_t) ik_payload.size();
+    ik_src.payload = ik_payload.data();
+    memset(ik_src.model_fingerprint, 0xCD, sizeof(ik_src.model_fingerprint));
+
+    ik_kv_dest_descriptor_t ik_dst = {};
+    ik_dst.n_layers = 1;
+    ik_dst.n_ctx = ik_src.n_ctx;
+    ik_dst.n_head_kv = ik_src.n_head_kv;
+    ik_dst.type_k = ik_src.type_k;
+    ik_dst.type_v = ik_src.type_v;
+    ik_dst.v_trans = ik_src.v_trans;
+    ik_dst.n_stream = 1;
+    memcpy(ik_dst.model_fingerprint, ik_src.model_fingerprint, sizeof(ik_dst.model_fingerprint));
+
+    ik_kv_compat_plan_t ik_plan = {};
+    result = ik_kv_compat_plan_build_strict_v1(&ik_src, &ik_dst, &ik_plan);
+    ASSERT_EQ(result, IK_KV_COMPAT_CONVERT_OK);
+    ASSERT_TRUE(ik_plan.is_compatible);
+    ASSERT_EQ((int) ik_plan.n_layers, 1);
+    ASSERT_TRUE(ik_plan.layer_mappings[0].k_row_size > 0);
+    ASSERT_TRUE(ik_plan.layer_mappings[0].v_row_size > 0);
+
+    const ik_kv_layer_mapping_t base_map = ik_plan.layer_mappings[0];
+    ASSERT_TRUE(base_map.k_row_size + base_map.k_offset <= ik_payload.size());
+    ASSERT_TRUE(base_map.v_row_size + base_map.v_offset <= ik_payload.size());
+
+    // Swap destination K/V placements to verify conversion applies plan mappings.
+    ik_plan.layer_mappings[0].dst_k_offset = base_map.v_offset;
+    ik_plan.layer_mappings[0].dst_v_offset = base_map.k_offset;
+
+    std::vector<uint8_t> expected = ik_payload;
+    std::vector<uint8_t> src_k(ik_payload.begin() + base_map.k_offset,
+                               ik_payload.begin() + base_map.k_offset + base_map.k_row_size);
+    std::vector<uint8_t> src_v(ik_payload.begin() + base_map.v_offset,
+                               ik_payload.begin() + base_map.v_offset + base_map.v_row_size);
+    memcpy(expected.data() + ik_plan.layer_mappings[0].dst_k_offset, src_k.data(), src_k.size());
+    memcpy(expected.data() + ik_plan.layer_mappings[0].dst_v_offset, src_v.data(), src_v.size());
+
+    std::vector<uint8_t> remapped(ik_payload.size(), 0);
+    ik_kv_convert_ctx_t ik_cvt = {};
+    ik_cvt.src = &ik_src;
+    ik_cvt.dst = &ik_dst;
+    ik_cvt.plan = &ik_plan;
+    ik_cvt.output_buf = remapped.data();
+    ik_cvt.output_size = remapped.size();
+    result = ik_kv_convert_prefill_to_ik_seq_blob(&ik_cvt);
+    ASSERT_EQ(result, IK_KV_COMPAT_CONVERT_OK);
+    ASSERT_EQ((int) ik_cvt.bytes_written, (int) remapped.size());
+    ASSERT_EQ(memcmp(remapped.data(), expected.data(), remapped.size()), 0);
+
+    ik_kv_bridge_shutdown();
+    tests_passed++;
+}
+
 //
 // Additional basic tests for plan building
 //
@@ -888,6 +1025,8 @@ int main(int argc, char ** argv) {
     test_kvb_ut_015_rtx_vstate_unknown_does_not_force_vtrans();
     test_kvb_ut_016_rtx_multistream_single_active_supported();
     test_kvb_ut_017_rtx_multistream_multiple_active_rejected();
+    test_kvb_ut_018_rtx_output_size_tracks_converted_payload();
+    test_kvb_ut_019_ik_conversion_uses_plan_layer_mappings();
     test_kvb_ut_030_plan_key_deterministic();
     test_kvb_ut_040_strict_profile_accepts_compatible();
     test_kvb_ut_041_strict_profile_rejects_dtype_mismatch();
