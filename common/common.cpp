@@ -499,6 +499,9 @@ void gpt_params_parse_from_env(gpt_params & params) {
     get_env("LLAMA_ARG_KV_RECV_NACK_ON_CRC_BAD",  params.kv_receiver_nack_on_crc_bad);
     get_env("LLAMA_ARG_KV_RECV_MAX_CONNECTIONS",  params.kv_receiver_max_connections);
     get_env("LLAMA_ARG_KV_RECV_IDLE_TIMEOUT",     params.kv_receiver_idle_timeout_sec);
+    get_env("LLAMA_ARG_KV_RECV_STALE_FINALIZE_TIMEOUT", params.kv_receiver_stale_finalize_timeout_sec);
+    get_env("LLAMA_ARG_KV_RECV_SESSION_RETENTION", params.kv_receiver_session_retention_sec);
+    get_env("LLAMA_ARG_KV_RECV_CLEANUP_INTERVAL", params.kv_receiver_cleanup_interval_sec);
     get_env("LLAMA_ARG_KV_RECV_SOCKET_SEND_BUF",  params.kv_receiver_socket_send_buf);
     get_env("LLAMA_ARG_KV_RECV_SOCKET_RECV_BUF",  params.kv_receiver_socket_recv_buf);
 }
@@ -1903,6 +1906,21 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.kv_receiver_idle_timeout_sec = std::stoi(argv[i]);
         return true;
     }
+    if (arg == "--kv-recv-stale-finalize-timeout") {
+        CHECK_ARG
+        params.kv_receiver_stale_finalize_timeout_sec = std::stoi(argv[i]);
+        return true;
+    }
+    if (arg == "--kv-recv-session-retention") {
+        CHECK_ARG
+        params.kv_receiver_session_retention_sec = std::stoi(argv[i]);
+        return true;
+    }
+    if (arg == "--kv-recv-cleanup-interval") {
+        CHECK_ARG
+        params.kv_receiver_cleanup_interval_sec = std::stoi(argv[i]);
+        return true;
+    }
     if (arg == "--kv-recv-socket-send-buf") {
         CHECK_ARG
         params.kv_receiver_socket_send_buf = std::stoi(argv[i]);
@@ -2568,6 +2586,9 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "server",      "       --kv-recv-no-nack-on-crc-bad","do not send NACK when chunk payload CRC check fails (default: enabled)" });
     options.push_back({ "server",      "       --kv-recv-max-connections N","maximum concurrent KV receiver connections (default: 32)" });
     options.push_back({ "server",      "       --kv-recv-idle-timeout N","idle timeout in seconds for KV receiver connection loop (default: 30)" });
+    options.push_back({ "server",      "       --kv-recv-stale-finalize-timeout N","force session finalization after N seconds without frames (0 = disabled, default: 120)" });
+    options.push_back({ "server",      "       --kv-recv-session-retention N","retain finalized sessions in memory/output dir for N seconds before pruning (0 = disabled, default: 1800)" });
+    options.push_back({ "server",      "       --kv-recv-cleanup-interval N","maintenance sweep interval in seconds for stale finalization/pruning (default: 10)" });
     options.push_back({ "server",      "       --kv-recv-socket-send-buf N","socket SO_SNDBUF for KV receiver (0 = system default)" });
     options.push_back({ "server",      "       --kv-recv-socket-recv-buf N","socket SO_RCVBUF for KV receiver (0 = system default)" });
     options.push_back({ "server",      "       --chat-template JINJA_TEMPLATE",

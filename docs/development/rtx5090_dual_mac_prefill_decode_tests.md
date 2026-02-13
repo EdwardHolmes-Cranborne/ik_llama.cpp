@@ -49,6 +49,8 @@ Expected:
 - `artifacts_reassembled` increases
 - `artifacts_validated` increases
 - `restore_tasks_skipped_dry_run` increases
+- `sessions_stale_finalized` stays stable for healthy runs
+- `sessions_pruned` stays stable during short functional runs
 - `sessions[].validation_ok == true`
 - `sessions[].expected_chunks > 0`
 - `sessions[].expected_payload_bytes > 0`
@@ -107,7 +109,21 @@ Pass criteria:
 - No corrupted session (`validation_ok=false`)
 - Fallback runs complete with successful reassembly/validation
 
-## 5. Prefill threshold/crossover validation
+## 5. Session lifecycle controls validation
+
+Start decode with:
+
+- `--kv-recv-stale-finalize-timeout 30`
+- `--kv-recv-session-retention 60`
+- `--kv-recv-cleanup-interval 5`
+
+Validation steps:
+
+1. Run one normal handoff and verify `sessions_stale_finalized` does not increment.
+2. Start a transfer and interrupt sender before `KV_DONE`; after ~30s idle, verify `sessions_stale_finalized` increments.
+3. Wait >60s and verify `sessions_pruned` increments and old session folders are removed from `/tmp/ik_kv_handoff`.
+
+## 6. Prefill threshold/crossover validation
 
 Goal: confirm RTX prefill is used only when prompt length merits it.
 
@@ -128,7 +144,7 @@ Pass criteria:
 - long prompts use prefill handoff path
 - behavior tracks configured crossover assumptions
 
-## 6. Soak test (recommended 1-4h)
+## 7. Soak test (recommended 1-4h)
 
 Example loop from `RTX_HOST`:
 
@@ -157,7 +173,7 @@ Pass criteria:
 - no invalid artifacts
 - stable decode service health
 
-## 7. Artifacts to archive for each test batch
+## 8. Artifacts to archive for each test batch
 
 1. Receiver snapshot:
    - `curl http://10.40.0.20:8080/kv-receiver/status`

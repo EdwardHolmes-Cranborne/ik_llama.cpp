@@ -39,6 +39,10 @@
 11. Improved ACK semantics and persistence safety:
    - Receiver now honors sender `ack_required` metadata and can suppress ACK/NACK chatter for no-ack sessions.
    - Receiver now returns `nack=io` when chunk persistence fails, allowing sender retransmit instead of silent bad ACK.
+12. Added receiver stale-session lifecycle management:
+   - New config to force-finalize sessions after idle frame timeout.
+   - New config to prune finalized sessions after retention window.
+   - Periodic maintenance sweep with status counters for stale-finalized/pruned sessions.
 
 ### Commits produced
 

@@ -24,6 +24,9 @@ struct kv_receiver_config {
 
     int32_t max_connections = 32;
     int32_t idle_timeout_sec = 30;
+    int32_t stale_finalize_timeout_sec = 120;
+    int32_t session_retention_sec = 1800;
+    int32_t cleanup_interval_sec = 10;
     int32_t socket_send_buf = 0;
     int32_t socket_recv_buf = 0;
 };
@@ -68,6 +71,9 @@ struct kv_receiver_stats {
     std::string bind_host;
     int32_t bind_port = -1;
     bool dry_run = false;
+    int32_t stale_finalize_timeout_sec = 0;
+    int32_t session_retention_sec = 0;
+    int32_t cleanup_interval_sec = 0;
 
     uint64_t connections_accepted = 0;
     uint64_t connections_rejected = 0;
@@ -79,6 +85,8 @@ struct kv_receiver_stats {
     uint64_t artifacts_validated = 0;
     uint64_t restore_tasks_enqueued = 0;
     uint64_t restore_tasks_skipped_dry_run = 0;
+    uint64_t sessions_stale_finalized = 0;
+    uint64_t sessions_pruned = 0;
 
     std::vector<kv_receiver_session_stats> sessions;
 };

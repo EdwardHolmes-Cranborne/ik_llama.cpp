@@ -370,6 +370,9 @@ struct gpt_params {
     bool kv_receiver_nack_on_crc_bad = true;
     int32_t kv_receiver_max_connections = 32;
     int32_t kv_receiver_idle_timeout_sec = 30;
+    int32_t kv_receiver_stale_finalize_timeout_sec = 120;
+    int32_t kv_receiver_session_retention_sec = 1800;
+    int32_t kv_receiver_cleanup_interval_sec = 10;
     int32_t kv_receiver_socket_send_buf = 0;
     int32_t kv_receiver_socket_recv_buf = 0;
 

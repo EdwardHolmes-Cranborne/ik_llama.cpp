@@ -806,6 +806,9 @@ int main(int argc, char ** argv) {
             {"bind_host", s.bind_host},
             {"bind_port", s.bind_port},
             {"dry_run", s.dry_run},
+            {"stale_finalize_timeout_sec", s.stale_finalize_timeout_sec},
+            {"session_retention_sec", s.session_retention_sec},
+            {"cleanup_interval_sec", s.cleanup_interval_sec},
             {"counters", {
                 {"connections_accepted", s.connections_accepted},
                 {"connections_rejected", s.connections_rejected},
@@ -817,6 +820,8 @@ int main(int argc, char ** argv) {
                 {"artifacts_validated", s.artifacts_validated},
                 {"restore_tasks_enqueued", s.restore_tasks_enqueued},
                 {"restore_tasks_skipped_dry_run", s.restore_tasks_skipped_dry_run},
+                {"sessions_stale_finalized", s.sessions_stale_finalized},
+                {"sessions_pruned", s.sessions_pruned},
             }},
             {"sessions", sessions},
         };

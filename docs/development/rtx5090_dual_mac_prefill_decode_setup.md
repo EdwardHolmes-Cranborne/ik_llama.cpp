@@ -79,7 +79,10 @@ mkdir -p /tmp/ik_slots /tmp/ik_kv_handoff
   --kv-recv-slot 0 \
   --kv-recv-output-dir /tmp/ik_kv_handoff \
   --kv-recv-max-connections 64 \
-  --kv-recv-idle-timeout 120
+  --kv-recv-idle-timeout 120 \
+  --kv-recv-stale-finalize-timeout 180 \
+  --kv-recv-session-retention 3600 \
+  --kv-recv-cleanup-interval 10
 ```
 
 Verify receiver state:
@@ -87,6 +90,12 @@ Verify receiver state:
 ```bash
 curl -s http://10.40.0.20:8080/kv-receiver/status | jq
 ```
+
+Receiver lifecycle notes:
+
+1. `--kv-recv-stale-finalize-timeout N`: force finalize incomplete sessions after `N` idle seconds (`0` disables).
+2. `--kv-recv-session-retention N`: keep finalized sessions and artifacts for `N` seconds before pruning (`0` disables).
+3. `--kv-recv-cleanup-interval N`: maintenance sweep interval.
 
 ## 5. Start RTX prefill client on WRX90
 

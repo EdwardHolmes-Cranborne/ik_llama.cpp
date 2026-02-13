@@ -654,6 +654,8 @@ struct kv_receiver_service::impl {
     std::atomic<uint64_t> stat_artifacts_validated{0};
     std::atomic<uint64_t> stat_restore_tasks_enqueued{0};
     std::atomic<uint64_t> stat_restore_tasks_skipped_dry_run{0};
+    std::atomic<uint64_t> stat_sessions_stale_finalized{0};
+    std::atomic<uint64_t> stat_sessions_pruned{0};
 
     std::atomic<bool> stop_requested{false};
 
@@ -720,6 +722,9 @@ struct kv_receiver_service::impl {
         config.transport_mode = normalized_mode;
         config.max_connections = std::max<int32_t>(1, config.max_connections);
         config.idle_timeout_sec = std::max<int32_t>(1, config.idle_timeout_sec);
+        config.stale_finalize_timeout_sec = std::max<int32_t>(0, config.stale_finalize_timeout_sec);
+        config.session_retention_sec = std::max<int32_t>(0, config.session_retention_sec);
+        config.cleanup_interval_sec = std::max<int32_t>(1, config.cleanup_interval_sec);
         config.output_dir = default_output_dir(config);
         stat_connections_accepted.store(0);
         stat_connections_rejected.store(0);
@@ -731,6 +736,8 @@ struct kv_receiver_service::impl {
         stat_artifacts_validated.store(0);
         stat_restore_tasks_enqueued.store(0);
         stat_restore_tasks_skipped_dry_run.store(0);
+        stat_sessions_stale_finalized.store(0);
+        stat_sessions_pruned.store(0);
         {
             std::lock_guard<std::mutex> lock(sessions_mutex);
             sessions.clear();
@@ -789,12 +796,15 @@ struct kv_receiver_service::impl {
         stop_requested.store(false);
         accept_thread = std::thread([this]() { accept_loop(); });
 
-        KVR_INF("KV receiver started mode=%s host=%s port=%d output=%s dry_run=%s\n",
+        KVR_INF("KV receiver started mode=%s host=%s port=%d output=%s dry_run=%s stale_finalize_timeout_sec=%d session_retention_sec=%d cleanup_interval_sec=%d\n",
                 runtime_state.resolved_transport_mode.c_str(),
                 runtime_state.bind_host.c_str(),
                 runtime_state.bind_port,
                 runtime_state.output_dir.c_str(),
-                config.dry_run ? "true" : "false");
+                config.dry_run ? "true" : "false",
+                config.stale_finalize_timeout_sec,
+                config.session_retention_sec,
+                config.cleanup_interval_sec);
 
         return true;
 #endif
@@ -853,6 +863,9 @@ struct kv_receiver_service::impl {
             out.bind_host = runtime_state.bind_host;
             out.bind_port = runtime_state.bind_port;
             out.dry_run = config.dry_run;
+            out.stale_finalize_timeout_sec = config.stale_finalize_timeout_sec;
+            out.session_retention_sec = config.session_retention_sec;
+            out.cleanup_interval_sec = config.cleanup_interval_sec;
         }
 
         out.connections_accepted = stat_connections_accepted.load();
@@ -865,6 +878,8 @@ struct kv_receiver_service::impl {
         out.artifacts_validated = stat_artifacts_validated.load();
         out.restore_tasks_enqueued = stat_restore_tasks_enqueued.load();
         out.restore_tasks_skipped_dry_run = stat_restore_tasks_skipped_dry_run.load();
+        out.sessions_stale_finalized = stat_sessions_stale_finalized.load();
+        out.sessions_pruned = stat_sessions_pruned.load();
 
 #ifndef _WIN32
         std::lock_guard<std::mutex> lock(sessions_mutex);
@@ -945,9 +960,129 @@ struct kv_receiver_service::impl {
         }
     }
 
+    struct prune_candidate {
+        uint64_t session_id = 0;
+        std::shared_ptr<session_state> session;
+        fs::path session_dir;
+    };
+
+    bool session_should_force_finalize(const std::shared_ptr<session_state> & session, uint64_t stale_cutoff_unix_us) const {
+        std::lock_guard<std::mutex> lock(session->mutex);
+        return !session->finalized &&
+            session->last_frame_unix_us > 0 &&
+            session->last_frame_unix_us <= stale_cutoff_unix_us;
+    }
+
+    void collect_stale_finalize_candidates(uint64_t stale_cutoff_unix_us, std::vector<std::shared_ptr<session_state>> * out) {
+        out->clear();
+        std::lock_guard<std::mutex> lock(sessions_mutex);
+        out->reserve(sessions.size());
+        for (const auto & kv : sessions) {
+            const std::shared_ptr<session_state> & session = kv.second;
+            if (session_should_force_finalize(session, stale_cutoff_unix_us)) {
+                out->push_back(session);
+            }
+        }
+    }
+
+    void collect_prune_candidates(uint64_t prune_cutoff_unix_us, std::vector<prune_candidate> * out) {
+        out->clear();
+        std::lock_guard<std::mutex> lock(sessions_mutex);
+        out->reserve(sessions.size());
+        for (const auto & kv : sessions) {
+            const std::shared_ptr<session_state> & session = kv.second;
+            bool eligible = false;
+            {
+                std::lock_guard<std::mutex> s_lock(session->mutex);
+                eligible = session->finalized &&
+                    session->last_frame_unix_us > 0 &&
+                    session->last_frame_unix_us <= prune_cutoff_unix_us;
+            }
+            if (!eligible) {
+                continue;
+            }
+            out->push_back(prune_candidate{
+                session->session_id,
+                session,
+                session->session_dir,
+            });
+        }
+    }
+
+    bool try_prune_session(const prune_candidate & candidate) {
+        std::error_code ec;
+        fs::remove_all(candidate.session_dir, ec);
+        if (ec) {
+            KVR_WRN("session prune remove failed sid=%" PRIu64 " dir=%s err=%s\n",
+                    candidate.session_id, candidate.session_dir.c_str(), ec.message().c_str());
+            return false;
+        }
+
+        bool erased = false;
+        {
+            std::lock_guard<std::mutex> lock(sessions_mutex);
+            const auto it = sessions.find(candidate.session_id);
+            if (it != sessions.end() && it->second == candidate.session) {
+                sessions.erase(it);
+                erased = true;
+            }
+        }
+
+        if (erased) {
+            stat_sessions_pruned.fetch_add(1);
+            KVR_INF("pruned finalized session sid=%" PRIu64 " dir=%s\n",
+                    candidate.session_id, candidate.session_dir.c_str());
+        }
+        return erased;
+    }
+
+    void run_session_maintenance() {
+        const uint64_t now_unix_us = unix_now_us();
+
+        if (config.stale_finalize_timeout_sec > 0) {
+            const uint64_t stale_window_us = (uint64_t) config.stale_finalize_timeout_sec * 1000000ull;
+            const uint64_t stale_cutoff = now_unix_us > stale_window_us ? now_unix_us - stale_window_us : 0;
+            std::vector<std::shared_ptr<session_state>> stale_candidates;
+            collect_stale_finalize_candidates(stale_cutoff, &stale_candidates);
+            for (const auto & session : stale_candidates) {
+                if (try_finalize_session(session, true, "stale-timeout")) {
+                    stat_sessions_stale_finalized.fetch_add(1);
+                }
+            }
+        }
+
+        if (config.session_retention_sec > 0) {
+            const uint64_t retention_window_us = (uint64_t) config.session_retention_sec * 1000000ull;
+            const uint64_t prune_cutoff = now_unix_us > retention_window_us ? now_unix_us - retention_window_us : 0;
+            std::vector<prune_candidate> prune_candidates;
+            collect_prune_candidates(prune_cutoff, &prune_candidates);
+            for (const auto & candidate : prune_candidates) {
+                try_prune_session(candidate);
+            }
+        }
+    }
+
+    void maybe_run_session_maintenance(uint64_t * last_maintenance_unix_us) {
+        if (config.stale_finalize_timeout_sec <= 0 && config.session_retention_sec <= 0) {
+            return;
+        }
+        const uint64_t now_unix_us = unix_now_us();
+        const uint64_t interval_us = (uint64_t) std::max<int32_t>(1, config.cleanup_interval_sec) * 1000000ull;
+        if (*last_maintenance_unix_us > 0 && now_unix_us > *last_maintenance_unix_us) {
+            const uint64_t elapsed = now_unix_us - *last_maintenance_unix_us;
+            if (elapsed < interval_us) {
+                return;
+            }
+        }
+        *last_maintenance_unix_us = now_unix_us;
+        run_session_maintenance();
+    }
+
     void accept_loop() {
+        uint64_t last_maintenance_unix_us = 0;
         while (!stop_requested.load()) {
             reap_worker_threads();
+            maybe_run_session_maintenance(&last_maintenance_unix_us);
 
             const int current_listen_fd = listen_fd;
             if (current_listen_fd < 0) {
@@ -1364,36 +1499,47 @@ struct kv_receiver_service::impl {
                 session->session_id, config.slot_id, id_task);
     }
 
-    void try_finalize_session(const std::shared_ptr<session_state> & session) {
-        bool should_finalize = false;
+    bool try_finalize_session(const std::shared_ptr<session_state> & session, bool force, const char * reason) {
+        size_t done_streams = 0;
+        size_t expected_streams = 0;
         {
             std::lock_guard<std::mutex> lock(session->mutex);
             if (session->finalized) {
-                return;
+                return false;
             }
 
             const size_t expected = session->expected_streams > 0
                 ? (size_t) session->expected_streams
                 : std::max<size_t>(1, session->seen_stream_ids.size());
+            done_streams = session->done_stream_ids.size();
+            expected_streams = expected;
 
-            if (session->done_stream_ids.size() < expected) {
-                return;
+            if (!force && done_streams < expected) {
+                return false;
             }
 
             session->finalized = true;
-            should_finalize = true;
+            if (force && session->last_error.empty()) {
+                session->last_error = std::string("forced finalize: ") + (reason != nullptr ? reason : "unknown");
+            }
         }
 
-        if (!should_finalize) {
-            return;
-        }
+        KVR_INF("finalizing session sid=%" PRIu64 " reason=%s force=%s done_streams=%zu expected_streams=%zu\n",
+                session->session_id,
+                (reason != nullptr && reason[0] != '\0') ? reason : "stream-done",
+                force ? "true" : "false",
+                done_streams,
+                expected_streams);
 
         std::string err;
         if (!reassemble_session_artifact(session, &err)) {
             mark_session_error(session, err);
             write_session_summary(session);
-            KVR_WRN("session finalize failed sid=%" PRIu64 " err=%s\n", session->session_id, err.c_str());
-            return;
+            KVR_WRN("session finalize failed sid=%" PRIu64 " reason=%s err=%s\n",
+                    session->session_id,
+                    (reason != nullptr && reason[0] != '\0') ? reason : "stream-done",
+                    err.c_str());
+            return true;
         }
         stat_artifacts_reassembled.fetch_add(1);
 
@@ -1407,8 +1553,11 @@ struct kv_receiver_service::impl {
         if (!validation_ok) {
             mark_session_error(session, validation_err);
             write_session_summary(session);
-            KVR_WRN("artifact validation failed sid=%" PRIu64 " err=%s\n", session->session_id, validation_err.c_str());
-            return;
+            KVR_WRN("artifact validation failed sid=%" PRIu64 " reason=%s err=%s\n",
+                    session->session_id,
+                    (reason != nullptr && reason[0] != '\0') ? reason : "stream-done",
+                    validation_err.c_str());
+            return true;
         }
         stat_artifacts_validated.fetch_add(1);
 
@@ -1417,11 +1566,12 @@ struct kv_receiver_service::impl {
             KVR_INF("dry-run mode: skipping slot restore sid=%" PRIu64 " artifact=%s\n",
                     session->session_id, session->artifact_path.c_str());
             write_session_summary(session);
-            return;
+            return true;
         }
 
         enqueue_slot_restore(session);
         write_session_summary(session);
+        return true;
     }
 
     void process_frame(int fd, const tbp_frame & frame) {
@@ -1586,7 +1736,7 @@ struct kv_receiver_service::impl {
                     std::lock_guard<std::mutex> lock(session->mutex);
                     session->done_stream_ids.insert(frame.stream_id);
                 }
-                try_finalize_session(session);
+                try_finalize_session(session, false, "stream-done");
             } break;
             default:
                 KVR_DBG("ignored unknown TBP frame type=%u sid=%" PRIu64 "\n", frame.msg_type, frame.session_id);
@@ -1638,6 +1788,9 @@ kv_receiver_config kv_receiver_config_from_params(const gpt_params & params) {
 
     cfg.max_connections = params.kv_receiver_max_connections;
     cfg.idle_timeout_sec = params.kv_receiver_idle_timeout_sec;
+    cfg.stale_finalize_timeout_sec = params.kv_receiver_stale_finalize_timeout_sec;
+    cfg.session_retention_sec = params.kv_receiver_session_retention_sec;
+    cfg.cleanup_interval_sec = params.kv_receiver_cleanup_interval_sec;
     cfg.socket_send_buf = params.kv_receiver_socket_send_buf;
     cfg.socket_recv_buf = params.kv_receiver_socket_recv_buf;
 
