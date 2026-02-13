@@ -115,6 +115,7 @@ There is no single point of reference describing all new `ik_llama.cpp` features
 * [RDMA + KV handoff implementation log](docs/development/rdma_kv_handoff_implementation_log.md)
 * [RTX5090 -> dual-Mac setup guide](docs/development/rtx5090_dual_mac_prefill_decode_setup.md)
 * [RTX5090 -> dual-Mac test guide](docs/development/rtx5090_dual_mac_prefill_decode_tests.md)
+* [Single-machine buffered prefill/decode E2E suite](docs/development/single_machine_buffered_e2e.md)
 
 ## Testing
 

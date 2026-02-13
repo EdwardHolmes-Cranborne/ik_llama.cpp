@@ -47,6 +47,11 @@
    - Split handoff now treats `kv_transport=disabled` as a real fallback to local decode (no false transport success).
    - Split handoff publish now rejects filesystem backend in transport-required paths.
    - Decode alias ordering fixed in CLI arg tables to satisfy parser invariants.
+14. Added single-machine buffered prefill->decode E2E harness (no core engine edits):
+   - New orchestrator script: `scripts/run_single_machine_buffered_e2e.sh`
+   - New replay utility: `scripts/tbp_replay_to_kv_receiver.py`
+   - New guide: `docs/development/single_machine_buffered_e2e.md`
+   - Receiver validation upgraded to assert `artifacts_reassembled`, `artifacts_validated`, `restore_tasks_enqueued`, and finalized validated session state.
 
 ### Commits produced
 
@@ -71,6 +76,10 @@
    - `llama-server --help` includes all new `--kv-recv*` and `--kv-transport*` options.
 3. No-regression checks:
    - Existing slot restore fallback path (`.kva` import via KV bridge) remains unchanged in `server-context.cpp`.
+4. Script/tooling validation:
+   - `python3 -m py_compile scripts/tbp_replay_to_kv_receiver.py` passes.
+   - `bash -n scripts/run_single_machine_buffered_e2e.sh` passes.
+   - `scripts/* --help` smoke checks pass.
 
 ### Remaining work for full gate closure
 
@@ -80,3 +89,4 @@
 2. Long soak and failure-injection runs over transport fallback matrix.
 3. Decode quality and first-token parity reporting against local baseline.
 4. Throughput and latency baselining for `tcp` vs `rdma` mode selection on the real USB4/TB fabric.
+5. Execute and archive the single-machine buffered suite on real model artifacts (requires local socket/model runtime; not runnable in this sandbox).
