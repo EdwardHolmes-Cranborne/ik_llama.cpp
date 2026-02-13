@@ -197,3 +197,29 @@ Pass criteria:
    - `/tmp/ik_kv_handoff/session_*/session_summary.json`
 3. Decode server logs and RPC server logs
 4. Prefill host logs with transport mode and threshold settings
+
+## 10. Phase-1 queue validation
+
+1. Local queue self-test:
+
+```bash
+cd /path/to/ik_llama.cpp
+./scripts/test_prefill_decode_job_queue.sh
+```
+
+2. Guardrail check (must reject invalid stream count):
+
+```bash
+./scripts/prefill_decode_job_queue.py submit \
+  --mode external_command \
+  --command "/bin/echo --kv-streams 2"
+```
+
+Expected: submission fails with guardrail violation.
+
+3. Serialized worker check on real commands:
+
+- Start queue worker
+- Submit multiple jobs
+- Verify `status` shows at most one active non-terminal job at a time
+- Verify completed jobs progress through `prefill_running -> artifact_ready -> handoff_running -> decode_running -> done`

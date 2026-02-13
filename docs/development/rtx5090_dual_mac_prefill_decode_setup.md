@@ -162,3 +162,28 @@ Use the same deployment and change only these controls:
 1. Start with `--kv-recv-dry-run` on decode for transport-only validation.
 2. Then remove dry-run to allow slot restore/import.
 3. Keep prompt lengths above the computed crossover for RTX prefill benefits; with `--prefill-min-stream-batch-tokens -1`, crossover remains auto-derived from runtime inputs.
+
+## 9. Phase-1 serialized queue mode (recommended current default)
+
+Use the queue worker to enforce one active handoff/decode job and avoid multi-sequence import collisions:
+
+```bash
+cd /path/to/ik_llama.cpp
+./scripts/prefill_decode_job_queue.py init
+./scripts/prefill_decode_job_queue.py worker
+```
+
+For deployment integration, submit `external_command` jobs that run your prefill+handoff wrapper:
+
+```bash
+./scripts/prefill_decode_job_queue.py submit \
+  --mode external_command \
+  --command "/path/to/your_prefill_handoff_wrapper.sh" \
+  --kv-transport auto
+```
+
+Queue env exported to the child process includes:
+
+- `IK_PDQ_JOB_ID`
+- `IK_PDQ_JOB_MODE`
+- `IK_PDQ_KV_TRANSPORT`

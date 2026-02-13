@@ -60,6 +60,7 @@
    - Added submit-time guardrails for external commands:
      reject `--kv-streams != 1` and reject graph-split restore commands without flash-attn.
    - Added per-job transport metadata (`--kv-transport`) exported to worker child env (`IK_PDQ_KV_TRANSPORT`).
+   - Added queue-mode usage and validation sections to dual-Mac setup/test guides.
    - Buffered E2E runner now supports threshold-preserving prefill mode selection:
      `--prefill-min-stream-batch-tokens` (default `-1`, runtime crossover logic).
 
