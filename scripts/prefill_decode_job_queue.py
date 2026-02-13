@@ -360,6 +360,10 @@ def run_phase2_prefill_stage(
         "--loopback-idle-timeout", str(req["loopback_idle_timeout"]),
         "--output-dir", str(stage_dir),
     ]
+    if bool(req.get("kv_transport_fallback", True)):
+        cmd.append("--kv-transport-fallback")
+    else:
+        cmd.append("--no-kv-transport-fallback")
 
     stage_dir.mkdir(parents=True, exist_ok=True)
     (stage_dir / "queue_command.txt").write_text(shell_join(cmd) + "\n", encoding="utf-8")
@@ -414,9 +418,14 @@ def run_phase2_handoff_stage(
         "--artifact", artifact_path,
         "--decode-host", str(req["decode_host"]),
         "--decode-port", str(req["decode_port"]),
+        "--kv-transport", str(req.get("kv_transport", "auto")),
         "--kv-chunk-bytes", str(req["kv_chunk_bytes"]),
         "--output-dir", str(stage_dir),
     ]
+    if bool(req.get("kv_transport_fallback", True)):
+        cmd.append("--kv-transport-fallback")
+    else:
+        cmd.append("--no-kv-transport-fallback")
     if bool(req.get("replay_ack_required", True)):
         cmd.append("--ack-required")
     if bool(req.get("replay_wait_ack", True)):
@@ -549,6 +558,8 @@ def cmd_submit(args: argparse.Namespace) -> int:
             raise SystemExit("phase2_split_pipeline mode requires --model --prompt-file --rtx-repo")
         if not args.decode_host:
             raise SystemExit("phase2_split_pipeline mode requires --decode-host")
+        if str(args.kv_transport) == "disabled":
+            raise SystemExit("phase2_split_pipeline mode requires kv transport enabled (use auto|rdma|tcp|mixed)")
         require_file(args.model, "model")
         require_file(args.prompt_file, "prompt file")
         if not Path(args.rtx_repo).is_dir():
@@ -582,6 +593,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
             "mode": mode,
             "command": str(args.command),
             "kv_transport": str(args.kv_transport),
+            "kv_transport_fallback": bool(args.kv_transport_fallback),
             "enforce_guardrails": bool(args.enforce_guardrails),
             "model": str(Path(args.model).resolve()) if args.model else "",
             "prompt_file": str(Path(args.prompt_file).resolve()) if args.prompt_file else "",
@@ -1045,9 +1057,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     p_submit.add_argument("--command", default="", help="command for external_command mode")
     p_submit.add_argument("--kv-transport", choices=["auto", "tcp", "rdma", "mixed", "disabled"], default="auto")
+    p_submit.add_argument("--kv-transport-fallback", dest="kv_transport_fallback", action="store_true")
+    p_submit.add_argument("--no-kv-transport-fallback", dest="kv_transport_fallback", action="store_false")
     p_submit.add_argument("--enforce-guardrails", dest="enforce_guardrails", action="store_true")
     p_submit.add_argument("--no-enforce-guardrails", dest="enforce_guardrails", action="store_false")
-    p_submit.set_defaults(enforce_guardrails=True)
+    p_submit.set_defaults(enforce_guardrails=True, kv_transport_fallback=True)
 
     p_submit.add_argument("--model", default="")
     p_submit.add_argument("--prompt-file", default="")

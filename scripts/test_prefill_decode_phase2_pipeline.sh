@@ -61,10 +61,14 @@ set -euo pipefail
 ARTIFACT_PATH=""
 OUTPUT_DIR=""
 DECODE_SMOKE=0
+KV_TRANSPORT=""
+HAS_TRANSPORT_FALLBACK=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --artifact) ARTIFACT_PATH="$2"; shift 2 ;;
     --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
+    --kv-transport) KV_TRANSPORT="$2"; shift 2 ;;
+    --kv-transport-fallback) HAS_TRANSPORT_FALLBACK=1; shift 1 ;;
     --decode-smoke) DECODE_SMOKE=1; shift 1 ;;
     *) shift 1 ;;
   esac
@@ -76,6 +80,14 @@ if [[ -z "${ARTIFACT_PATH}" || -z "${OUTPUT_DIR}" ]]; then
 fi
 if [[ ! -f "${ARTIFACT_PATH}" ]]; then
   echo "artifact missing: ${ARTIFACT_PATH}" >&2
+  exit 2
+fi
+if [[ "${KV_TRANSPORT}" != "rdma" ]]; then
+  echo "expected --kv-transport rdma, got '${KV_TRANSPORT}'" >&2
+  exit 2
+fi
+if [[ "${HAS_TRANSPORT_FALLBACK}" != "0" ]]; then
+  echo "expected no --kv-transport-fallback flag in test path" >&2
   exit 2
 fi
 
@@ -115,6 +127,8 @@ python3 "${QUEUE_SCRIPT}" --spool-dir "${SPOOL_DIR}" submit \
   --prompt-file "${PROMPT_A}" \
   --rtx-repo "${RTX_REPO}" \
   --decode-host 127.0.0.1 \
+  --kv-transport rdma \
+  --no-kv-transport-fallback \
   --decode-smoke \
   --priority 10 \
   --max-prefill-retries 0 \
@@ -126,6 +140,8 @@ python3 "${QUEUE_SCRIPT}" --spool-dir "${SPOOL_DIR}" submit \
   --prompt-file "${PROMPT_B}" \
   --rtx-repo "${RTX_REPO}" \
   --decode-host 127.0.0.1 \
+  --kv-transport rdma \
+  --no-kv-transport-fallback \
   --decode-smoke \
   --priority 5 \
   --max-prefill-retries 0 \

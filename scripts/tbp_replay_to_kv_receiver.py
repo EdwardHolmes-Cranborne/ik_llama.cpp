@@ -2,13 +2,15 @@
 """
 Replay a captured KV artifact (or chunk directory) to the ik KV receiver over TBP.
 
-This is intended for single-machine buffered E2E validation:
-1) prefill sender -> loopback disk buffer
-2) replay disk buffer -> ik llama-server /kv-receiver
+Supports transport mode selection for phase-2 handoff workflows:
+- tcp
+- rdma (address/interface selection semantics)
+- auto|mixed (mode fallback order)
 """
 
 import argparse
 import json
+import os
 import socket
 import struct
 import time
@@ -28,6 +30,51 @@ TBP_MSG_KV_CHUNK = 8
 TBP_MSG_KV_SEGMENT_END = 9
 TBP_MSG_KV_ACK = 10
 TBP_MSG_KV_DONE = 12
+
+
+def env_str(key: str, default: str = "") -> str:
+    val = os.environ.get(key, "")
+    return val if val else default
+
+
+def env_int(key: str, default: int) -> int:
+    raw = os.environ.get(key, "")
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def split_csv(raw: str) -> List[str]:
+    out: List[str] = []
+    for item in raw.split(","):
+        v = item.strip()
+        if v and v not in out:
+            out.append(v)
+    return out
+
+
+def normalize_transport_mode(raw: str) -> str:
+    mode = raw.strip().lower()
+    if mode == "tb-direct":
+        return "rdma"
+    if mode in ("tb-ethernet", "ethernet"):
+        return "tcp"
+    return mode
+
+
+def mode_order(mode: str, fallback: bool) -> List[str]:
+    if mode in ("auto", "mixed"):
+        return ["rdma", "tcp"]
+    if mode == "rdma":
+        return ["rdma", "tcp"] if fallback else ["rdma"]
+    if mode == "tcp":
+        return ["tcp", "rdma"] if fallback else ["tcp"]
+    if mode == "disabled":
+        return ["disabled"]
+    return []
 
 
 def crc32_u32(data: bytes) -> int:
@@ -164,13 +211,135 @@ def send_frame(
     sock.sendall(frame)
 
 
+def parse_endpoint(raw: str) -> Tuple[str, int]:
+    text = raw.strip()
+    if not text:
+        raise ValueError("empty endpoint")
+
+    if text.startswith("["):
+        # [ipv6]:port
+        end = text.find("]")
+        if end <= 1 or end + 2 > len(text) or text[end + 1] != ":":
+            raise ValueError(f"invalid endpoint format: {raw}")
+        host = text[1:end]
+        port = int(text[end + 2 :])
+        return host, port
+
+    if ":" not in text:
+        raise ValueError(f"missing port in endpoint: {raw}")
+    host, port_text = text.rsplit(":", 1)
+    if not host:
+        raise ValueError(f"missing host in endpoint: {raw}")
+    return host, int(port_text)
+
+
+def default_endpoint_for_mode(mode: str, host_arg: str, port_arg: int) -> str:
+    if mode == "rdma":
+        explicit = env_str("LLAMA_PREFILL_KV_RDMA_ENDPOINT", env_str("LLAMA_PREFILL_TB_ENDPOINT", ""))
+        if explicit:
+            return explicit
+        host = env_str("LLAMA_PREFILL_KV_RDMA_HOST", env_str("LLAMA_PREFILL_KV_HOST", host_arg))
+        port = env_int("LLAMA_PREFILL_KV_RDMA_PORT", env_int("LLAMA_PREFILL_KV_PORT", port_arg))
+        return f"{host}:{port}"
+
+    # tcp path
+    explicit = env_str("LLAMA_PREFILL_KV_TCP_ENDPOINT", "")
+    if explicit:
+        return explicit
+    host = env_str("LLAMA_PREFILL_KV_HOST", host_arg)
+    port = env_int("LLAMA_PREFILL_KV_PORT", port_arg)
+    return f"{host}:{port}"
+
+
+def resolve_endpoints(mode: str, args: argparse.Namespace) -> List[str]:
+    out: List[str] = []
+
+    def add(ep: str) -> None:
+        ep = ep.strip()
+        if not ep:
+            return
+        if ep not in out:
+            out.append(ep)
+
+    add(args.endpoint)
+    for ep in split_csv(args.peer_addrs):
+        add(ep)
+
+    env_peers = split_csv(env_str("LLAMA_PREFILL_KV_PEER_ADDRS", ""))
+    for ep in env_peers:
+        add(ep)
+
+    if mode == "rdma":
+        for ep in split_csv(env_str("LLAMA_PREFILL_KV_RDMA_PEER_ADDRS", "")):
+            add(ep)
+    else:
+        for ep in split_csv(env_str("LLAMA_PREFILL_KV_TCP_PEER_ADDRS", "")):
+            add(ep)
+
+    add(default_endpoint_for_mode(mode, args.host, args.port))
+
+    return out
+
+
+def resolve_bind_addrs(mode: str, args: argparse.Namespace) -> List[str]:
+    if args.bind_addrs.strip():
+        return split_csv(args.bind_addrs)
+
+    if mode == "rdma":
+        raw = env_str("LLAMA_PREFILL_KV_RDMA_BIND_ADDRS", env_str("LLAMA_PREFILL_KV_BIND_ADDRS", ""))
+    else:
+        raw = env_str("LLAMA_PREFILL_KV_TCP_BIND_ADDRS", env_str("LLAMA_PREFILL_KV_BIND_ADDRS", ""))
+    return split_csv(raw)
+
+
+def connect_transport(mode: str, args: argparse.Namespace) -> Tuple[socket.socket, str, str]:
+    endpoints = resolve_endpoints(mode, args)
+    if not endpoints:
+        raise RuntimeError(f"no endpoints resolved for mode={mode}")
+
+    bind_addrs = resolve_bind_addrs(mode, args)
+    bind_candidates = [""]
+    bind_candidates.extend([b for b in bind_addrs if b])
+
+    timeout_sec = max(0.05, float(args.connect_timeout_ms) / 1000.0)
+    errors: List[str] = []
+
+    for endpoint in endpoints:
+        try:
+            host, port = parse_endpoint(endpoint)
+        except Exception as exc:
+            errors.append(f"{endpoint}: parse failed ({exc})")
+            continue
+
+        for bind_addr in bind_candidates:
+            source = (bind_addr, 0) if bind_addr else None
+            try:
+                sock = socket.create_connection((host, port), timeout=timeout_sec, source_address=source)
+                return sock, endpoint, bind_addr
+            except OSError as exc:
+                btxt = bind_addr if bind_addr else "<none>"
+                errors.append(f"{endpoint} bind={btxt}: {exc}")
+
+    joined = "; ".join(errors[-6:])
+    raise RuntimeError(f"connect failed for mode={mode}: {joined}")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Replay buffered KV stream to ik kv-receiver")
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument("--artifact", help="path to KV artifact file")
     src.add_argument("--chunks-dir", help="directory containing seq_*.bin chunk files")
+
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=19001)
+    ap.add_argument("--endpoint", default="", help="explicit endpoint host:port override")
+    ap.add_argument("--peer-addrs", default="", help="comma-separated peer endpoint overrides")
+    ap.add_argument("--bind-addrs", default="", help="comma-separated local source addresses for outgoing socket bind")
+
+    ap.add_argument("--transport-mode", default="tcp", help="auto|rdma|tcp|mixed|disabled (aliases: tb-direct,tb-ethernet,ethernet)")
+    ap.add_argument("--transport-fallback", action="store_true", help="allow rdma<->tcp fallback when transport-mode is strict")
+    ap.add_argument("--connect-timeout-ms", type=int, default=5000)
+
     ap.add_argument("--session-id", default="")
     ap.add_argument("--stream-id", type=int, default=1)
     ap.add_argument("--chunk-bytes", type=int, default=4 * 1024 * 1024)
@@ -182,6 +351,15 @@ def main() -> int:
     ap.add_argument("--execution-mode", choices=["coupled", "decoupled"], default="coupled")
     ap.add_argument("--output", default="", help="optional json summary output path")
     args = ap.parse_args()
+
+    requested_mode = normalize_transport_mode(str(args.transport_mode))
+    if requested_mode not in {"auto", "rdma", "tcp", "mixed", "disabled"}:
+        raise SystemExit(
+            f"invalid --transport-mode '{args.transport_mode}' "
+            "(allowed: auto,rdma,tcp,mixed,disabled; aliases: tb-direct,tb-ethernet,ethernet)"
+        )
+    if requested_mode == "disabled":
+        raise SystemExit("transport mode 'disabled' cannot replay artifact")
 
     if args.session_id:
         wire_session_id = parse_session_id(args.session_id)
@@ -215,8 +393,31 @@ def main() -> int:
     ack_frames_seen = 0
     nack_frames_seen = 0
 
+    attempts = mode_order(requested_mode, bool(args.transport_fallback))
+    if not attempts:
+        raise SystemExit(f"could not resolve transport mode order for mode={requested_mode}")
+
+    connect_errors: List[str] = []
+    sock: Optional[socket.socket] = None
+    resolved_mode = ""
+    resolved_endpoint = ""
+    resolved_bind_addr = ""
+    for mode in attempts:
+        if mode == "disabled":
+            continue
+        try:
+            sock, resolved_endpoint, resolved_bind_addr = connect_transport(mode, args)
+            resolved_mode = mode
+            break
+        except Exception as exc:
+            connect_errors.append(f"{mode}: {exc}")
+
+    if sock is None:
+        detail = "; ".join(connect_errors[-6:])
+        raise SystemExit(f"transport connect failed: {detail}")
+
     started = time.time()
-    with socket.create_connection((args.host, args.port), timeout=5.0) as sock:
+    with sock:
         # HELLO
         send_frame(
             sock,
@@ -238,7 +439,8 @@ def main() -> int:
             payload_text=(
                 f"mode={args.mode};artifact={artifact_name};bytes={total_bytes};"
                 f"remote_nodes=1;execution_mode={args.execution_mode};streams=1;"
-                f"ack_required={1 if args.ack_required else 0};balance=roundrobin;replay=1"
+                f"ack_required={1 if args.ack_required else 0};balance=roundrobin;"
+                f"replay=1;transport_mode={resolved_mode}"
             ),
         )
         seq += 1
@@ -347,6 +549,13 @@ def main() -> int:
         "ok": True,
         "host": args.host,
         "port": args.port,
+        "transport_mode_requested": requested_mode,
+        "transport_mode_resolved": resolved_mode,
+        "transport_backend": resolved_mode,
+        "transport_fallback": bool(args.transport_fallback),
+        "endpoint": resolved_endpoint,
+        "bind_addr": resolved_bind_addr,
+        "mode_attempt_order": attempts,
         "session_id": wire_session_id,
         "stream_id": stream_id,
         "source": str(source_path),

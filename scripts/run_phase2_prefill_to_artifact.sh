@@ -11,6 +11,7 @@ CTX_SIZE=32768
 N_PREDICT=128
 PREFILL_MIN_STREAM_BATCH_TOKENS=-1
 KV_TRANSPORT="${IK_PDQ_KV_TRANSPORT:-auto}"
+KV_TRANSPORT_FALLBACK=1
 KV_STREAM_CHUNK_BYTES=$((4 * 1024 * 1024))
 KV_MAX_INFLIGHT_BYTES=$((256 * 1024 * 1024))
 BUFFER_HOST="127.0.0.1"
@@ -34,6 +35,8 @@ Optional:
   --n-predict N
   --prefill-min-stream-batch-tokens N
   --kv-transport MODE          auto|tcp|rdma|mixed|disabled
+  --kv-transport-fallback
+  --no-kv-transport-fallback
   --kv-stream-chunk-bytes N
   --kv-max-inflight-bytes N
   --buffer-port N
@@ -61,6 +64,8 @@ while [[ $# -gt 0 ]]; do
         --n-predict) N_PREDICT="$2"; shift 2 ;;
         --prefill-min-stream-batch-tokens) PREFILL_MIN_STREAM_BATCH_TOKENS="$2"; shift 2 ;;
         --kv-transport) KV_TRANSPORT="$2"; shift 2 ;;
+        --kv-transport-fallback) KV_TRANSPORT_FALLBACK=1; shift 1 ;;
+        --no-kv-transport-fallback) KV_TRANSPORT_FALLBACK=0; shift 1 ;;
         --kv-stream-chunk-bytes) KV_STREAM_CHUNK_BYTES="$2"; shift 2 ;;
         --kv-max-inflight-bytes) KV_MAX_INFLIGHT_BYTES="$2"; shift 2 ;;
         --buffer-port) BUFFER_PORT="$2"; shift 2 ;;
@@ -143,7 +148,7 @@ LLAMA_PREFILL_TB_ENABLE=1 \
   --prefill-transport-mode progressive \
   --prefill-execution-mode coupled \
   --kv-transport "${KV_TRANSPORT}" \
-  --kv-transport-fallback \
+  $([[ "${KV_TRANSPORT_FALLBACK}" == "1" ]] && echo "--kv-transport-fallback") \
   --kv-host "${BUFFER_HOST}" \
   --kv-port "${BUFFER_PORT}" \
   --kv-streams 1 \
@@ -177,7 +182,7 @@ LLAMA_PREFILL_TB_ENABLE=1 \
   --prefill-transport-mode progressive \
   --prefill-execution-mode coupled \
   --kv-transport "${KV_TRANSPORT}" \
-  --kv-transport-fallback \
+  $([[ "${KV_TRANSPORT_FALLBACK}" == "1" ]] && echo "--kv-transport-fallback") \
   --kv-host "${BUFFER_HOST}" \
   --kv-port "${BUFFER_PORT}" \
   --kv-streams 1 \
@@ -201,6 +206,7 @@ cat > "${META_PATH}" <<EOF
   "artifact_path": "${ARTIFACT_PATH}",
   "artifact_bytes": ${ARTIFACT_BYTES},
   "kv_transport": "${KV_TRANSPORT}",
+  "kv_transport_fallback": ${KV_TRANSPORT_FALLBACK},
   "buffer_host": "${BUFFER_HOST}",
   "buffer_port": ${BUFFER_PORT}
 }

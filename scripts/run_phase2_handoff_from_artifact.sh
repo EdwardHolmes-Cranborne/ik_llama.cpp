@@ -8,6 +8,8 @@ REPLAY_SCRIPT="${IK_REPO}/scripts/tbp_replay_to_kv_receiver.py"
 ARTIFACT_PATH=""
 DECODE_HOST=""
 DECODE_PORT=19001
+KV_TRANSPORT="${IK_PDQ_KV_TRANSPORT:-auto}"
+KV_TRANSPORT_FALLBACK=1
 KV_CHUNK_BYTES=$((4 * 1024 * 1024))
 ACK_REQUIRED=0
 WAIT_ACK=0
@@ -27,6 +29,9 @@ Required:
 
 Optional:
   --decode-port N
+  --kv-transport MODE         auto|tcp|rdma|mixed|disabled
+  --kv-transport-fallback
+  --no-kv-transport-fallback
   --kv-chunk-bytes N
   --ack-required
   --wait-ack
@@ -44,6 +49,9 @@ while [[ $# -gt 0 ]]; do
         --artifact) ARTIFACT_PATH="$2"; shift 2 ;;
         --decode-host) DECODE_HOST="$2"; shift 2 ;;
         --decode-port) DECODE_PORT="$2"; shift 2 ;;
+        --kv-transport) KV_TRANSPORT="$2"; shift 2 ;;
+        --kv-transport-fallback) KV_TRANSPORT_FALLBACK=1; shift 1 ;;
+        --no-kv-transport-fallback) KV_TRANSPORT_FALLBACK=0; shift 1 ;;
         --kv-chunk-bytes) KV_CHUNK_BYTES="$2"; shift 2 ;;
         --ack-required) ACK_REQUIRED=1; shift 1 ;;
         --wait-ack) WAIT_ACK=1; shift 1 ;;
@@ -74,6 +82,17 @@ if [[ ! -f "${REPLAY_SCRIPT}" ]]; then
     echo "replay script not found: ${REPLAY_SCRIPT}" >&2
     exit 2
 fi
+case "${KV_TRANSPORT}" in
+    auto|tcp|rdma|mixed|disabled) ;;
+    *)
+        echo "invalid --kv-transport: ${KV_TRANSPORT}" >&2
+        exit 2
+        ;;
+esac
+if [[ "${KV_TRANSPORT}" == "disabled" ]]; then
+    echo "kv transport mode 'disabled' cannot replay artifact to decode receiver" >&2
+    exit 2
+fi
 
 mkdir -p "${OUTPUT_DIR}"
 REPLAY_JSON="${OUTPUT_DIR}/replay_result.json"
@@ -88,11 +107,15 @@ fi
 echo "[phase2/2] replay artifact"
 replay_args=(
   --artifact "${ARTIFACT_PATH}"
+  --transport-mode "${KV_TRANSPORT}"
   --host "${DECODE_HOST}"
   --port "${DECODE_PORT}"
   --chunk-bytes "${KV_CHUNK_BYTES}"
   --output "${REPLAY_JSON}"
 )
+if [[ "${KV_TRANSPORT_FALLBACK}" == "1" ]]; then
+    replay_args+=(--transport-fallback)
+fi
 if [[ "${ACK_REQUIRED}" == "1" ]]; then
     replay_args+=(--ack-required)
 fi
@@ -128,6 +151,8 @@ cat > "${META_PATH}" <<EOF
   "artifact_path": "${ARTIFACT_PATH}",
   "decode_host": "${DECODE_HOST}",
   "decode_port": ${DECODE_PORT},
+  "kv_transport": "${KV_TRANSPORT}",
+  "kv_transport_fallback": ${KV_TRANSPORT_FALLBACK},
   "decode_http_url": "${DECODE_HTTP_URL}",
   "decode_smoke": ${DECODE_SMOKE},
   "replay_output": "${REPLAY_JSON}",
