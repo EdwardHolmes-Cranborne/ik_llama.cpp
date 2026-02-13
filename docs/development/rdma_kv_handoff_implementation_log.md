@@ -84,6 +84,8 @@
 - `eaed6ee0` Honor sender ACK policy and NACK on chunk persistence errors
 - `fe16986e` Add KV receiver stale-finalize and session retention maintenance
 - `efb93a5` [RTX fork] Require network transport for split handoff and fix decode arg alias order
+- `2d42d766` Harden phase-1 queue worker launch failure handling
+- `344fb3fb` Document phase-1 queue launch-failure hardening
 
 ### Verification completed
 
