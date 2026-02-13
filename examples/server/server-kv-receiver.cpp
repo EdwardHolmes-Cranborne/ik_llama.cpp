@@ -1490,25 +1490,28 @@ struct kv_receiver_service::impl {
                 }
 
                 if (config.ack_enabled) {
-                    const std::string ack_payload = (!crc_ok && config.nack_on_crc_bad) ? "nack=crc" : "ack=1";
-                    std::string ack_err;
-                    if (!send_tbp_frame(fd,
-                                        TBP_MSG_KV_ACK,
-                                        0,
-                                        frame.session_id,
-                                        frame.stream_id,
-                                        frame.seq_no,
-                                        reinterpret_cast<const uint8_t *>(ack_payload.data()),
-                                        ack_payload.size(),
-                                        &ack_err)) {
-                        mark_session_error(session, ack_err);
-                        KVR_WRN("failed sending ACK sid=%" PRIu64 " stream=%" PRIu64 " seq=%" PRIu64 " err=%s\n",
-                                frame.session_id, frame.stream_id, frame.seq_no, ack_err.c_str());
-                    } else {
-                        if (ack_payload == "ack=1") {
-                            stat_ack_sent.fetch_add(1);
+                    const bool send_crc_failure_response = crc_ok || config.nack_on_crc_bad;
+                    if (send_crc_failure_response) {
+                        const std::string ack_payload = (!crc_ok) ? "nack=crc" : "ack=1";
+                        std::string ack_err;
+                        if (!send_tbp_frame(fd,
+                                            TBP_MSG_KV_ACK,
+                                            0,
+                                            frame.session_id,
+                                            frame.stream_id,
+                                            frame.seq_no,
+                                            reinterpret_cast<const uint8_t *>(ack_payload.data()),
+                                            ack_payload.size(),
+                                            &ack_err)) {
+                            mark_session_error(session, ack_err);
+                            KVR_WRN("failed sending ACK sid=%" PRIu64 " stream=%" PRIu64 " seq=%" PRIu64 " err=%s\n",
+                                    frame.session_id, frame.stream_id, frame.seq_no, ack_err.c_str());
                         } else {
-                            stat_nack_sent.fetch_add(1);
+                            if (ack_payload == "ack=1") {
+                                stat_ack_sent.fetch_add(1);
+                            } else {
+                                stat_nack_sent.fetch_add(1);
+                            }
                         }
                     }
                 }
