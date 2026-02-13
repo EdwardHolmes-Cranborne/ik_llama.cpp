@@ -32,6 +32,8 @@
 8. Added receiver payload-byte completeness enforcement:
    - Parses expected payload bytes from session/segment metadata.
    - Verifies reassembled artifact byte size before validation/restore queueing.
+9. Corrected CRC failure signaling behavior:
+   - When `--kv-recv-no-nack-on-crc-bad` is set, receiver no longer sends false positive ACKs on CRC-bad chunks.
 
 ### Commits produced
 
@@ -42,6 +44,7 @@
 - `aec132a0` Add RTX5090 dual-Mac deployment and test guides
 - `6844c1fb` Harden KV receiver chunk completeness and payload parsing
 - `9979071b` Track expected KV payload bytes for receiver validation
+- `efcd76cf` Avoid false ACKs on CRC failures when NACKs are disabled
 
 ### Verification completed
 
