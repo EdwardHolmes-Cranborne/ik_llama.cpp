@@ -34,6 +34,8 @@
    - Verifies reassembled artifact byte size before validation/restore queueing.
 9. Corrected CRC failure signaling behavior:
    - When `--kv-recv-no-nack-on-crc-bad` is set, receiver no longer sends false positive ACKs on CRC-bad chunks.
+10. Tightened chunk-set completeness enforcement:
+   - Receiver now enforces exact chunk-count match (`got == expected`) when `chunks_sent` metadata is present.
 
 ### Commits produced
 
@@ -45,6 +47,7 @@
 - `6844c1fb` Harden KV receiver chunk completeness and payload parsing
 - `9979071b` Track expected KV payload bytes for receiver validation
 - `efcd76cf` Avoid false ACKs on CRC failures when NACKs are disabled
+- `d3e9e38c` Enforce strict expected chunk count on KV reassembly
 
 ### Verification completed
 
