@@ -13,6 +13,12 @@
 #include <assert.h>
 #include <vector>
 #include <stdint.h>
+#include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <string>
+
+namespace fs = std::filesystem;
 
 // Test counters
 static int tests_passed = 0;
@@ -181,6 +187,31 @@ static std::vector<uint8_t> build_rtx_artifact(size_t header_size, const std::ve
 
     memcpy(artifact.data() + header_size, payload.data(), payload.size());
     return artifact;
+}
+
+static std::string make_test_cache_dir(const char * tag) {
+    const auto ts = std::chrono::steady_clock::now().time_since_epoch().count();
+    return std::string("/tmp/ik_kv_plan_cache_") + tag + "_" + std::to_string((long long) ts);
+}
+
+static void build_compatible_src_dst(
+        ik_kv_source_descriptor_t & src,
+        ik_kv_dest_descriptor_t & dst) {
+    memset(&src, 0, sizeof(src));
+    memset(&dst, 0, sizeof(dst));
+
+    src.n_layers = dst.n_layers = 32;
+    src.n_ctx = dst.n_ctx = 4096;
+    src.n_head_kv = dst.n_head_kv = 32;
+    src.n_embd_head = dst.n_embd_head = 128;
+    src.type_k = dst.type_k = IK_KV_TYPE_F16;
+    src.type_v = dst.type_v = IK_KV_TYPE_F16;
+    src.v_trans = dst.v_trans = 0;
+    src.n_stream = dst.n_stream = 1;
+    src.source_format = IK_KV_SOURCE_FORMAT_IK_KVA;
+    src.payload_size = 1024;
+    memset(src.model_fingerprint, 0xAB, sizeof(src.model_fingerprint));
+    memcpy(dst.model_fingerprint, src.model_fingerprint, sizeof(dst.model_fingerprint));
 }
 
 //
@@ -693,6 +724,150 @@ TEST(kvb_ut_042_strict_profile_rejects_nstream_not_one) {
     tests_passed++;
 }
 
+TEST(kvb_ut_050_plan_cache_load_store_hit_path) {
+    ik_kv_bridge_init();
+
+    const std::string cache_dir = make_test_cache_dir("hit");
+    fs::create_directories(cache_dir);
+
+    ik_kv_bridge_config_t cfg;
+    ik_kv_bridge_get_config(&cfg);
+    cfg.plan_cache_dir = cache_dir.c_str();
+    ik_kv_bridge_set_config(&cfg);
+
+    ik_kv_source_descriptor_t src;
+    ik_kv_dest_descriptor_t dst;
+    build_compatible_src_dst(src, dst);
+
+    ik_kv_compat_plan_key_t key = {};
+    ik_kv_compat_convert_result_t result = ik_kv_compat_plan_key_build(&src, &dst, &key);
+    ASSERT_EQ(result, IK_KV_COMPAT_CONVERT_OK);
+
+    ik_kv_compat_plan_t plan = {};
+    result = ik_kv_compat_plan_build_strict_v1(&src, &dst, &plan);
+    ASSERT_EQ(result, IK_KV_COMPAT_CONVERT_OK);
+    ASSERT_TRUE(plan.is_compatible);
+
+    result = ik_kv_plan_cache_store(&key, &plan);
+    ASSERT_EQ(result, IK_KV_COMPAT_CONVERT_OK);
+
+    ik_kv_compat_plan_t loaded = {};
+    result = ik_kv_plan_cache_load(&key, &loaded);
+    ASSERT_EQ(result, IK_KV_COMPAT_CONVERT_OK);
+    ASSERT_EQ(memcmp(&plan, &loaded, sizeof(plan)), 0);
+
+    ik_kv_plan_cache_clear();
+    std::error_code ec;
+    fs::remove_all(cache_dir, ec);
+    ik_kv_bridge_shutdown();
+    tests_passed++;
+}
+
+TEST(kvb_ut_051_plan_cache_invalidate) {
+    ik_kv_bridge_init();
+
+    const std::string cache_dir = make_test_cache_dir("invalidate");
+    fs::create_directories(cache_dir);
+
+    ik_kv_bridge_config_t cfg;
+    ik_kv_bridge_get_config(&cfg);
+    cfg.plan_cache_dir = cache_dir.c_str();
+    ik_kv_bridge_set_config(&cfg);
+
+    ik_kv_source_descriptor_t src;
+    ik_kv_dest_descriptor_t dst;
+    build_compatible_src_dst(src, dst);
+
+    ik_kv_compat_plan_key_t key = {};
+    ik_kv_compat_convert_result_t result = ik_kv_compat_plan_key_build(&src, &dst, &key);
+    ASSERT_EQ(result, IK_KV_COMPAT_CONVERT_OK);
+
+    ik_kv_compat_plan_t plan = {};
+    result = ik_kv_compat_plan_build_strict_v1(&src, &dst, &plan);
+    ASSERT_EQ(result, IK_KV_COMPAT_CONVERT_OK);
+
+    result = ik_kv_plan_cache_store(&key, &plan);
+    ASSERT_EQ(result, IK_KV_COMPAT_CONVERT_OK);
+
+    result = ik_kv_plan_cache_invalidate(&key);
+    ASSERT_EQ(result, IK_KV_COMPAT_CONVERT_OK);
+
+    ik_kv_compat_plan_t loaded = {};
+    result = ik_kv_plan_cache_load(&key, &loaded);
+    ASSERT_EQ(result, IK_KV_COMPAT_CONVERT_ERR_PLAN_BUILD);
+
+    ik_kv_plan_cache_clear();
+    std::error_code ec;
+    fs::remove_all(cache_dir, ec);
+    ik_kv_bridge_shutdown();
+    tests_passed++;
+}
+
+TEST(kvb_ut_052_plan_cache_rejects_corrupted_file) {
+    ik_kv_bridge_init();
+
+    const std::string cache_dir = make_test_cache_dir("corrupt");
+    fs::create_directories(cache_dir);
+
+    ik_kv_bridge_config_t cfg;
+    ik_kv_bridge_get_config(&cfg);
+    cfg.plan_cache_dir = cache_dir.c_str();
+    ik_kv_bridge_set_config(&cfg);
+
+    ik_kv_source_descriptor_t src;
+    ik_kv_dest_descriptor_t dst;
+    build_compatible_src_dst(src, dst);
+
+    ik_kv_compat_plan_key_t key = {};
+    ik_kv_compat_convert_result_t result = ik_kv_compat_plan_key_build(&src, &dst, &key);
+    ASSERT_EQ(result, IK_KV_COMPAT_CONVERT_OK);
+
+    ik_kv_compat_plan_t plan = {};
+    result = ik_kv_compat_plan_build_strict_v1(&src, &dst, &plan);
+    ASSERT_EQ(result, IK_KV_COMPAT_CONVERT_OK);
+
+    result = ik_kv_plan_cache_store(&key, &plan);
+    ASSERT_EQ(result, IK_KV_COMPAT_CONVERT_OK);
+
+    fs::path cache_file;
+    for (const auto & entry : fs::directory_iterator(cache_dir)) {
+        if (entry.is_regular_file() && entry.path().extension() == ".ikvc") {
+            cache_file = entry.path();
+            break;
+        }
+    }
+    ASSERT_FALSE(cache_file.empty());
+
+    {
+        std::vector<uint8_t> blob;
+        std::ifstream ifs(cache_file, std::ios::binary);
+        ASSERT_TRUE(ifs.is_open());
+        ifs.seekg(0, std::ios::end);
+        const std::streamoff n = ifs.tellg();
+        ASSERT_TRUE(n > 0);
+        ifs.seekg(0, std::ios::beg);
+        blob.resize((size_t) n);
+        ifs.read((char *) blob.data(), (std::streamsize) blob.size());
+        ASSERT_TRUE(ifs.good() || ifs.eof());
+        blob[blob.size() - 1] ^= 0x5Au;
+
+        std::ofstream ofs(cache_file, std::ios::binary | std::ios::trunc);
+        ASSERT_TRUE(ofs.is_open());
+        ofs.write((const char *) blob.data(), (std::streamsize) blob.size());
+        ASSERT_TRUE(ofs.good());
+    }
+
+    ik_kv_compat_plan_t loaded = {};
+    result = ik_kv_plan_cache_load(&key, &loaded);
+    ASSERT_EQ(result, IK_KV_COMPAT_CONVERT_ERR_PLAN_BUILD);
+
+    ik_kv_plan_cache_clear();
+    std::error_code ec;
+    fs::remove_all(cache_dir, ec);
+    ik_kv_bridge_shutdown();
+    tests_passed++;
+}
+
 //
 // Main test runner
 //
@@ -717,6 +892,9 @@ int main(int argc, char ** argv) {
     test_kvb_ut_040_strict_profile_accepts_compatible();
     test_kvb_ut_041_strict_profile_rejects_dtype_mismatch();
     test_kvb_ut_042_strict_profile_rejects_nstream_not_one();
+    test_kvb_ut_050_plan_cache_load_store_hit_path();
+    test_kvb_ut_051_plan_cache_invalidate();
+    test_kvb_ut_052_plan_cache_rejects_corrupted_file();
     
     printf("\n=== Results ===\n");
     printf("Passed: %d\n", tests_passed);

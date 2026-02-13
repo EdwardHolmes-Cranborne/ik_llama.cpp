@@ -18,11 +18,24 @@
 #include <vector>
 #include <array>
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <limits>
+#include <string>
+#include <system_error>
 
 namespace {
 
+namespace fs = std::filesystem;
+
 constexpr size_t IK_KV_FINGERPRINT_SIZE = 32;
 constexpr std::array<char, 8> RTX_KVARTIF1_MAGIC = { 'K', 'V', 'A', 'R', 'T', 'I', 'F', '1' };
+constexpr std::array<char, 8> IK_PLAN_CACHE_MAGIC = { 'I', 'K', 'K', 'V', 'C', 'A', 'C', '1' };
+constexpr uint16_t IK_PLAN_CACHE_VERSION_MAJOR = 1;
+constexpr uint16_t IK_PLAN_CACHE_VERSION_MINOR = 0;
+constexpr size_t IK_PLAN_CACHE_HEADER_SIZE = 8 + 2 + 2 + 4 + 4 + 4 + IK_KV_PLAN_KEY_SIZE;
 
 constexpr size_t RTX_HDR_OFF_FORMAT_MAJOR = 8;
 constexpr size_t RTX_HDR_OFF_FORMAT_MINOR = 10;
@@ -69,6 +82,21 @@ static inline void wr_u32_le(uint8_t * p, uint32_t v) {
     p[3] = (uint8_t) ((v >> 24) & 0xFFu);
 }
 
+static inline void append_u8(std::vector<uint8_t> & out, uint8_t v) {
+    out.push_back(v);
+}
+
+static inline void append_u16(std::vector<uint8_t> & out, uint16_t v) {
+    out.push_back((uint8_t) (v & 0xFFu));
+    out.push_back((uint8_t) ((v >> 8) & 0xFFu));
+}
+
+static inline void append_u64(std::vector<uint8_t> & out, uint64_t v) {
+    for (int i = 0; i < 8; ++i) {
+        out.push_back((uint8_t) ((v >> (8 * i)) & 0xFFu));
+    }
+}
+
 static bool is_all_zero_fingerprint(const uint8_t fp[IK_KV_FINGERPRINT_SIZE]) {
     for (size_t i = 0; i < IK_KV_FINGERPRINT_SIZE; ++i) {
         if (fp[i] != 0) {
@@ -87,11 +115,27 @@ static uint64_t fnv1a64(const uint8_t * data, size_t size) {
     return h;
 }
 
+static uint64_t fnv1a64_seeded(uint64_t seed, const uint8_t * data, size_t size) {
+    uint64_t h = seed;
+    for (size_t i = 0; i < size; ++i) {
+        h ^= data[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
 static void append_u32(std::vector<uint8_t> & out, uint32_t v) {
     out.push_back((uint8_t) (v & 0xFFu));
     out.push_back((uint8_t) ((v >> 8) & 0xFFu));
     out.push_back((uint8_t) ((v >> 16) & 0xFFu));
     out.push_back((uint8_t) ((v >> 24) & 0xFFu));
+}
+
+static void append_bytes(std::vector<uint8_t> & out, const uint8_t * data, size_t size) {
+    if (!data || size == 0) {
+        return;
+    }
+    out.insert(out.end(), data, data + size);
 }
 
 static uint32_t crc32_ieee(const uint8_t * data, size_t size) {
@@ -112,6 +156,73 @@ static uint32_t crc32_ieee(const uint8_t * data, size_t size) {
         crc = table[(crc ^ data[i]) & 0xFFu] ^ (crc >> 8u);
     }
     return crc ^ 0xFFFFFFFFu;
+}
+
+static uint32_t saturating_u32(uint64_t v) {
+    return (uint32_t) std::min<uint64_t>(v, std::numeric_limits<uint32_t>::max());
+}
+
+static std::string key_to_hex(const ik_kv_compat_plan_key_t & key) {
+    static const char hex[] = "0123456789abcdef";
+    std::string out;
+    out.resize(IK_KV_PLAN_KEY_SIZE * 2);
+    for (size_t i = 0; i < IK_KV_PLAN_KEY_SIZE; ++i) {
+        out[2 * i + 0] = hex[(key.data[i] >> 4) & 0x0Fu];
+        out[2 * i + 1] = hex[key.data[i] & 0x0Fu];
+    }
+    return out;
+}
+
+static std::string get_plan_cache_dir();
+static fs::path plan_cache_path_for_key(const ik_kv_compat_plan_key_t & key);
+
+static bool load_file_binary(const fs::path & path, std::vector<uint8_t> & out) {
+    out.clear();
+    std::ifstream ifs(path, std::ios::binary);
+    if (!ifs.is_open()) {
+        return false;
+    }
+    ifs.seekg(0, std::ios::end);
+    const std::streamoff end = ifs.tellg();
+    if (end < 0) {
+        return false;
+    }
+    ifs.seekg(0, std::ios::beg);
+    out.resize((size_t) end);
+    if (!out.empty()) {
+        ifs.read((char *) out.data(), (std::streamsize) out.size());
+        if (!ifs.good() && !ifs.eof()) {
+            out.clear();
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool write_file_binary_atomic(const fs::path & path, const uint8_t * data, size_t size) {
+    if (!data || size == 0) {
+        return false;
+    }
+
+    const fs::path tmp = path.string() + ".tmp";
+    {
+        std::ofstream ofs(tmp, std::ios::binary | std::ios::trunc);
+        if (!ofs.is_open()) {
+            return false;
+        }
+        ofs.write((const char *) data, (std::streamsize) size);
+        if (!ofs.good()) {
+            return false;
+        }
+    }
+
+    std::error_code ec;
+    fs::rename(tmp, path, ec);
+    if (ec) {
+        fs::remove(tmp, ec);
+        return false;
+    }
+    return true;
 }
 
 static bool map_ggml_type_to_ik(uint16_t ggml_type, uint8_t * out_type) {
@@ -694,6 +805,29 @@ static struct {
     bool telemetry_enabled;
 } g_kv_bridge = {};
 
+namespace {
+
+static std::string get_plan_cache_dir() {
+    if (g_kv_bridge.config.plan_cache_dir && g_kv_bridge.config.plan_cache_dir[0] != '\0') {
+        return std::string(g_kv_bridge.config.plan_cache_dir);
+    }
+    const char * env_dir = std::getenv("IK_KV_BRIDGE_PLAN_CACHE_DIR");
+    if (env_dir && env_dir[0] != '\0') {
+        return std::string(env_dir);
+    }
+    return std::string();
+}
+
+static fs::path plan_cache_path_for_key(const ik_kv_compat_plan_key_t & key) {
+    const std::string cache_dir = get_plan_cache_dir();
+    if (cache_dir.empty()) {
+        return fs::path();
+    }
+    return fs::path(cache_dir) / ("plan_" + key_to_hex(key) + ".ikvc");
+}
+
+} // namespace
+
 //
 // Initialization and configuration
 //
@@ -927,23 +1061,49 @@ ik_kv_compat_convert_result_t ik_kv_compat_plan_key_build(
     if (!src || !dst || !key_out) {
         return IK_KV_COMPAT_CONVERT_ERR_INVALID_ARG;
     }
-    
-    // TODO: Build deterministic key from source/destination schemas
-    // and model fingerprints
+    std::vector<uint8_t> material;
+    material.reserve(256);
+
+    append_bytes(material, (const uint8_t *) "IK_KV_PLAN_KEY_V1", 16);
+
+    append_u32(material, src->n_layers);
+    append_u32(material, src->n_ctx);
+    append_u32(material, src->n_head_kv);
+    append_u32(material, src->n_embd_head);
+    append_u64(material, src->payload_size);
+    append_u8(material, src->type_k);
+    append_u8(material, src->type_v);
+    append_u8(material, src->v_trans);
+    append_u8(material, src->n_stream);
+    append_u8(material, src->source_format);
+    append_bytes(material, src->model_fingerprint, IK_KV_FINGERPRINT_SIZE);
+
+    append_u32(material, dst->n_layers);
+    append_u32(material, dst->n_ctx);
+    append_u32(material, dst->n_head_kv);
+    append_u32(material, dst->n_embd_head);
+    append_u8(material, dst->type_k);
+    append_u8(material, dst->type_v);
+    append_u8(material, dst->v_trans);
+    append_u8(material, dst->n_stream);
+    append_bytes(material, dst->model_fingerprint, IK_KV_FINGERPRINT_SIZE);
+
+    static const uint64_t salts[8] = {
+        0x13c6ef372fe94a71ull, 0x64b3f4d215ec8a09ull,
+        0xb4894f7d03e2d6c5ull, 0x5a47ac20df18b6f3ull,
+        0x39d1e7b4548cf20dull, 0x8f25c43e18db7691ull,
+        0xc4f86123ab4d95e7ull, 0x7be2da0195c4f863ull,
+    };
+
     memset(key_out, 0, sizeof(*key_out));
-    
-    // Placeholder: XOR first 32 bytes of each fingerprint
-    for (int i = 0; i < 32; i++) {
-        key_out->data[i] = src->model_fingerprint[i] ^ dst->model_fingerprint[i];
+    for (size_t i = 0; i < 8; ++i) {
+        const uint64_t seed = 1469598103934665603ull ^ salts[i];
+        const uint64_t h = fnv1a64_seeded(seed, material.data(), material.size());
+        for (int j = 0; j < 8; ++j) {
+            key_out->data[i * 8 + j] = (uint8_t) ((h >> (8 * j)) & 0xFFu);
+        }
     }
-    
-    // Add type information to key
-    key_out->data[32] = (src->type_k << 4) | src->type_v;
-    key_out->data[33] = (dst->type_k << 4) | dst->type_v;
-    key_out->data[34] = (src->v_trans << 4) | dst->v_trans;
-    key_out->data[35] = src->n_stream;
-    key_out->data[36] = dst->n_stream;
-    
+
     return IK_KV_COMPAT_CONVERT_OK;
 }
 
@@ -1063,11 +1223,37 @@ ik_kv_compat_convert_result_t ik_kv_compat_plan_build_strict_v1(
     plan_out->is_compatible = true;
     plan_out->reject_reason = IK_KV_COMPAT_REJECT_NONE;
     plan_out->n_layers = src->n_layers ? src->n_layers : dst->n_layers;
-    plan_out->total_src_size = (uint32_t)src->payload_size;
-    plan_out->total_dst_size = (uint32_t)src->payload_size;
-    
-    // TODO: Build layer mappings (KVB-005)
-    // For now, assume contiguous copy is sufficient
+    if (plan_out->n_layers > IK_KV_MAX_LAYERS) {
+        plan_out->is_compatible = false;
+        plan_out->reject_reason = IK_KV_COMPAT_REJECT_N_LAYER_MISMATCH;
+        return IK_KV_COMPAT_CONVERT_OK;
+    }
+
+    const uint64_t src_size = src->payload_size;
+    const uint64_t dst_size = ik_kv_convert_get_output_size(src, dst);
+    plan_out->total_src_size = saturating_u32(src_size);
+    plan_out->total_dst_size = saturating_u32(dst_size);
+
+    const uint8_t needs_v_trans =
+        (src->v_trans <= 1 && dst->v_trans <= 1 && src->v_trans != dst->v_trans) ? 1u : 0u;
+
+    for (uint32_t il = 0; il < plan_out->n_layers; ++il) {
+        const uint64_t src_begin = (src_size * il) / plan_out->n_layers;
+        const uint64_t src_end   = (src_size * (il + 1)) / plan_out->n_layers;
+        const uint64_t dst_begin = (dst_size * il) / plan_out->n_layers;
+
+        ik_kv_layer_mapping_t & m = plan_out->layer_mappings[il];
+        memset(&m, 0, sizeof(m));
+        m.layer_idx = il;
+        m.k_row_size = saturating_u32(src_end - src_begin);
+        m.v_row_size = saturating_u32(src_end - src_begin);
+        m.k_offset = saturating_u32(src_begin);
+        m.v_offset = saturating_u32(src_begin);
+        m.dst_k_offset = saturating_u32(dst_begin);
+        m.dst_v_offset = saturating_u32(dst_begin);
+        m.needs_scatter = 0;
+        m.needs_v_trans = needs_v_trans;
+    }
     
     return IK_KV_COMPAT_CONVERT_OK;
 }
@@ -1105,10 +1291,67 @@ ik_kv_compat_convert_result_t ik_kv_plan_cache_load(
     if (!key || !plan_out) {
         return IK_KV_COMPAT_CONVERT_ERR_INVALID_ARG;
     }
-    
-    // TODO: Implement on-disk plan cache
-    // For now, always return "not found"
-    return IK_KV_COMPAT_CONVERT_ERR_PLAN_BUILD;
+    memset(plan_out, 0, sizeof(*plan_out));
+
+    const fs::path path = plan_cache_path_for_key(*key);
+    if (path.empty()) {
+        return IK_KV_COMPAT_CONVERT_ERR_PLAN_BUILD;
+    }
+
+    std::vector<uint8_t> blob;
+    if (!load_file_binary(path, blob)) {
+        return IK_KV_COMPAT_CONVERT_ERR_PLAN_BUILD;
+    }
+
+    if (blob.size() < IK_PLAN_CACHE_HEADER_SIZE + sizeof(ik_kv_compat_plan_t)) {
+        return IK_KV_COMPAT_CONVERT_ERR_PLAN_BUILD;
+    }
+
+    const uint8_t * p = blob.data();
+    if (memcmp(p, IK_PLAN_CACHE_MAGIC.data(), IK_PLAN_CACHE_MAGIC.size()) != 0) {
+        return IK_KV_COMPAT_CONVERT_ERR_PLAN_BUILD;
+    }
+    p += IK_PLAN_CACHE_MAGIC.size();
+
+    const uint16_t ver_major = rd_u16_le(p);
+    p += 2;
+    const uint16_t ver_minor = rd_u16_le(p);
+    p += 2;
+    const uint32_t header_size = rd_u32_le(p);
+    p += 4;
+    const uint32_t payload_size = rd_u32_le(p);
+    p += 4;
+    const uint32_t payload_crc = rd_u32_le(p);
+    p += 4;
+
+    if (ver_major != IK_PLAN_CACHE_VERSION_MAJOR ||
+            ver_minor != IK_PLAN_CACHE_VERSION_MINOR ||
+            header_size != IK_PLAN_CACHE_HEADER_SIZE ||
+            payload_size != sizeof(ik_kv_compat_plan_t)) {
+        return IK_KV_COMPAT_CONVERT_ERR_PLAN_BUILD;
+    }
+
+    if (memcmp(p, key->data, IK_KV_PLAN_KEY_SIZE) != 0) {
+        return IK_KV_COMPAT_CONVERT_ERR_PLAN_BUILD;
+    }
+    p += IK_KV_PLAN_KEY_SIZE;
+
+    if (blob.size() != (size_t) header_size + payload_size) {
+        return IK_KV_COMPAT_CONVERT_ERR_PLAN_BUILD;
+    }
+
+    const uint8_t * payload = blob.data() + header_size;
+    if (crc32_ieee(payload, payload_size) != payload_crc) {
+        return IK_KV_COMPAT_CONVERT_ERR_PLAN_BUILD;
+    }
+
+    memcpy(plan_out, payload, sizeof(*plan_out));
+    if (memcmp(plan_out->key.data, key->data, IK_KV_PLAN_KEY_SIZE) != 0) {
+        memset(plan_out, 0, sizeof(*plan_out));
+        return IK_KV_COMPAT_CONVERT_ERR_PLAN_BUILD;
+    }
+
+    return IK_KV_COMPAT_CONVERT_OK;
 }
 
 ik_kv_compat_convert_result_t ik_kv_plan_cache_store(
@@ -1118,8 +1361,40 @@ ik_kv_compat_convert_result_t ik_kv_plan_cache_store(
     if (!key || !plan) {
         return IK_KV_COMPAT_CONVERT_ERR_INVALID_ARG;
     }
-    
-    // TODO: Implement on-disk plan cache
+    const fs::path path = plan_cache_path_for_key(*key);
+    if (path.empty()) {
+        return IK_KV_COMPAT_CONVERT_OK;
+    }
+
+    if (memcmp(plan->key.data, key->data, IK_KV_PLAN_KEY_SIZE) != 0) {
+        return IK_KV_COMPAT_CONVERT_ERR_INVALID_ARG;
+    }
+
+    std::error_code ec;
+    fs::create_directories(path.parent_path(), ec);
+    if (ec) {
+        return IK_KV_COMPAT_CONVERT_ERR_INTERNAL;
+    }
+
+    const uint8_t * payload = (const uint8_t *) plan;
+    const uint32_t payload_size = (uint32_t) sizeof(ik_kv_compat_plan_t);
+    const uint32_t payload_crc = crc32_ieee(payload, payload_size);
+
+    std::vector<uint8_t> blob;
+    blob.reserve(IK_PLAN_CACHE_HEADER_SIZE + payload_size);
+    append_bytes(blob, (const uint8_t *) IK_PLAN_CACHE_MAGIC.data(), IK_PLAN_CACHE_MAGIC.size());
+    append_u16(blob, IK_PLAN_CACHE_VERSION_MAJOR);
+    append_u16(blob, IK_PLAN_CACHE_VERSION_MINOR);
+    append_u32(blob, IK_PLAN_CACHE_HEADER_SIZE);
+    append_u32(blob, payload_size);
+    append_u32(blob, payload_crc);
+    append_bytes(blob, key->data, IK_KV_PLAN_KEY_SIZE);
+    append_bytes(blob, payload, payload_size);
+
+    if (!write_file_binary_atomic(path, blob.data(), blob.size())) {
+        return IK_KV_COMPAT_CONVERT_ERR_INTERNAL;
+    }
+
     return IK_KV_COMPAT_CONVERT_OK;
 }
 
@@ -1129,13 +1404,52 @@ ik_kv_compat_convert_result_t ik_kv_plan_cache_invalidate(
     if (!key) {
         return IK_KV_COMPAT_CONVERT_ERR_INVALID_ARG;
     }
-    
-    // TODO: Implement cache invalidation
+    const fs::path path = plan_cache_path_for_key(*key);
+    if (path.empty()) {
+        return IK_KV_COMPAT_CONVERT_OK;
+    }
+
+    std::error_code ec;
+    fs::remove(path, ec);
+    if (ec) {
+        return IK_KV_COMPAT_CONVERT_ERR_INTERNAL;
+    }
+
     return IK_KV_COMPAT_CONVERT_OK;
 }
 
 void ik_kv_plan_cache_clear(void) {
-    // TODO: Implement cache clearing
+    const std::string cache_dir = get_plan_cache_dir();
+    if (cache_dir.empty()) {
+        return;
+    }
+
+    std::error_code ec;
+    const fs::path root(cache_dir);
+    if (!fs::exists(root, ec) || ec) {
+        return;
+    }
+
+    fs::directory_iterator it(root, ec);
+    if (ec) {
+        return;
+    }
+    const fs::directory_iterator end;
+
+    for (; it != end; it.increment(ec)) {
+        if (ec) {
+            return;
+        }
+        if (!it->is_regular_file()) {
+            continue;
+        }
+        const fs::path path = it->path();
+        const std::string name = path.filename().string();
+        if (name.rfind("plan_", 0) == 0 && path.extension() == ".ikvc") {
+            std::error_code rm_ec;
+            fs::remove(path, rm_ec);
+        }
+    }
 }
 
 //
@@ -1227,20 +1541,44 @@ ik_kv_compat_convert_result_t ik_kv_import_into_context(
         ik_kv_bridge_init();
     }
 
+    const auto t0 = std::chrono::steady_clock::now();
+    ik_kv_bridge_metrics_t metrics = {};
+    metrics.mode = (uint8_t) g_kv_bridge.config.mode;
+    metrics.status = 2;
+    metrics.bytes_in = artifact_size;
+
+    auto finalize = [&](ik_kv_compat_convert_result_t rc,
+                        ik_kv_compat_reject_reason_t reject) -> ik_kv_compat_convert_result_t {
+        const auto t1 = std::chrono::steady_clock::now();
+        metrics.convert_us = (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+        metrics.reject_reason = (uint8_t) reject;
+        if (rc == IK_KV_COMPAT_CONVERT_OK) {
+            metrics.status = 0;
+        } else if (reject != IK_KV_COMPAT_REJECT_NONE || rc == IK_KV_COMPAT_CONVERT_ERR_DST_MISMATCH) {
+            metrics.status = 1;
+        } else {
+            metrics.status = 2;
+        }
+        g_kv_bridge.last_metrics = metrics;
+        if (reject_reason) {
+            *reject_reason = reject;
+        }
+        return rc;
+    };
+
     // Check bridge mode
     if (g_kv_bridge.config.mode == IK_KV_BRIDGE_MODE_OFF) {
-        if (reject_reason) *reject_reason = IK_KV_COMPAT_REJECT_NONE;
-        return IK_KV_COMPAT_CONVERT_ERR_INVALID_ARG;
+        return finalize(IK_KV_COMPAT_CONVERT_ERR_INVALID_ARG, IK_KV_COMPAT_REJECT_NONE);
     }
 
     kv_artifact_view_t artifact_view = {};
-    if (!parse_artifact_view(artifact_data, artifact_size, &artifact_view, reject_reason)) {
-        return IK_KV_COMPAT_CONVERT_ERR_SRC_PARSE;
+    ik_kv_compat_reject_reason_t reject = IK_KV_COMPAT_REJECT_NONE;
+    if (!parse_artifact_view(artifact_data, artifact_size, &artifact_view, &reject)) {
+        return finalize(IK_KV_COMPAT_CONVERT_ERR_SRC_PARSE, reject);
     }
 
     if (!ik_kv_source_validate_payload(&artifact_view.header, artifact_view.payload, artifact_view.payload_size)) {
-        if (reject_reason) *reject_reason = IK_KV_COMPAT_REJECT_PAYLOAD_CRC_MISMATCH;
-        return IK_KV_COMPAT_CONVERT_ERR_CHECKSUM;
+        return finalize(IK_KV_COMPAT_CONVERT_ERR_CHECKSUM, IK_KV_COMPAT_REJECT_PAYLOAD_CRC_MISMATCH);
     }
 
     // Parse source descriptor.
@@ -1250,29 +1588,50 @@ ik_kv_compat_convert_result_t ik_kv_import_into_context(
         artifact_view.payload,
         artifact_view.payload_size,
         &src_desc,
-        reject_reason);
+        &reject);
     if (result != IK_KV_COMPAT_CONVERT_OK) {
-        return result;
+        return finalize(result, reject);
     }
+    metrics.bytes_in = (uint64_t) src_desc.payload_size;
 
     // Introspect destination.
     ik_kv_dest_descriptor_t dst_desc = {};
     result = ik_kv_dest_introspect_from_ctx(ctx, &dst_desc);
     if (result != IK_KV_COMPAT_CONVERT_OK) {
-        if (reject_reason) *reject_reason = IK_KV_COMPAT_REJECT_NONE;
-        return result;
+        return finalize(result, IK_KV_COMPAT_REJECT_NONE);
     }
 
-    // Build compatibility plan.
-    ik_kv_compat_plan_t plan = {};
-    result = ik_kv_compat_plan_build_strict_v1(&src_desc, &dst_desc, &plan);
+    ik_kv_compat_plan_key_t plan_key = {};
+    result = ik_kv_compat_plan_key_build(&src_desc, &dst_desc, &plan_key);
     if (result != IK_KV_COMPAT_CONVERT_OK) {
-        if (reject_reason) *reject_reason = IK_KV_COMPAT_REJECT_NONE;
-        return result;
+        return finalize(result, IK_KV_COMPAT_REJECT_NONE);
     }
+    metrics.plan_key = fnv1a64(plan_key.data, sizeof(plan_key.data));
+
+    ik_kv_compat_plan_t plan = {};
+    bool plan_loaded = false;
+
+    const ik_kv_compat_convert_result_t cache_rc = ik_kv_plan_cache_load(&plan_key, &plan);
+    if (cache_rc == IK_KV_COMPAT_CONVERT_OK) {
+        if (ik_kv_compat_plan_validate(&plan, &src_desc, &dst_desc)) {
+            plan_loaded = true;
+            metrics.plan_cache_hit = true;
+        } else {
+            (void) ik_kv_plan_cache_invalidate(&plan_key);
+            memset(&plan, 0, sizeof(plan));
+        }
+    }
+
+    if (!plan_loaded) {
+        result = ik_kv_compat_plan_build_strict_v1(&src_desc, &dst_desc, &plan);
+        if (result != IK_KV_COMPAT_CONVERT_OK) {
+            return finalize(result, IK_KV_COMPAT_REJECT_NONE);
+        }
+        (void) ik_kv_plan_cache_store(&plan_key, &plan);
+    }
+
     if (!plan.is_compatible) {
-        if (reject_reason) *reject_reason = plan.reject_reason;
-        return IK_KV_COMPAT_CONVERT_ERR_DST_MISMATCH;
+        return finalize(IK_KV_COMPAT_CONVERT_ERR_DST_MISMATCH, plan.reject_reason);
     }
 
     // Convert source payload to destination sequence-state blob.
@@ -1286,19 +1645,17 @@ ik_kv_compat_convert_result_t ik_kv_import_into_context(
 
     result = ik_kv_convert_prefill_to_ik_seq_blob(&cvt);
     if (result != IK_KV_COMPAT_CONVERT_OK) {
-        if (reject_reason) *reject_reason = cvt.reject;
-        return result;
+        return finalize(result, cvt.reject);
     }
+    metrics.bytes_out = (uint64_t) cvt.bytes_written;
 
     // Import converted state into destination sequence.
     const size_t n_read = llama_state_seq_set_data(ctx, converted.data(), cvt.bytes_written, dest_seq_id);
     if (n_read != cvt.bytes_written) {
-        if (reject_reason) *reject_reason = IK_KV_COMPAT_REJECT_INCOMPATIBLE_PROFILE;
-        return IK_KV_COMPAT_CONVERT_ERR_CONVERT;
+        return finalize(IK_KV_COMPAT_CONVERT_ERR_CONVERT, IK_KV_COMPAT_REJECT_INCOMPATIBLE_PROFILE);
     }
 
-    if (reject_reason) *reject_reason = IK_KV_COMPAT_REJECT_NONE;
-    return IK_KV_COMPAT_CONVERT_OK;
+    return finalize(IK_KV_COMPAT_CONVERT_OK, IK_KV_COMPAT_REJECT_NONE);
 }
 
 ik_kv_compat_convert_result_t ik_kv_import_into_context_with_plan(
