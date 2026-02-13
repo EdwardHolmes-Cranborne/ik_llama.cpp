@@ -1257,9 +1257,9 @@ struct kv_receiver_service::impl {
             std::lock_guard<std::mutex> lock(session->mutex);
             expected_chunks = session->expected_chunks;
             expected_payload_bytes = session->expected_payload_bytes;
-            if (expected_chunks > 0 && chunk_files.size() < expected_chunks) {
+            if (expected_chunks > 0 && chunk_files.size() != expected_chunks) {
                 if (error) {
-                    *error = "incomplete chunk set: got " + std::to_string(chunk_files.size()) +
+                    *error = "chunk set mismatch: got " + std::to_string(chunk_files.size()) +
                              " expected " + std::to_string(expected_chunks);
                 }
                 return false;
