@@ -103,6 +103,8 @@
 - `344fb3fb` Document phase-1 queue launch-failure hardening
 - `37e2c7de` Implement phase-2 split prefill/handoff queue pipeline
 - `23b7703c` Document phase-2 split prefill/handoff queue workflow
+- `5ffa2dcc` Add transport-aware phase-2 artifact replay controls
+- `e9e5124c` Document phase-2 replay transport mode and fallback
 
 ### Verification completed
 
