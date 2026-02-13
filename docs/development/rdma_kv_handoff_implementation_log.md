@@ -69,6 +69,16 @@
    - Worker now catches external runner launch exceptions (e.g. missing binary) and records error context.
    - Failed launch paths now store `result.runner_exception`, persist worker stream logs, and transition to retry/failed states correctly.
    - Queue self-test now covers unlaunchable command path to prevent regressions.
+17. Implemented Phase-2 split prefill/handoff pipeline queue tooling:
+   - Queue mode `phase2_split_pipeline` added to `scripts/prefill_decode_job_queue.py`.
+   - Added dedicated `prefill-worker` and `handoff-worker` loops with separate locks and stage-specific retry handling.
+   - Added stage wrappers:
+     - `scripts/run_phase2_prefill_to_artifact.sh` (prefill -> disk artifact)
+     - `scripts/run_phase2_handoff_from_artifact.sh` (artifact replay -> decode)
+   - Added deterministic Phase-2 regression test:
+     `scripts/test_prefill_decode_phase2_pipeline.sh`.
+   - Added new operator guide:
+     `docs/development/prefill_decode_phase2_pipeline.md`.
 
 ### Commits produced
 
@@ -86,6 +96,7 @@
 - `efb93a5` [RTX fork] Require network transport for split handoff and fix decode arg alias order
 - `2d42d766` Harden phase-1 queue worker launch failure handling
 - `344fb3fb` Document phase-1 queue launch-failure hardening
+- `37e2c7de` Implement phase-2 split prefill/handoff queue pipeline
 
 ### Verification completed
 
@@ -100,6 +111,7 @@
    - `bash -n scripts/run_single_machine_buffered_e2e.sh` passes.
    - `scripts/* --help` smoke checks pass.
    - `scripts/test_prefill_decode_job_queue.sh` passes including launch-failure state transition checks.
+   - `scripts/test_prefill_decode_phase2_pipeline.sh` passes (artifact queueing + handoff retry path).
 
 ### Remaining work for full gate closure
 
@@ -110,3 +122,4 @@
 3. Decode quality and first-token parity reporting against local baseline.
 4. Throughput and latency baselining for `tcp` vs `rdma` mode selection on the real USB4/TB fabric.
 5. Execute and archive the single-machine buffered suite on real model artifacts (requires local socket/model runtime; not runnable in this sandbox).
+6. Add native RDMA replay client path for Phase-2 artifact handoff (current replay helper is TCP socket based).

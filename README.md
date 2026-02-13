@@ -117,6 +117,7 @@ There is no single point of reference describing all new `ik_llama.cpp` features
 * [RTX5090 -> dual-Mac test guide](docs/development/rtx5090_dual_mac_prefill_decode_tests.md)
 * [Single-machine buffered prefill/decode E2E suite](docs/development/single_machine_buffered_e2e.md)
 * [Phase-1 prefill/decode single-flight queue](docs/development/prefill_decode_phase1_queue.md)
+* [Phase-2 prefill/decode split pipeline queue](docs/development/prefill_decode_phase2_pipeline.md)
 
 ## Testing
 

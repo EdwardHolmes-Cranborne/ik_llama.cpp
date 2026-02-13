@@ -192,3 +192,38 @@ Queue env exported to the child process includes:
 - `IK_PDQ_JOB_ID`
 - `IK_PDQ_JOB_MODE`
 - `IK_PDQ_KV_TRANSPORT`
+
+## 10. Phase-2 split pipeline queue mode (prefill overlap + serialized handoff)
+
+Phase-2 allows prefill jobs to keep running and staging artifacts while decode import/handoff remains serialized.
+
+Start both workers:
+
+```bash
+cd /path/to/ik_llama.cpp
+./scripts/prefill_decode_job_queue.py init
+./scripts/prefill_decode_job_queue.py prefill-worker
+./scripts/prefill_decode_job_queue.py handoff-worker
+```
+
+Submit one job:
+
+```bash
+./scripts/prefill_decode_job_queue.py submit \
+  --mode phase2_split_pipeline \
+  --model /models/your-model.gguf \
+  --prompt-file /prompts/long_prompt.txt \
+  --rtx-repo /path/to/RTX_ACCELERATED_MAC_PREFILL_LLAMA \
+  --decode-host 10.40.0.20 \
+  --decode-port 19001 \
+  --kv-transport auto \
+  --prefill-min-stream-batch-tokens -1 \
+  --max-prefill-retries 1 \
+  --max-handoff-retries 2
+```
+
+Operational notes:
+
+1. `prefill-worker` advances jobs to `artifact_ready`; `handoff-worker` drains `artifact_ready` one-at-a-time.
+2. Handoff retry does not recompute prefill; it reuses persisted artifact path.
+3. Current Phase-2 handoff script replays via TCP (`tbp_replay_to_kv_receiver.py`); for strict live RDMA-path validation, keep using direct prefill sender handoff flow.

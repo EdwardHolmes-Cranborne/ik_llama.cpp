@@ -4,6 +4,9 @@ This queue provides a serialized prefill -> handoff -> decode workflow using ext
 
 It is intended to prevent multi-sequence handoff collisions while current bridge import is single-stream constrained.
 
+For split prefill/handoff workers (prefill overlap with serialized handoff), see:
+`docs/development/prefill_decode_phase2_pipeline.md`.
+
 ## Scope
 
 - Persistent on-disk queue/spool

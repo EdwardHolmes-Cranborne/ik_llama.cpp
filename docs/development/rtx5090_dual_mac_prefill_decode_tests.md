@@ -223,3 +223,27 @@ Expected: submission fails with guardrail violation.
 - Submit multiple jobs
 - Verify `status` shows at most one active non-terminal job at a time
 - Verify completed jobs progress through `prefill_running -> artifact_ready -> handoff_running -> decode_running -> done`
+
+## 11. Phase-2 split pipeline queue validation
+
+1. Local deterministic self-test:
+
+```bash
+cd /path/to/ik_llama.cpp
+./scripts/test_prefill_decode_phase2_pipeline.sh
+```
+
+2. Real-environment split-worker check:
+
+- Start `prefill-worker` and `handoff-worker` in parallel.
+- Submit at least 3 `phase2_split_pipeline` jobs with different prompt files.
+- Confirm queue status shows:
+  - `artifact_ready_depth` can increase above 0 while handoff is busy
+  - only one handoff/decode stage active at a time
+- Confirm failed handoff retries return state to `artifact_ready` (not `queued`) and do not rerun prefill.
+
+3. Transport/crossover consistency check:
+
+- Submit with `--kv-transport tcp`, then `rdma`, then `auto`.
+- Keep `--prefill-min-stream-batch-tokens -1`.
+- Verify expected state progression and no compatibility regressions (`N_STREAM_UNSUPPORTED`, graph-split restore errors).
