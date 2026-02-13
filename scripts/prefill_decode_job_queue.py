@@ -156,6 +156,36 @@ def shell_join(cmd: List[str]) -> str:
     return " ".join(shlex.quote(c) for c in cmd)
 
 
+def parse_flag_value(argv: List[str], flag: str) -> Optional[str]:
+    for i, tok in enumerate(argv):
+        if tok == flag and i + 1 < len(argv):
+            return argv[i + 1]
+        if tok.startswith(flag + "="):
+            return tok.split("=", 1)[1]
+    return None
+
+
+def has_flag(argv: List[str], flag: str) -> bool:
+    for tok in argv:
+        if tok == flag or tok.startswith(flag + "="):
+            return True
+    return False
+
+
+def validate_external_command_guardrails(command_text: str) -> None:
+    argv = shlex.split(command_text)
+    kv_streams = parse_flag_value(argv, "--kv-streams")
+    if kv_streams is not None and kv_streams != "1":
+        raise SystemExit("guardrail violation: external command uses --kv-streams != 1")
+
+    split_mode = parse_flag_value(argv, "--split-mode")
+    if split_mode == "graph":
+        if has_flag(argv, "--no-flash-attn"):
+            raise SystemExit("guardrail violation: --split-mode graph with --no-flash-attn is not supported for restore/import")
+        if not has_flag(argv, "--flash-attn"):
+            raise SystemExit("guardrail violation: --split-mode graph requires --flash-attn")
+
+
 def run_job_command(
     repo_root: Path,
     job: Dict[str, Any],
@@ -196,9 +226,16 @@ def run_job_command(
     (run_dir / "queue_command.txt").write_text(shell_join(cmd) + "\n", encoding="utf-8")
 
     with log_path.open("w", encoding="utf-8") as logf:
+        child_env = os.environ.copy()
+        child_env["IK_PDQ_JOB_ID"] = str(job.get("job_id", ""))
+        child_env["IK_PDQ_JOB_MODE"] = mode
+        child_env["IK_PDQ_KV_TRANSPORT"] = str(req.get("kv_transport", "auto"))
+        child_env["IK_PDQ_MAX_RETRIES"] = str(job.get("max_retries", 0))
+
         proc = subprocess.Popen(
             cmd,
             cwd=str(repo_root),
+            env=child_env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -285,6 +322,8 @@ def cmd_submit(args: argparse.Namespace) -> int:
     else:
         if not args.command.strip():
             raise SystemExit("external_command mode requires --command")
+        if args.enforce_guardrails:
+            validate_external_command_guardrails(args.command)
 
     job_id = time.strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:8]
     retries = int(args.max_retries if args.max_retries is not None else cfg.get("max_retries_default", 0))
@@ -300,6 +339,8 @@ def cmd_submit(args: argparse.Namespace) -> int:
         "request": {
             "mode": mode,
             "command": str(args.command),
+            "kv_transport": str(args.kv_transport),
+            "enforce_guardrails": bool(args.enforce_guardrails),
             "model": str(Path(args.model).resolve()) if args.model else "",
             "prompt_file": str(Path(args.prompt_file).resolve()) if args.prompt_file else "",
             "rtx_repo": str(Path(args.rtx_repo).resolve()) if args.rtx_repo else "",
@@ -368,6 +409,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     queued = [j.get("job_id") for j in jobs if str(j.get("state", "")) == "queued"]
     payload = {
         "spool_dir": str(spool),
+        "spool_bytes": spool_size_bytes(spool),
         "counts": counts,
         "queued_depth": len(queued),
         "queued_job_ids": queued,
@@ -377,6 +419,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         print(json.dumps(payload, indent=2))
     else:
         print(f"spool_dir={payload['spool_dir']}")
+        print(f"spool_bytes={payload['spool_bytes']}")
         print(f"queued_depth={payload['queued_depth']}")
         print("counts=" + json.dumps(counts, sort_keys=True))
         if active:
@@ -505,6 +548,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_submit = sub.add_parser("submit", help="submit one queued job")
     p_submit.add_argument("--mode", choices=[JOB_MODE_SINGLE_MACHINE, JOB_MODE_EXTERNAL_COMMAND], default=JOB_MODE_SINGLE_MACHINE)
     p_submit.add_argument("--command", default="", help="command for external_command mode")
+    p_submit.add_argument("--kv-transport", choices=["auto", "tcp", "rdma", "mixed", "disabled"], default="auto")
+    p_submit.add_argument("--enforce-guardrails", dest="enforce_guardrails", action="store_true")
+    p_submit.add_argument("--no-enforce-guardrails", dest="enforce_guardrails", action="store_false")
+    p_submit.set_defaults(enforce_guardrails=True)
     p_submit.add_argument("--model", default="")
     p_submit.add_argument("--prompt-file", default="")
     p_submit.add_argument("--rtx-repo", default="")

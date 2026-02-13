@@ -53,6 +53,7 @@ Spool layout:
   --model /path/to/model.gguf \
   --prompt-file /path/to/prompt.txt \
   --rtx-repo /path/to/RTX_ACCELERATED_MAC_PREFILL_LLAMA \
+  --kv-transport auto \
   --prefill-min-stream-batch-tokens -1
 ```
 
@@ -60,6 +61,7 @@ Notes:
 
 - `--prefill-min-stream-batch-tokens -1` preserves runtime crossover/threshold logic.
 - For compatibility with current bridge import, keep handoff artifacts effectively single logical non-empty stream.
+- Transport metadata is tracked per job via `--kv-transport` and exported to child env as `IK_PDQ_KV_TRANSPORT`.
 
 ## Run worker
 
@@ -96,7 +98,8 @@ For deterministic queue/worker tests without model/network dependencies:
 ```bash
 ./scripts/prefill_decode_job_queue.py submit \
   --mode external_command \
-  --command "/path/to/runner_or_test_script.sh"
+  --command "/path/to/runner_or_test_script.sh" \
+  --kv-transport rdma
 ```
 
 Built-in self-test:
@@ -110,3 +113,7 @@ Built-in self-test:
 - Worker lock enforces one active job.
 - Queue size and spool-byte limits can be enforced via `config.json`.
 - Runner logs are persisted under `runs/<job_id>/worker_stream.log`.
+- External command mode guardrails (enabled by default):
+  - reject `--kv-streams` values other than `1`
+  - reject `--split-mode graph` unless `--flash-attn` is present
+  - reject `--split-mode graph` with `--no-flash-attn`

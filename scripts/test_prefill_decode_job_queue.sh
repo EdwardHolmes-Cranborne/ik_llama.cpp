@@ -14,6 +14,10 @@ FAKE_OK="${TMP_ROOT}/fake_ok.sh"
 cat > "${FAKE_OK}" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+if [[ "${IK_PDQ_KV_TRANSPORT:-}" != "tcp" ]]; then
+  echo "unexpected IK_PDQ_KV_TRANSPORT=${IK_PDQ_KV_TRANSPORT:-}"
+  exit 9
+fi
 echo "[3/7] run prefill sender into disk buffer"
 echo "[4/7] replay buffered artifact to ik kv-receiver"
 echo "[7/7] run decode smoke request on ik server"
@@ -29,12 +33,25 @@ FAIL_JOB_JSON="${TMP_ROOT}/fail_submit.json"
 python3 "${QUEUE_SCRIPT}" --spool-dir "${SPOOL_DIR}" submit \
   --mode external_command \
   --command "${FAKE_OK}" \
+  --kv-transport tcp \
   --priority 5 > "${OK_JOB_JSON}"
 
 python3 "${QUEUE_SCRIPT}" --spool-dir "${SPOOL_DIR}" submit \
   --mode external_command \
   --command "bash -lc 'echo fail_job; exit 7'" \
   --priority 1 > "${FAIL_JOB_JSON}"
+
+set +e
+python3 "${QUEUE_SCRIPT}" --spool-dir "${SPOOL_DIR}" submit \
+  --mode external_command \
+  --command "/bin/echo --kv-streams 2" \
+  >/dev/null 2>&1
+GUARDRAIL_RC=$?
+set -e
+if [[ "${GUARDRAIL_RC}" -eq 0 ]]; then
+  echo "expected guardrail submit rejection for --kv-streams 2"
+  exit 1
+fi
 
 OK_JOB_ID="$(python3 - <<'PY' "${OK_JOB_JSON}"
 import json
