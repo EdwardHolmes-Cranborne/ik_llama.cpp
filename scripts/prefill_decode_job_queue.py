@@ -11,6 +11,7 @@ import argparse
 import fcntl
 import json
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -26,6 +27,8 @@ DEFAULT_MAX_SPOOL_BYTES = 0
 DEFAULT_POLL_SEC = 2.0
 STATE_TERMINAL = {"done", "failed", "canceled"}
 STATE_QUEUEABLE = {"queued"}
+JOB_MODE_SINGLE_MACHINE = "single_machine_runner"
+JOB_MODE_EXTERNAL_COMMAND = "external_command"
 
 
 def now_us() -> int:
@@ -149,6 +152,10 @@ def require_file(path: str, name: str) -> None:
         raise SystemExit(f"{name} not found: {path}")
 
 
+def shell_join(cmd: List[str]) -> str:
+    return " ".join(shlex.quote(c) for c in cmd)
+
+
 def run_job_command(
     repo_root: Path,
     job: Dict[str, Any],
@@ -157,29 +164,36 @@ def run_job_command(
     on_stage: Optional[Callable[[str, str], None]] = None,
 ) -> int:
     req = job["request"]
-    cmd: List[str] = [
-        str(repo_root / "scripts" / "run_single_machine_buffered_e2e.sh"),
-        "--model", req["model"],
-        "--prompt-file", req["prompt_file"],
-        "--output-dir", str(run_dir),
-        "--ctx-size", str(req["ctx_size"]),
-        "--prefill-n-predict", str(req["prefill_n_predict"]),
-        "--prefill-min-stream-batch-tokens", str(req["prefill_min_stream_batch_tokens"]),
-        "--decode-n-predict", str(req["decode_n_predict"]),
-        "--kv-chunk-bytes", str(req["kv_chunk_bytes"]),
-        "--kv-max-inflight", str(req["kv_max_inflight"]),
-        "--loopback-idle-timeout", str(req["loopback_idle_timeout"]),
-    ]
-    rtx_repo = req.get("rtx_repo", "")
-    if rtx_repo:
-        cmd.extend(["--rtx-repo", rtx_repo])
-    if bool(req.get("no_replay_ack", False)):
-        cmd.append("--no-replay-ack")
-    for extra in req.get("extra_args", []):
-        cmd.append(str(extra))
+    mode = str(req.get("mode", JOB_MODE_SINGLE_MACHINE))
+    if mode == JOB_MODE_EXTERNAL_COMMAND:
+        command_text = str(req.get("command", "")).strip()
+        if not command_text:
+            raise RuntimeError("external_command mode requires non-empty request.command")
+        cmd = shlex.split(command_text)
+    else:
+        cmd = [
+            str(repo_root / "scripts" / "run_single_machine_buffered_e2e.sh"),
+            "--model", req["model"],
+            "--prompt-file", req["prompt_file"],
+            "--output-dir", str(run_dir),
+            "--ctx-size", str(req["ctx_size"]),
+            "--prefill-n-predict", str(req["prefill_n_predict"]),
+            "--prefill-min-stream-batch-tokens", str(req["prefill_min_stream_batch_tokens"]),
+            "--decode-n-predict", str(req["decode_n_predict"]),
+            "--kv-chunk-bytes", str(req["kv_chunk_bytes"]),
+            "--kv-max-inflight", str(req["kv_max_inflight"]),
+            "--loopback-idle-timeout", str(req["loopback_idle_timeout"]),
+        ]
+        rtx_repo = req.get("rtx_repo", "")
+        if rtx_repo:
+            cmd.extend(["--rtx-repo", rtx_repo])
+        if bool(req.get("no_replay_ack", False)):
+            cmd.append("--no-replay-ack")
+        for extra in req.get("extra_args", []):
+            cmd.append(str(extra))
 
     run_dir.mkdir(parents=True, exist_ok=True)
-    (run_dir / "queue_command.txt").write_text(" ".join(cmd) + "\n", encoding="utf-8")
+    (run_dir / "queue_command.txt").write_text(shell_join(cmd) + "\n", encoding="utf-8")
 
     with log_path.open("w", encoding="utf-8") as logf:
         proc = subprocess.Popen(
@@ -257,10 +271,20 @@ def cmd_submit(args: argparse.Namespace) -> int:
     cfg = load_config(spool)
     ensure_queue_capacity(spool, cfg)
 
-    require_file(args.model, "model")
-    require_file(args.prompt_file, "prompt file")
-    if args.rtx_repo and not Path(args.rtx_repo).is_dir():
-        raise SystemExit(f"rtx repo not found: {args.rtx_repo}")
+    mode = str(args.mode)
+    if mode not in (JOB_MODE_SINGLE_MACHINE, JOB_MODE_EXTERNAL_COMMAND):
+        raise SystemExit(f"invalid mode: {mode}")
+
+    if mode == JOB_MODE_SINGLE_MACHINE:
+        if not args.model or not args.prompt_file:
+            raise SystemExit("single_machine_runner mode requires --model and --prompt-file")
+        require_file(args.model, "model")
+        require_file(args.prompt_file, "prompt file")
+        if args.rtx_repo and not Path(args.rtx_repo).is_dir():
+            raise SystemExit(f"rtx repo not found: {args.rtx_repo}")
+    else:
+        if not args.command.strip():
+            raise SystemExit("external_command mode requires --command")
 
     job_id = time.strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:8]
     retries = int(args.max_retries if args.max_retries is not None else cfg.get("max_retries_default", 0))
@@ -274,8 +298,10 @@ def cmd_submit(args: argparse.Namespace) -> int:
         "created_at_unix_us": now_us(),
         "updated_at_unix_us": now_us(),
         "request": {
-            "model": str(Path(args.model).resolve()),
-            "prompt_file": str(Path(args.prompt_file).resolve()),
+            "mode": mode,
+            "command": str(args.command),
+            "model": str(Path(args.model).resolve()) if args.model else "",
+            "prompt_file": str(Path(args.prompt_file).resolve()) if args.prompt_file else "",
             "rtx_repo": str(Path(args.rtx_repo).resolve()) if args.rtx_repo else "",
             "ctx_size": int(args.ctx_size),
             "prefill_n_predict": int(args.prefill_n_predict),
@@ -310,10 +336,51 @@ def cmd_list(args: argparse.Namespace) -> int:
         print("no jobs")
         return 0
     for j in jobs:
+        req = j.get("request", {})
+        mode = req.get("mode", JOB_MODE_SINGLE_MACHINE)
         print(
             f"{j.get('job_id')} state={j.get('state')} prio={j.get('priority')} "
-            f"attempt={j.get('attempt')}/{j.get('max_retries')} updated_us={j.get('updated_at_unix_us')}"
+            f"attempt={j.get('attempt')}/{j.get('max_retries')} mode={mode} "
+            f"updated_us={j.get('updated_at_unix_us')}"
         )
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    spool = Path(args.spool_dir)
+    ensure_dirs(spool)
+    jobs = list_jobs(spool)
+    counts: Dict[str, int] = {}
+    for job in jobs:
+        st = str(job.get("state", "unknown"))
+        counts[st] = counts.get(st, 0) + 1
+
+    active = [
+        {
+            "job_id": j.get("job_id"),
+            "state": j.get("state"),
+            "attempt": j.get("attempt"),
+            "priority": j.get("priority"),
+        }
+        for j in jobs
+        if str(j.get("state", "")) not in STATE_TERMINAL and str(j.get("state", "")) != "queued"
+    ]
+    queued = [j.get("job_id") for j in jobs if str(j.get("state", "")) == "queued"]
+    payload = {
+        "spool_dir": str(spool),
+        "counts": counts,
+        "queued_depth": len(queued),
+        "queued_job_ids": queued,
+        "active_jobs": active,
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2))
+    else:
+        print(f"spool_dir={payload['spool_dir']}")
+        print(f"queued_depth={payload['queued_depth']}")
+        print("counts=" + json.dumps(counts, sort_keys=True))
+        if active:
+            print("active_jobs=" + json.dumps(active, sort_keys=True))
     return 0
 
 
@@ -436,8 +503,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_init.set_defaults(func=cmd_init)
 
     p_submit = sub.add_parser("submit", help="submit one queued job")
-    p_submit.add_argument("--model", required=True)
-    p_submit.add_argument("--prompt-file", required=True)
+    p_submit.add_argument("--mode", choices=[JOB_MODE_SINGLE_MACHINE, JOB_MODE_EXTERNAL_COMMAND], default=JOB_MODE_SINGLE_MACHINE)
+    p_submit.add_argument("--command", default="", help="command for external_command mode")
+    p_submit.add_argument("--model", default="")
+    p_submit.add_argument("--prompt-file", default="")
     p_submit.add_argument("--rtx-repo", default="")
     p_submit.add_argument("--ctx-size", type=int, default=8192)
     p_submit.add_argument("--prefill-n-predict", type=int, default=8)
@@ -456,6 +525,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_list.add_argument("--state", default="")
     p_list.add_argument("--json", action="store_true")
     p_list.set_defaults(func=cmd_list)
+
+    p_status = sub.add_parser("status", help="queue status summary")
+    p_status.add_argument("--json", action="store_true")
+    p_status.set_defaults(func=cmd_status)
 
     p_show = sub.add_parser("show", help="show one job")
     p_show.add_argument("job_id")

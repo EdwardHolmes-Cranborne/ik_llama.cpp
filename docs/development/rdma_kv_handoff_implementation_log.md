@@ -55,6 +55,8 @@
 15. Started Phase-1 single-flight handoff queue implementation (external tooling):
    - New persistent queue worker: `scripts/prefill_decode_job_queue.py`
    - New operator guide: `docs/development/prefill_decode_phase1_queue.md`
+   - Added queue status summary command and external-command execution mode for deterministic CI/local testing.
+   - Added queue self-test harness: `scripts/test_prefill_decode_job_queue.sh`
    - Buffered E2E runner now supports threshold-preserving prefill mode selection:
      `--prefill-min-stream-batch-tokens` (default `-1`, runtime crossover logic).
 

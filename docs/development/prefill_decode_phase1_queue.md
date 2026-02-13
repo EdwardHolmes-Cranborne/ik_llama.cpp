@@ -79,6 +79,7 @@ Run continuously:
 
 ```bash
 ./scripts/prefill_decode_job_queue.py list
+./scripts/prefill_decode_job_queue.py status --json
 ./scripts/prefill_decode_job_queue.py show <job_id>
 ```
 
@@ -86,6 +87,22 @@ Cancel queued job:
 
 ```bash
 ./scripts/prefill_decode_job_queue.py cancel <job_id>
+```
+
+## External Command Mode (testing/integration)
+
+For deterministic queue/worker tests without model/network dependencies:
+
+```bash
+./scripts/prefill_decode_job_queue.py submit \
+  --mode external_command \
+  --command "/path/to/runner_or_test_script.sh"
+```
+
+Built-in self-test:
+
+```bash
+./scripts/test_prefill_decode_job_queue.sh
 ```
 
 ## Guardrails
