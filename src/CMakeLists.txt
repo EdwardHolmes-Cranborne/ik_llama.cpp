@@ -58,10 +58,17 @@ add_library(llama
             unicode.h
             unicode.cpp
             unicode-data.cpp
+            # KV Bridge module (Gate 2.5)
+            kv-bridge/ik-kv-compat-types.h
+            kv-bridge/ik-kv-compat-types.cpp
+            kv-bridge/ik-kv-compat.h
+            kv-bridge/ik-kv-compat.cpp
             )
 
 target_include_directories(llama PUBLIC . ../include)
 target_include_directories(llama PRIVATE ../ggml/src)
+target_include_directories(llama PRIVATE .  # For kv-bridge headers
+                           ${CMAKE_CURRENT_SOURCE_DIR}/kv-bridge)
 target_compile_features   (llama PUBLIC cxx_std_17)
 
 target_link_libraries(llama PUBLIC ggml)

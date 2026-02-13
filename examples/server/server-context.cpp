@@ -10,6 +10,35 @@
 #include "speculative.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#include "src/kv-bridge/ik-kv-compat.h"
+
+#include <fstream>
+
+namespace {
+bool read_file_bytes(const std::string & path, std::vector<uint8_t> & out, std::string & err) {
+    std::ifstream ifs(path, std::ios::binary | std::ios::ate);
+    if (!ifs.is_open()) {
+        err = "failed to open file";
+        return false;
+    }
+
+    const std::streamsize size = ifs.tellg();
+    if (size < 0) {
+        err = "failed to determine file size";
+        return false;
+    }
+    ifs.seekg(0, std::ios::beg);
+
+    out.resize((size_t) size);
+    if (size > 0) {
+        if (!ifs.read((char *) out.data(), size)) {
+            err = "failed to read file bytes";
+            return false;
+        }
+    }
+    return true;
+}
+} // namespace
 
 
 server_context::~server_context() {
@@ -2001,11 +2030,38 @@ void server_context::process_single_task(server_task&& task) {
         size_t token_count = 0;
         size_t nread = llama_state_seq_load_file(ctx, filepath.c_str(), slot->id, slot->cache_tokens.data(), slot->cache_tokens.size(), &token_count);
         if (nread == 0) {
-            slot->cache_tokens.resize(0);
-            send_error(task, "Unable to restore slot, no available space in KV cache or invalid slot save file", ERROR_TYPE_INVALID_REQUEST);
-            break;
+            // Fallback: treat file as prefill-side .kva artifact and run bridge import.
+            std::vector<uint8_t> artifact;
+            std::string read_err;
+            if (!read_file_bytes(filepath, artifact, read_err)) {
+                slot->cache_tokens.resize(0);
+                send_error(task, "Unable to restore slot: invalid sequence file and failed to read artifact (" + read_err + ")", ERROR_TYPE_INVALID_REQUEST);
+                break;
+            }
+
+            ik_kv_compat_reject_reason_t reject = IK_KV_COMPAT_REJECT_NONE;
+            const ik_kv_compat_convert_result_t rc = ik_kv_import_into_context(
+                ctx, artifact.data(), artifact.size(), slot->id, &reject);
+            if (rc != IK_KV_COMPAT_CONVERT_OK) {
+                slot->cache_tokens.resize(0);
+                send_error(task,
+                    "Unable to restore slot: invalid sequence file and bridge import failed (" +
+                    std::string(ik_kv_compat_result_str(rc)) + ", reject=" + ik_kv_compat_reject_str(reject) + ")",
+                    ERROR_TYPE_INVALID_REQUEST);
+                break;
+            }
+
+            const llama_pos pos_max = llama_kv_cache_seq_pos_max(ctx, slot->id);
+            token_count = pos_max < 0 ? 0 : (size_t) pos_max + 1;
+            slot->cache_tokens.resize(token_count);
+            for (size_t i = 0; i < token_count; ++i) {
+                slot->cache_tokens.set_token((llama_pos) i, LLAMA_TOKEN_NULL);
+            }
+            nread = artifact.size();
         }
-        slot->cache_tokens.resize(token_count);
+        if (slot->cache_tokens.size() != token_count) {
+            slot->cache_tokens.resize(token_count);
+        }
 
         const int64_t t_end = ggml_time_us();
         const double t_restore_ms = (t_end - t_start) / 1000.0;

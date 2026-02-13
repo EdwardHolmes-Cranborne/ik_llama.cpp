@@ -143,3 +143,14 @@ llama_target_and_test(test-autorelease.cpp        LABEL "model")
 get_filename_component(TEST_TARGET test-c.c NAME_WE)
 add_executable(${TEST_TARGET} test-c.c)
 target_link_libraries(${TEST_TARGET} PRIVATE llama)
+
+#
+# KV Bridge tests (KVB-013)
+#
+
+# test-kv-bridge-parser - Tests KVB-UT-001, KVB-UT-010, KVB-UT-011, KVB-UT-012, KVB-UT-030, KVB-UT-040, KVB-UT-041, KVB-UT-042
+add_executable(test-kv-bridge-parser test-kv-bridge-parser.cpp)
+target_link_libraries(test-kv-bridge-parser PRIVATE llama)
+target_include_directories(test-kv-bridge-parser PRIVATE ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME test-kv-bridge-parser COMMAND test-kv-bridge-parser)
+set_property(TEST test-kv-bridge-parser PROPERTY LABELS "kv-bridge")
