@@ -43,6 +43,10 @@
    - New config to force-finalize sessions after idle frame timeout.
    - New config to prune finalized sessions after retention window.
    - Periodic maintenance sweep with status counters for stale-finalized/pruned sessions.
+13. Hardened prefill-side split transport correctness (RTX fork):
+   - Split handoff now treats `kv_transport=disabled` as a real fallback to local decode (no false transport success).
+   - Split handoff publish now rejects filesystem backend in transport-required paths.
+   - Decode alias ordering fixed in CLI arg tables to satisfy parser invariants.
 
 ### Commits produced
 
@@ -57,6 +61,7 @@
 - `d3e9e38c` Enforce strict expected chunk count on KV reassembly
 - `eaed6ee0` Honor sender ACK policy and NACK on chunk persistence errors
 - `fe16986e` Add KV receiver stale-finalize and session retention maintenance
+- `efb93a5` [RTX fork] Require network transport for split handoff and fix decode arg alias order
 
 ### Verification completed
 
