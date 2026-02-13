@@ -1,0 +1,145 @@
+# RTX5090 -> Dual-Mac Decode Setup Guide
+
+This guide documents the target deployment:
+
+- Prefill host: WRX90 + RTX 5090 + NVMe SSD
+- Decode cluster:
+  - Mac Studio (512GB)
+  - MacBook Pro M3 Max (128GB)
+- Transport fabric: USB4 / Thunderbolt networking/tunneling
+- Flow: RTX prefill -> KV handoff -> ik `llama-server` decode across both Macs
+
+## 1. Host roles and addresses
+
+Use fixed addresses on the Thunderbolt/USB4 fabric:
+
+- `RTX_HOST` (WRX90): `10.40.0.10`
+- `MAC_STUDIO` (decode coordinator): `10.40.0.20`
+- `MAC_MBP` (decode worker): `10.40.0.21`
+
+All commands below assume these values.
+
+## 2. Build binaries
+
+### 2.1 Build ik on both Macs
+
+Run on both `MAC_STUDIO` and `MAC_MBP`:
+
+```bash
+cd /path/to/ik_llama.cpp
+cmake -S . -B build_codex -DGGML_METAL=ON -DGGML_RPC=ON
+cmake --build build_codex -j
+```
+
+### 2.2 Build RTX prefill fork on WRX90
+
+```bash
+cd /path/to/RTX_ACCELERATED_MAC_PREFILL_LLAMA/prefill_llama.cpp
+cmake -S . -B build -DGGML_CUDA=ON
+cmake --build build -j
+```
+
+## 3. Start decode worker RPC servers (both Macs)
+
+### 3.1 Mac Studio RPC server
+
+```bash
+cd /path/to/ik_llama.cpp
+./build_codex/bin/rpc-server --host 0.0.0.0 --port 50052 --device METAL0
+```
+
+### 3.2 MacBook Pro RPC server
+
+```bash
+cd /path/to/ik_llama.cpp
+./build_codex/bin/rpc-server --host 0.0.0.0 --port 50052 --device METAL0
+```
+
+## 4. Start decode coordinator (`llama-server`) on Mac Studio
+
+```bash
+cd /path/to/ik_llama.cpp
+mkdir -p /tmp/ik_slots /tmp/ik_kv_handoff
+
+./build_codex/bin/llama-server \
+  -m /models/your-model.gguf \
+  --host 0.0.0.0 --port 8080 \
+  -c 32768 \
+  -ngl 999 \
+  --split-mode graph \
+  --max-gpu 2 \
+  --tensor-split 0.70,0.30 \
+  --rpc 10.40.0.20:50052,10.40.0.21:50052 \
+  --slot-save-path /tmp/ik_slots \
+  --kv-recv-enable \
+  --kv-transport auto \
+  --kv-transport-fallback \
+  --kv-recv-host 0.0.0.0 \
+  --kv-recv-port 19001 \
+  --kv-recv-slot 0 \
+  --kv-recv-output-dir /tmp/ik_kv_handoff \
+  --kv-recv-max-connections 64 \
+  --kv-recv-idle-timeout 120
+```
+
+Verify receiver state:
+
+```bash
+curl -s http://10.40.0.20:8080/kv-receiver/status | jq
+```
+
+## 5. Start RTX prefill client on WRX90
+
+Set crossover logic inputs (keep dynamic prefill threshold behavior enabled):
+
+```bash
+export LLAMA_PREFILL_TB_ENABLE=1
+export LLAMA_PREFILL_STREAM_FLOOR_MS=4000
+export LLAMA_PREFILL_STREAM_TOK_S=2500
+export LLAMA_PREFILL_DECODE_TOK_S=220
+```
+
+Run prefill/decode handoff:
+
+```bash
+cd /path/to/RTX_ACCELERATED_MAC_PREFILL_LLAMA/prefill_llama.cpp
+
+./build/bin/llama-cli \
+  -m /models/your-model.gguf \
+  -f /prompts/long_prompt.txt \
+  -c 32768 \
+  -n 128 \
+  -ps --prefill-overlap \
+  --prefill-min-stream-batch-tokens -1 \
+  --prefill-decode-mode split_thunderbolt \
+  --prefill-decode-transport-required \
+  --prefill-transport-mode progressive \
+  --prefill-execution-mode coupled \
+  --kv-transport auto \
+  --kv-transport-fallback \
+  --kv-host 10.40.0.20 \
+  --kv-port 19001 \
+  --kv-streams 4 \
+  --kv-stream-chunk-bytes 4194304 \
+  --kv-max-inflight-bytes 268435456
+```
+
+## 6. Transport mode switching (both supported)
+
+Use the same deployment and change only these controls:
+
+1. `rdma preferred`:
+   - prefill: `--kv-transport rdma --kv-transport-fallback`
+   - decode: `--kv-transport rdma --kv-transport-fallback`
+2. `tcp only`:
+   - prefill: `--kv-transport tcp`
+   - decode: `--kv-transport tcp`
+3. `auto`:
+   - prefill: `--kv-transport auto`
+   - decode: `--kv-transport auto`
+
+## 7. Notes for first production run
+
+1. Start with `--kv-recv-dry-run` on decode for transport-only validation.
+2. Then remove dry-run to allow slot restore/import.
+3. Keep prompt lengths above the computed crossover for RTX prefill benefits; with `--prefill-min-stream-batch-tokens -1`, crossover remains auto-derived from runtime inputs.

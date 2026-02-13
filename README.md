@@ -112,6 +112,9 @@ There is no single point of reference describing all new `ik_llama.cpp` features
 * [This guide](https://github.com/ikawrakow/ik_llama.cpp/discussions/258) is a good place to start if you came here because of DeepSeek models
 * [This discussion](https://github.com/ikawrakow/ik_llama.cpp/discussions/266) is about running DeepSeek-V3/R1 on a 16 x 3090 setup
 * [This discussion](https://github.com/ikawrakow/ik_llama.cpp/discussions/8) describes the new quantization types available in `ik_llama.cpp`
+* [RDMA + KV handoff implementation log](docs/development/rdma_kv_handoff_implementation_log.md)
+* [RTX5090 -> dual-Mac setup guide](docs/development/rtx5090_dual_mac_prefill_decode_setup.md)
+* [RTX5090 -> dual-Mac test guide](docs/development/rtx5090_dual_mac_prefill_decode_tests.md)
 
 ## Testing
 
