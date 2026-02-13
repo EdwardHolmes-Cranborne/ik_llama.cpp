@@ -102,6 +102,20 @@ For deterministic queue/worker tests without model/network dependencies:
   --kv-transport rdma
 ```
 
+Recommended real handoff wrapper:
+
+```bash
+./scripts/prefill_decode_job_queue.py submit \
+  --mode external_command \
+  --kv-transport auto \
+  --command "./scripts/run_phase1_prefill_handoff_job.sh \
+    --model /models/your-model.gguf \
+    --prompt-file /prompts/long_prompt.txt \
+    --rtx-repo /path/to/RTX_ACCELERATED_MAC_PREFILL_LLAMA \
+    --decode-host 10.40.0.20 \
+    --decode-port 19001"
+```
+
 Built-in self-test:
 
 ```bash
