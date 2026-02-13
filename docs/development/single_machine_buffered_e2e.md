@@ -49,3 +49,5 @@ The suite writes a timestamped output directory under `/tmp/ik_rtx_single_machin
 - This suite is intentionally external tooling only.
 - It validates buffered handoff mechanics and receiver-side restore path in one host environment.
 - It does not replace real multi-host RDMA/TCP hardware matrix testing.
+- It intentionally uses single-stream replay/send semantics; current bridge import path rejects artifacts with multiple non-empty RTX streams.
+- For decode runs that use `--split-mode graph`, keep `--flash-attn` enabled to avoid transposed-V restore incompatibility.

@@ -65,6 +65,7 @@ mkdir -p /tmp/ik_slots /tmp/ik_kv_handoff
   -m /models/your-model.gguf \
   --host 0.0.0.0 --port 8080 \
   -c 32768 \
+  --flash-attn \
   -ngl 999 \
   --split-mode graph \
   --max-gpu 2 \
@@ -128,7 +129,7 @@ cd /path/to/RTX_ACCELERATED_MAC_PREFILL_LLAMA/prefill_llama.cpp
   --kv-transport-fallback \
   --kv-host 10.40.0.20 \
   --kv-port 19001 \
-  --kv-streams 4 \
+  --kv-streams 1 \
   --kv-stream-chunk-bytes 4194304 \
   --kv-max-inflight-bytes 268435456
 ```
@@ -147,7 +148,16 @@ Use the same deployment and change only these controls:
    - prefill: `--kv-transport auto`
    - decode: `--kv-transport auto`
 
-## 7. Notes for first production run
+## 7. KV import compatibility constraints (current)
+
+1. Use single-stream payloads for bridge import:
+   - Current bridge import path rejects RTX artifacts with more than one non-empty stream (`reject=N_STREAM_UNSUPPORTED`).
+   - Keep prefill sender at `--kv-streams 1` for production handoff until multi-stream import support lands.
+2. For decode `--split-mode graph`, keep `--flash-attn` enabled:
+   - Graph-split restore rejects transposed-V restore path.
+   - If you must run without flash attention, avoid `--split-mode graph` for restore/import runs.
+
+## 8. Notes for first production run
 
 1. Start with `--kv-recv-dry-run` on decode for transport-only validation.
 2. Then remove dry-run to allow slot restore/import.

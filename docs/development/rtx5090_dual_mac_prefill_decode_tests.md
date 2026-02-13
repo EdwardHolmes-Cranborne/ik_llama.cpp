@@ -80,6 +80,12 @@ Expected:
 - no new `validation_error`
 - `sessions[].expected_chunks` / `sessions[].expected_payload_bytes` stay non-zero
 
+Compatibility checks (must stay clear):
+
+- no `sessions[].validation_error` containing `N_STREAM_UNSUPPORTED`
+- no decode logs containing:
+  - `Transposed V cache is not sypported with split mode 'graph'`
+
 Also verify decode server still responds:
 
 ```bash
@@ -144,7 +150,17 @@ Pass criteria:
 - long prompts use prefill handoff path
 - behavior tracks configured crossover assumptions
 
-## 7. Soak test (recommended 1-4h)
+## 7. Restore compatibility guardrails
+
+1. Single-stream import constraint:
+   - run with `--kv-streams 1` on prefill sender
+   - verify no `N_STREAM_UNSUPPORTED` reject in receiver session summaries
+2. Graph split + flash-attn constraint:
+   - for `--split-mode graph`, run decode with `--flash-attn`
+   - if testing decode without flash-attn, switch away from graph split for import/restore runs
+   - verify decode logs do not contain `Transposed V cache is not sypported with split mode 'graph'`
+
+## 8. Soak test (recommended 1-4h)
 
 Example loop from `RTX_HOST`:
 
@@ -173,7 +189,7 @@ Pass criteria:
 - no invalid artifacts
 - stable decode service health
 
-## 8. Artifacts to archive for each test batch
+## 9. Artifacts to archive for each test batch
 
 1. Receiver snapshot:
    - `curl http://10.40.0.20:8080/kv-receiver/status`
