@@ -56,6 +56,7 @@
 - `efcd76cf` Avoid false ACKs on CRC failures when NACKs are disabled
 - `d3e9e38c` Enforce strict expected chunk count on KV reassembly
 - `eaed6ee0` Honor sender ACK policy and NACK on chunk persistence errors
+- `fe16986e` Add KV receiver stale-finalize and session retention maintenance
 
 ### Verification completed
 
