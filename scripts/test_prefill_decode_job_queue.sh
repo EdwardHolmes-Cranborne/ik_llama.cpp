@@ -29,6 +29,7 @@ python3 "${QUEUE_SCRIPT}" --spool-dir "${SPOOL_DIR}" init --max-queued 8 >/dev/n
 
 OK_JOB_JSON="${TMP_ROOT}/ok_submit.json"
 FAIL_JOB_JSON="${TMP_ROOT}/fail_submit.json"
+LAUNCH_FAIL_JOB_JSON="${TMP_ROOT}/launch_fail_submit.json"
 
 python3 "${QUEUE_SCRIPT}" --spool-dir "${SPOOL_DIR}" submit \
   --mode external_command \
@@ -40,6 +41,11 @@ python3 "${QUEUE_SCRIPT}" --spool-dir "${SPOOL_DIR}" submit \
   --mode external_command \
   --command "bash -lc 'echo fail_job; exit 7'" \
   --priority 1 > "${FAIL_JOB_JSON}"
+
+python3 "${QUEUE_SCRIPT}" --spool-dir "${SPOOL_DIR}" submit \
+  --mode external_command \
+  --command "/definitely/not/a/real/command --foo" \
+  --priority 0 > "${LAUNCH_FAIL_JOB_JSON}"
 
 set +e
 python3 "${QUEUE_SCRIPT}" --spool-dir "${SPOOL_DIR}" submit \
@@ -67,13 +73,21 @@ print(json.load(open(sys.argv[1], encoding="utf-8"))["job_id"])
 PY
 )"
 
+LAUNCH_FAIL_JOB_ID="$(python3 - <<'PY' "${LAUNCH_FAIL_JOB_JSON}"
+import json
+import sys
+print(json.load(open(sys.argv[1], encoding="utf-8"))["job_id"])
+PY
+)"
+
+python3 "${QUEUE_SCRIPT}" --spool-dir "${SPOOL_DIR}" worker --once >/dev/null
 python3 "${QUEUE_SCRIPT}" --spool-dir "${SPOOL_DIR}" worker --once >/dev/null
 python3 "${QUEUE_SCRIPT}" --spool-dir "${SPOOL_DIR}" worker --once >/dev/null
 
 STATUS_JSON="${TMP_ROOT}/status.json"
 python3 "${QUEUE_SCRIPT}" --spool-dir "${SPOOL_DIR}" status --json > "${STATUS_JSON}"
 
-python3 - <<'PY' "${STATUS_JSON}" "${SPOOL_DIR}" "${OK_JOB_ID}" "${FAIL_JOB_ID}"
+python3 - <<'PY' "${STATUS_JSON}" "${SPOOL_DIR}" "${OK_JOB_ID}" "${FAIL_JOB_ID}" "${LAUNCH_FAIL_JOB_ID}"
 import json
 import pathlib
 import sys
@@ -82,12 +96,13 @@ status = json.load(open(sys.argv[1], encoding="utf-8"))
 spool = pathlib.Path(sys.argv[2])
 ok_job_id = sys.argv[3]
 fail_job_id = sys.argv[4]
+launch_fail_job_id = sys.argv[5]
 
 counts = status.get("counts", {})
 if int(counts.get("done", 0)) < 1:
     raise SystemExit("expected at least one done job")
-if int(counts.get("failed", 0)) < 1:
-    raise SystemExit("expected at least one failed job")
+if int(counts.get("failed", 0)) < 2:
+    raise SystemExit("expected at least two failed jobs")
 
 ok_job = json.load(open(spool / "jobs" / f"{ok_job_id}.json", encoding="utf-8"))
 if ok_job.get("state") != "done":
@@ -103,6 +118,22 @@ for required_state in ("prefill_running", "artifact_ready", "handoff_running", "
 fail_job = json.load(open(spool / "jobs" / f"{fail_job_id}.json", encoding="utf-8"))
 if fail_job.get("state") != "failed":
     raise SystemExit(f"expected fail job state failed, got {fail_job.get('state')}")
+
+launch_fail_job = json.load(open(spool / "jobs" / f"{launch_fail_job_id}.json", encoding="utf-8"))
+if launch_fail_job.get("state") != "failed":
+    raise SystemExit(f"expected launch fail job state failed, got {launch_fail_job.get('state')}")
+launch_result = launch_fail_job.get("result", {})
+if int(launch_result.get("return_code", 0)) != 127:
+    raise SystemExit(f"expected launch fail return_code 127, got {launch_result.get('return_code')}")
+runner_exception = str(launch_result.get("runner_exception", ""))
+if not runner_exception:
+    raise SystemExit("expected launch fail job to include result.runner_exception")
+log_path = pathlib.Path(str(launch_result.get("worker_stream_log", "")))
+if not log_path.is_file():
+    raise SystemExit("expected launch fail worker stream log file to exist")
+log_text = log_path.read_text(encoding="utf-8")
+if "[queue-worker] job runner exception:" not in log_text:
+    raise SystemExit("expected launch fail worker log to include worker exception marker")
 PY
 
 echo "queue self-test passed"

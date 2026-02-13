@@ -15,6 +15,7 @@ import shlex
 import subprocess
 import sys
 import time
+import traceback
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -491,7 +492,20 @@ def cmd_worker(args: argparse.Namespace) -> int:
                 stage_state["last"] = state
                 update_state(spool, job, state, message)
 
-            rc = run_job_command(repo_root, job, run_dir, log_path, on_stage=on_stage)
+            runner_exception: Optional[str] = None
+            try:
+                rc = run_job_command(repo_root, job, run_dir, log_path, on_stage=on_stage)
+            except Exception as exc:
+                rc = 127
+                runner_exception = f"{type(exc).__name__}: {exc}"
+                tb = traceback.format_exc()
+                with log_path.open("a", encoding="utf-8") as logf:
+                    logf.write(f"[queue-worker] job runner exception: {runner_exception}\n")
+                    logf.write(tb)
+                    if not tb.endswith("\n"):
+                        logf.write("\n")
+                sys.stderr.write(f"[queue-worker] {job['job_id']} runner exception: {runner_exception}\n")
+                sys.stderr.flush()
 
             if rc == 0:
                 update_state(
@@ -508,6 +522,13 @@ def cmd_worker(args: argparse.Namespace) -> int:
                     },
                 )
             else:
+                result_patch: Dict[str, Any] = {
+                    "return_code": rc,
+                    "run_dir": str(run_dir),
+                    "worker_stream_log": str(log_path),
+                }
+                if runner_exception:
+                    result_patch["runner_exception"] = runner_exception
                 max_retries = int(job.get("max_retries", 0))
                 attempt = int(job.get("attempt", 1))
                 if attempt <= max_retries:
@@ -516,7 +537,7 @@ def cmd_worker(args: argparse.Namespace) -> int:
                         job,
                         "queued",
                         f"job failed rc={rc}; retrying",
-                        patch={"result": {"return_code": rc, "run_dir": str(run_dir)}},
+                        patch={"result": result_patch},
                     )
                 else:
                     update_state(
@@ -524,7 +545,7 @@ def cmd_worker(args: argparse.Namespace) -> int:
                         job,
                         "failed",
                         f"job failed rc={rc}; retries exhausted",
-                        patch={"result": {"return_code": rc, "run_dir": str(run_dir), "worker_stream_log": str(log_path)}},
+                        patch={"result": result_patch},
                     )
 
             if args.once:
