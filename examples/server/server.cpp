@@ -1,6 +1,7 @@
 #pragma warning(disable : 4996)
 #include "server-context.h"
 #include "server-common.h"
+#include "server-kv-receiver.h"
 #include "chat.h"
 
 #include "common.h"
@@ -453,6 +454,7 @@ int main(int argc, char ** argv) {
 
     // struct that contains llama context and inference
     server_context ctx_server;
+    kv_receiver_service kv_receiver(ctx_server.queue_tasks, ctx_server.queue_results);
 
     if (!params.system_prompt.empty()) {
         ctx_server.system_prompt_set(params.system_prompt);
@@ -583,6 +585,26 @@ int main(int argc, char ** argv) {
     }
 
     LOG_INFO("model loaded", {});
+
+    {
+        const kv_receiver_config kv_cfg = kv_receiver_config_from_params(params);
+        std::string kv_start_err;
+        if (!kv_receiver.start(kv_cfg, &kv_start_err)) {
+            fprintf(stderr, "failed to start KV receiver: %s\n", kv_start_err.c_str());
+            return 1;
+        }
+
+        const kv_receiver_runtime kv_runtime = kv_receiver.runtime();
+        LOG_INFO("kv receiver", {
+            {"enabled", kv_runtime.enabled},
+            {"running", kv_runtime.running},
+            {"requested_transport_mode", kv_runtime.requested_transport_mode},
+            {"resolved_transport_mode", kv_runtime.resolved_transport_mode},
+            {"bind_host", kv_runtime.bind_host},
+            {"bind_port", kv_runtime.bind_port},
+            {"output_dir", kv_runtime.output_dir},
+        });
+    }
 
     const auto model_meta = ctx_server.model_meta();
 
@@ -2066,6 +2088,17 @@ int main(int argc, char ** argv) {
         params.n_threads_http = std::max(params.n_parallel + 2, (int32_t) std::thread::hardware_concurrency() - 1);
     }
     log_data["n_threads_http"] =  std::to_string(params.n_threads_http);
+    {
+        const kv_receiver_runtime kv_runtime = kv_receiver.runtime();
+        log_data["kv_receiver_enabled"] = kv_runtime.enabled ? "true" : "false";
+        log_data["kv_receiver_running"] = kv_runtime.running ? "true" : "false";
+        log_data["kv_receiver_mode"] = kv_runtime.resolved_transport_mode;
+        if (kv_runtime.running) {
+            log_data["kv_receiver_host"] = kv_runtime.bind_host;
+            log_data["kv_receiver_port"] = std::to_string(kv_runtime.bind_port);
+            log_data["kv_receiver_output_dir"] = kv_runtime.output_dir;
+        }
+    }
     svr->new_task_queue = [&params] { return new httplib::ThreadPool(params.n_threads_http); };
 
     LOG_INFO("HTTP server listening", log_data);
@@ -2115,6 +2148,7 @@ int main(int argc, char ** argv) {
 
     ctx_server.queue_tasks.start_loop();
 
+    kv_receiver.stop();
     svr->stop();
     t.join();
 

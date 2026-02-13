@@ -487,6 +487,19 @@ void gpt_params_parse_from_env(gpt_params & params) {
     get_env("LLAMA_ARG_CONT_BATCHING",    params.cont_batching);
     get_env("LLAMA_ARG_HOST",             params.hostname);
     get_env("LLAMA_ARG_PORT",             params.port);
+    get_env("LLAMA_ARG_KV_RECV_ENABLE",           params.kv_receiver_enable);
+    get_env("LLAMA_ARG_KV_TRANSPORT",             params.kv_transport);
+    get_env("LLAMA_ARG_KV_TRANSPORT_FALLBACK",    params.kv_transport_fallback);
+    get_env("LLAMA_ARG_KV_RECV_HOST",             params.kv_receiver_host);
+    get_env("LLAMA_ARG_KV_RECV_PORT",             params.kv_receiver_port);
+    get_env("LLAMA_ARG_KV_RECV_SLOT",             params.kv_receiver_slot_id);
+    get_env("LLAMA_ARG_KV_RECV_OUTPUT_DIR",       params.kv_receiver_output_dir);
+    get_env("LLAMA_ARG_KV_RECV_ACK",              params.kv_receiver_ack);
+    get_env("LLAMA_ARG_KV_RECV_NACK_ON_CRC_BAD",  params.kv_receiver_nack_on_crc_bad);
+    get_env("LLAMA_ARG_KV_RECV_MAX_CONNECTIONS",  params.kv_receiver_max_connections);
+    get_env("LLAMA_ARG_KV_RECV_IDLE_TIMEOUT",     params.kv_receiver_idle_timeout_sec);
+    get_env("LLAMA_ARG_KV_RECV_SOCKET_SEND_BUF",  params.kv_receiver_socket_send_buf);
+    get_env("LLAMA_ARG_KV_RECV_SOCKET_RECV_BUF",  params.kv_receiver_socket_recv_buf);
 }
 
 bool gpt_params_parse(int argc, char ** argv, gpt_params & params) {
@@ -1834,6 +1847,67 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         }
         return true;
     }
+    if (arg == "--kv-recv-enable") {
+        params.kv_receiver_enable = true;
+        return true;
+    }
+    if (arg == "--kv-transport") {
+        CHECK_ARG
+        params.kv_transport = string_lower(std::string(argv[i]));
+        return true;
+    }
+    if (arg == "--kv-transport-fallback") {
+        params.kv_transport_fallback = true;
+        return true;
+    }
+    if (arg == "--kv-recv-host") {
+        CHECK_ARG
+        params.kv_receiver_host = argv[i];
+        return true;
+    }
+    if (arg == "--kv-recv-port") {
+        CHECK_ARG
+        params.kv_receiver_port = std::stoi(argv[i]);
+        return true;
+    }
+    if (arg == "--kv-recv-slot") {
+        CHECK_ARG
+        params.kv_receiver_slot_id = std::stoi(argv[i]);
+        return true;
+    }
+    if (arg == "--kv-recv-output-dir") {
+        CHECK_ARG
+        params.kv_receiver_output_dir = argv[i];
+        return true;
+    }
+    if (arg == "--kv-recv-no-ack") {
+        params.kv_receiver_ack = false;
+        return true;
+    }
+    if (arg == "--kv-recv-no-nack-on-crc-bad") {
+        params.kv_receiver_nack_on_crc_bad = false;
+        return true;
+    }
+    if (arg == "--kv-recv-max-connections") {
+        CHECK_ARG
+        params.kv_receiver_max_connections = std::stoi(argv[i]);
+        return true;
+    }
+    if (arg == "--kv-recv-idle-timeout") {
+        CHECK_ARG
+        params.kv_receiver_idle_timeout_sec = std::stoi(argv[i]);
+        return true;
+    }
+    if (arg == "--kv-recv-socket-send-buf") {
+        CHECK_ARG
+        params.kv_receiver_socket_send_buf = std::stoi(argv[i]);
+        return true;
+    }
+    if (arg == "--kv-recv-socket-recv-buf") {
+        CHECK_ARG
+        params.kv_receiver_socket_recv_buf = std::stoi(argv[i]);
+        return true;
+    }
     if (arg == "--reasoning-tokens") {
         CHECK_ARG
         params.think_tokens = thinking_tokens_from_string(std::string(argv[i]));
@@ -2477,6 +2551,19 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "server",      "       --metrics",              "enable prometheus compatible metrics endpoint (default: %s)", params.endpoint_metrics ? "enabled" : "disabled" });
     options.push_back({ "server",      "       --no-slots",             "disables slots monitoring endpoint (default: %s)", params.endpoint_slots ? "enabled" : "disabled" });
     options.push_back({ "server",      "       --slot-save-path PATH",  "path to save slot kv cache (default: disabled)" });
+    options.push_back({ "server",      "       --kv-recv-enable",       "enable KV handoff receiver for prefill artifacts (default: disabled)" });
+    options.push_back({ "server",      "       --kv-transport MODE",    "KV handoff transport mode: auto|rdma|tcp|mixed|disabled (default: disabled)" });
+    options.push_back({ "server",      "       --kv-transport-fallback","when kv-transport is rdma/tcp, allow fallback to the other mode if unavailable (default: disabled)" });
+    options.push_back({ "server",      "       --kv-recv-host HOST",    "KV receiver bind host override (default: resolved from transport mode)" });
+    options.push_back({ "server",      "       --kv-recv-port PORT",    "KV receiver bind port override (default: resolved from transport mode)" });
+    options.push_back({ "server",      "       --kv-recv-slot ID",      "slot ID to restore into for received KV artifacts (default: 0)" });
+    options.push_back({ "server",      "       --kv-recv-output-dir PATH","directory for received KV chunks/artifacts (default: slot-save-path or /tmp/ik_kv_handoff)" });
+    options.push_back({ "server",      "       --kv-recv-no-ack",       "disable ACK frames for incoming KV chunks (default: ACK enabled)" });
+    options.push_back({ "server",      "       --kv-recv-no-nack-on-crc-bad","do not send NACK when chunk payload CRC check fails (default: enabled)" });
+    options.push_back({ "server",      "       --kv-recv-max-connections N","maximum concurrent KV receiver connections (default: 32)" });
+    options.push_back({ "server",      "       --kv-recv-idle-timeout N","idle timeout in seconds for KV receiver connection loop (default: 30)" });
+    options.push_back({ "server",      "       --kv-recv-socket-send-buf N","socket SO_SNDBUF for KV receiver (0 = system default)" });
+    options.push_back({ "server",      "       --kv-recv-socket-recv-buf N","socket SO_RCVBUF for KV receiver (0 = system default)" });
     options.push_back({ "server",      "       --chat-template JINJA_TEMPLATE",
                                                                         "set custom jinja chat template (default: template taken from model's metadata)\n"
                                                                         "only commonly used templates are accepted:\n"

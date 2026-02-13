@@ -357,6 +357,21 @@ struct gpt_params {
     std::string sql_save_file;
     std::string sqlite_zstd_ext_file;
 
+    // KV handoff receiver (prefill -> decode bridge)
+    bool kv_receiver_enable = false;
+    std::string kv_transport = "disabled"; // auto|rdma|tcp|mixed|disabled
+    bool kv_transport_fallback = false;
+    std::string kv_receiver_host = "";
+    int32_t kv_receiver_port = -1;
+    int32_t kv_receiver_slot_id = 0;
+    std::string kv_receiver_output_dir = "";
+    bool kv_receiver_ack = true;
+    bool kv_receiver_nack_on_crc_bad = true;
+    int32_t kv_receiver_max_connections = 32;
+    int32_t kv_receiver_idle_timeout_sec = 30;
+    int32_t kv_receiver_socket_send_buf = 0;
+    int32_t kv_receiver_socket_recv_buf = 0;
+
     float slot_prompt_similarity = 0.1f;
     int32_t cache_ram_mib = 8192;   // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     int32_t cache_ram_n_min = 0;     // min number of tokens required to save in the ram
