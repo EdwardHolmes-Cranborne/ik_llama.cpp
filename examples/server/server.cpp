@@ -603,6 +603,7 @@ int main(int argc, char ** argv) {
             {"bind_host", kv_runtime.bind_host},
             {"bind_port", kv_runtime.bind_port},
             {"output_dir", kv_runtime.output_dir},
+            {"dry_run", kv_cfg.dry_run},
         });
     }
 
@@ -770,6 +771,55 @@ int main(int argc, char ** argv) {
                     res_err(res, format_error_response("Model failed to load", ERROR_TYPE_SERVER));
                 } break;
         }
+    };
+
+    const auto handle_kv_receiver_status = [&](const httplib::Request &, httplib::Response & res) {
+        const kv_receiver_stats s = kv_receiver.stats();
+
+        json sessions = json::array();
+        for (const auto & ss : s.sessions) {
+            sessions.push_back({
+                {"session_id", ss.session_id},
+                {"bytes_received", ss.bytes_received},
+                {"chunks_received", ss.chunks_received},
+                {"bad_crc_chunks", ss.bad_crc_chunks},
+                {"expected_streams", ss.expected_streams},
+                {"seen_streams", ss.seen_streams},
+                {"done_streams", ss.done_streams},
+                {"finalized", ss.finalized},
+                {"validation_ok", ss.validation_ok},
+                {"restore_enqueued", ss.restore_enqueued},
+                {"artifact_path", ss.artifact_path},
+                {"validation_error", ss.validation_error},
+                {"last_error", ss.last_error},
+                {"first_frame_unix_us", ss.first_frame_unix_us},
+                {"last_frame_unix_us", ss.last_frame_unix_us},
+            });
+        }
+
+        const json payload = {
+            {"running", s.running},
+            {"resolved_transport_mode", s.resolved_transport_mode},
+            {"bind_host", s.bind_host},
+            {"bind_port", s.bind_port},
+            {"dry_run", s.dry_run},
+            {"counters", {
+                {"connections_accepted", s.connections_accepted},
+                {"connections_rejected", s.connections_rejected},
+                {"frames_total", s.frames_total},
+                {"frames_bad", s.frames_bad},
+                {"ack_sent", s.ack_sent},
+                {"nack_sent", s.nack_sent},
+                {"artifacts_reassembled", s.artifacts_reassembled},
+                {"artifacts_validated", s.artifacts_validated},
+                {"restore_tasks_enqueued", s.restore_tasks_enqueued},
+                {"restore_tasks_skipped_dry_run", s.restore_tasks_skipped_dry_run},
+            }},
+            {"sessions", sessions},
+        };
+
+        res.set_content(payload.dump(), "application/json");
+        res.status = 200;
     };
 
     const auto handle_slots = [&](const httplib::Request &, httplib::Response & res) {
@@ -2021,6 +2071,7 @@ int main(int argc, char ** argv) {
     }
     // register API routes
     svr->Get ("/health",              handle_health);
+    svr->Get ("/kv-receiver/status",  handle_kv_receiver_status);
     svr->Get ("/metrics",             handle_metrics);
     svr->Get ("/props",               handle_props);
     svr->Get("/v1/props",             handle_props_simple);
@@ -2090,9 +2141,11 @@ int main(int argc, char ** argv) {
     log_data["n_threads_http"] =  std::to_string(params.n_threads_http);
     {
         const kv_receiver_runtime kv_runtime = kv_receiver.runtime();
+        const kv_receiver_stats kv_stats = kv_receiver.stats();
         log_data["kv_receiver_enabled"] = kv_runtime.enabled ? "true" : "false";
         log_data["kv_receiver_running"] = kv_runtime.running ? "true" : "false";
         log_data["kv_receiver_mode"] = kv_runtime.resolved_transport_mode;
+        log_data["kv_receiver_dry_run"] = kv_stats.dry_run ? "true" : "false";
         if (kv_runtime.running) {
             log_data["kv_receiver_host"] = kv_runtime.bind_host;
             log_data["kv_receiver_port"] = std::to_string(kv_runtime.bind_port);

@@ -5,6 +5,7 @@
 
 #include <memory>
 #include <string>
+#include <vector>
 
 struct kv_receiver_config {
     bool enabled = false;
@@ -16,6 +17,7 @@ struct kv_receiver_config {
 
     int32_t slot_id = 0;
     std::string output_dir;
+    bool dry_run = false;
 
     bool ack_enabled = true;
     bool nack_on_crc_bad = true;
@@ -39,6 +41,45 @@ struct kv_receiver_runtime {
     std::string output_dir;
 };
 
+struct kv_receiver_session_stats {
+    uint64_t session_id = 0;
+    uint64_t bytes_received = 0;
+    uint64_t chunks_received = 0;
+    uint64_t bad_crc_chunks = 0;
+    int32_t expected_streams = 0;
+    int32_t seen_streams = 0;
+    int32_t done_streams = 0;
+    bool finalized = false;
+    bool validation_ok = false;
+    bool restore_enqueued = false;
+    std::string artifact_path;
+    std::string validation_error;
+    std::string last_error;
+    uint64_t first_frame_unix_us = 0;
+    uint64_t last_frame_unix_us = 0;
+};
+
+struct kv_receiver_stats {
+    bool running = false;
+    std::string resolved_transport_mode;
+    std::string bind_host;
+    int32_t bind_port = -1;
+    bool dry_run = false;
+
+    uint64_t connections_accepted = 0;
+    uint64_t connections_rejected = 0;
+    uint64_t frames_total = 0;
+    uint64_t frames_bad = 0;
+    uint64_t ack_sent = 0;
+    uint64_t nack_sent = 0;
+    uint64_t artifacts_reassembled = 0;
+    uint64_t artifacts_validated = 0;
+    uint64_t restore_tasks_enqueued = 0;
+    uint64_t restore_tasks_skipped_dry_run = 0;
+
+    std::vector<kv_receiver_session_stats> sessions;
+};
+
 // Resolve and normalize runtime KV receiver config from gpt_params.
 kv_receiver_config kv_receiver_config_from_params(const gpt_params & params);
 
@@ -54,6 +95,7 @@ public:
     void stop();
 
     kv_receiver_runtime runtime() const;
+    kv_receiver_stats stats() const;
 
 private:
     struct impl;

@@ -494,6 +494,7 @@ void gpt_params_parse_from_env(gpt_params & params) {
     get_env("LLAMA_ARG_KV_RECV_PORT",             params.kv_receiver_port);
     get_env("LLAMA_ARG_KV_RECV_SLOT",             params.kv_receiver_slot_id);
     get_env("LLAMA_ARG_KV_RECV_OUTPUT_DIR",       params.kv_receiver_output_dir);
+    get_env("LLAMA_ARG_KV_RECV_DRY_RUN",          params.kv_receiver_dry_run);
     get_env("LLAMA_ARG_KV_RECV_ACK",              params.kv_receiver_ack);
     get_env("LLAMA_ARG_KV_RECV_NACK_ON_CRC_BAD",  params.kv_receiver_nack_on_crc_bad);
     get_env("LLAMA_ARG_KV_RECV_MAX_CONNECTIONS",  params.kv_receiver_max_connections);
@@ -1880,6 +1881,10 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.kv_receiver_output_dir = argv[i];
         return true;
     }
+    if (arg == "--kv-recv-dry-run") {
+        params.kv_receiver_dry_run = true;
+        return true;
+    }
     if (arg == "--kv-recv-no-ack") {
         params.kv_receiver_ack = false;
         return true;
@@ -2558,6 +2563,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "server",      "       --kv-recv-port PORT",    "KV receiver bind port override (default: resolved from transport mode)" });
     options.push_back({ "server",      "       --kv-recv-slot ID",      "slot ID to restore into for received KV artifacts (default: 0)" });
     options.push_back({ "server",      "       --kv-recv-output-dir PATH","directory for received KV chunks/artifacts (default: slot-save-path or /tmp/ik_kv_handoff)" });
+    options.push_back({ "server",      "       --kv-recv-dry-run",      "reassemble/validate incoming KV artifacts but do not enqueue slot restore (default: disabled)" });
     options.push_back({ "server",      "       --kv-recv-no-ack",       "disable ACK frames for incoming KV chunks (default: ACK enabled)" });
     options.push_back({ "server",      "       --kv-recv-no-nack-on-crc-bad","do not send NACK when chunk payload CRC check fails (default: enabled)" });
     options.push_back({ "server",      "       --kv-recv-max-connections N","maximum concurrent KV receiver connections (default: 32)" });

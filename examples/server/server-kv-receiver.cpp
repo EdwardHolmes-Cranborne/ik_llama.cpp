@@ -1,8 +1,10 @@
 #include "server-kv-receiver.h"
 
 #include "server-task.h"
+#include "src/kv-bridge/ik-kv-compat.h"
 
 #include "log.h"
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <array>
@@ -38,6 +40,7 @@
 #endif
 
 namespace fs = std::filesystem;
+using json = nlohmann::ordered_json;
 
 #define KVR_INF(fmt, ...) LOG_INF("kvr  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define KVR_WRN(fmt, ...) LOG_WRN("kvr  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -87,9 +90,21 @@ struct session_state {
     uint64_t bytes_received = 0;
     uint64_t chunks_received = 0;
     uint64_t bad_crc_chunks = 0;
+    uint64_t first_frame_unix_us = 0;
+    uint64_t last_frame_unix_us = 0;
 
     bool finalized = false;
+    bool validation_ok = false;
+    bool restore_enqueued = false;
+    std::string validation_error;
+    std::string last_error;
 };
+
+uint64_t unix_now_us() {
+    using namespace std::chrono;
+    return (uint64_t) duration_cast<microseconds>(
+        system_clock::now().time_since_epoch()).count();
+}
 
 std::string env_string(const char * name, const std::string & fallback = "") {
     const char * v = std::getenv(name);
@@ -615,6 +630,16 @@ struct kv_receiver_service::impl {
 
     mutable std::mutex runtime_mutex;
     kv_receiver_runtime runtime_state = {};
+    std::atomic<uint64_t> stat_connections_accepted{0};
+    std::atomic<uint64_t> stat_connections_rejected{0};
+    std::atomic<uint64_t> stat_frames_total{0};
+    std::atomic<uint64_t> stat_frames_bad{0};
+    std::atomic<uint64_t> stat_ack_sent{0};
+    std::atomic<uint64_t> stat_nack_sent{0};
+    std::atomic<uint64_t> stat_artifacts_reassembled{0};
+    std::atomic<uint64_t> stat_artifacts_validated{0};
+    std::atomic<uint64_t> stat_restore_tasks_enqueued{0};
+    std::atomic<uint64_t> stat_restore_tasks_skipped_dry_run{0};
 
     std::atomic<bool> stop_requested{false};
 
@@ -633,7 +658,7 @@ struct kv_receiver_service::impl {
     std::mutex conn_mutex;
     std::set<int> active_connections;
 
-    std::mutex sessions_mutex;
+    mutable std::mutex sessions_mutex;
     std::unordered_map<uint64_t, std::shared_ptr<session_state>> sessions;
 #endif
 
@@ -682,6 +707,20 @@ struct kv_receiver_service::impl {
         config.max_connections = std::max<int32_t>(1, config.max_connections);
         config.idle_timeout_sec = std::max<int32_t>(1, config.idle_timeout_sec);
         config.output_dir = default_output_dir(config);
+        stat_connections_accepted.store(0);
+        stat_connections_rejected.store(0);
+        stat_frames_total.store(0);
+        stat_frames_bad.store(0);
+        stat_ack_sent.store(0);
+        stat_nack_sent.store(0);
+        stat_artifacts_reassembled.store(0);
+        stat_artifacts_validated.store(0);
+        stat_restore_tasks_enqueued.store(0);
+        stat_restore_tasks_skipped_dry_run.store(0);
+        {
+            std::lock_guard<std::mutex> lock(sessions_mutex);
+            sessions.clear();
+        }
 
         std::error_code ec;
         fs::create_directories(config.output_dir, ec);
@@ -736,11 +775,12 @@ struct kv_receiver_service::impl {
         stop_requested.store(false);
         accept_thread = std::thread([this]() { accept_loop(); });
 
-        KVR_INF("KV receiver started mode=%s host=%s port=%d output=%s\n",
+        KVR_INF("KV receiver started mode=%s host=%s port=%d output=%s dry_run=%s\n",
                 runtime_state.resolved_transport_mode.c_str(),
                 runtime_state.bind_host.c_str(),
                 runtime_state.bind_port,
-                runtime_state.output_dir.c_str());
+                runtime_state.output_dir.c_str(),
+                config.dry_run ? "true" : "false");
 
         return true;
 #endif
@@ -788,6 +828,59 @@ struct kv_receiver_service::impl {
     kv_receiver_runtime runtime() const {
         std::lock_guard<std::mutex> lock(runtime_mutex);
         return runtime_state;
+    }
+
+    kv_receiver_stats stats() const {
+        kv_receiver_stats out = {};
+        {
+            std::lock_guard<std::mutex> lock(runtime_mutex);
+            out.running = runtime_state.running;
+            out.resolved_transport_mode = runtime_state.resolved_transport_mode;
+            out.bind_host = runtime_state.bind_host;
+            out.bind_port = runtime_state.bind_port;
+            out.dry_run = config.dry_run;
+        }
+
+        out.connections_accepted = stat_connections_accepted.load();
+        out.connections_rejected = stat_connections_rejected.load();
+        out.frames_total = stat_frames_total.load();
+        out.frames_bad = stat_frames_bad.load();
+        out.ack_sent = stat_ack_sent.load();
+        out.nack_sent = stat_nack_sent.load();
+        out.artifacts_reassembled = stat_artifacts_reassembled.load();
+        out.artifacts_validated = stat_artifacts_validated.load();
+        out.restore_tasks_enqueued = stat_restore_tasks_enqueued.load();
+        out.restore_tasks_skipped_dry_run = stat_restore_tasks_skipped_dry_run.load();
+
+#ifndef _WIN32
+        std::lock_guard<std::mutex> lock(sessions_mutex);
+        out.sessions.reserve(sessions.size());
+        for (const auto & kv : sessions) {
+            const std::shared_ptr<session_state> & s = kv.second;
+            kv_receiver_session_stats ss = {};
+            std::lock_guard<std::mutex> s_lock(s->mutex);
+            ss.session_id = s->session_id;
+            ss.bytes_received = s->bytes_received;
+            ss.chunks_received = s->chunks_received;
+            ss.bad_crc_chunks = s->bad_crc_chunks;
+            ss.expected_streams = s->expected_streams;
+            ss.seen_streams = (int32_t) s->seen_stream_ids.size();
+            ss.done_streams = (int32_t) s->done_stream_ids.size();
+            ss.finalized = s->finalized;
+            ss.validation_ok = s->validation_ok;
+            ss.restore_enqueued = s->restore_enqueued;
+            ss.artifact_path = s->artifact_path.string();
+            ss.validation_error = s->validation_error;
+            ss.last_error = s->last_error;
+            ss.first_frame_unix_us = s->first_frame_unix_us;
+            ss.last_frame_unix_us = s->last_frame_unix_us;
+            out.sessions.push_back(std::move(ss));
+        }
+        std::sort(out.sessions.begin(), out.sessions.end(), [](const auto & a, const auto & b) {
+            return a.session_id < b.session_id;
+        });
+#endif
+        return out;
     }
 
 #ifndef _WIN32
@@ -890,10 +983,12 @@ struct kv_receiver_service::impl {
                 }
 
                 if (!accepted) {
+                    stat_connections_rejected.fetch_add(1);
                     KVR_WRN("dropping connection: max connections reached (%d)\n", config.max_connections);
                     close_fd(fd);
                     continue;
                 }
+                stat_connections_accepted.fetch_add(1);
 
                 configure_accepted_socket(fd, config);
 
@@ -931,6 +1026,136 @@ struct kv_receiver_service::impl {
 
         sessions[session_id] = session;
         return session;
+    }
+
+    void mark_session_error(const std::shared_ptr<session_state> & session, const std::string & message) {
+        std::lock_guard<std::mutex> lock(session->mutex);
+        session->last_error = message;
+    }
+
+    bool read_file_bytes(const fs::path & path, std::vector<uint8_t> * out, std::string * error) {
+        std::ifstream ifs(path, std::ios::binary);
+        if (!ifs.is_open()) {
+            if (error) {
+                *error = "failed to open file: " + path.string();
+            }
+            return false;
+        }
+        ifs.seekg(0, std::ios::end);
+        const std::streampos end_pos = ifs.tellg();
+        if (end_pos < 0) {
+            if (error) {
+                *error = "failed to get file size: " + path.string();
+            }
+            return false;
+        }
+        ifs.seekg(0, std::ios::beg);
+        out->resize((size_t) end_pos);
+        if (!out->empty()) {
+            ifs.read(reinterpret_cast<char *>(out->data()), (std::streamsize) out->size());
+            if (!ifs.good()) {
+                if (error) {
+                    *error = "failed to read file bytes: " + path.string();
+                }
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool validate_artifact(const std::shared_ptr<session_state> & session, std::string * error) {
+        std::vector<uint8_t> bytes;
+        std::string read_err;
+        if (!read_file_bytes(session->artifact_path, &bytes, &read_err)) {
+            if (error) {
+                *error = read_err;
+            }
+            return false;
+        }
+
+        ik_kva_header_t header = {};
+        ik_kv_compat_reject_reason_t reject = IK_KV_COMPAT_REJECT_NONE;
+        const ik_kv_compat_convert_result_t rc = ik_kv_source_parse_kva_header(
+            bytes.data(), bytes.size(), &header, &reject);
+        if (rc != IK_KV_COMPAT_CONVERT_OK) {
+            if (error) {
+                *error = "header validation failed: rc=" + std::string(ik_kv_compat_result_str(rc)) +
+                         ", reject=" + std::string(ik_kv_compat_reject_str(reject));
+            }
+            return false;
+        }
+
+        if (header.payload_size > bytes.size()) {
+            if (error) {
+                *error = "artifact payload_size exceeds file size";
+            }
+            return false;
+        }
+        const size_t payload_offset = bytes.size() - (size_t) header.payload_size;
+        if (payload_offset > bytes.size()) {
+            if (error) {
+                *error = "invalid payload offset";
+            }
+            return false;
+        }
+        const uint8_t * payload_ptr = bytes.data() + payload_offset;
+        const size_t payload_size = (size_t) header.payload_size;
+        if (!ik_kv_source_validate_payload(&header, payload_ptr, payload_size)) {
+            if (error) {
+                *error = "payload CRC/size validation failed";
+            }
+            return false;
+        }
+
+        return true;
+    }
+
+    void write_session_summary(const std::shared_ptr<session_state> & session) {
+        kv_receiver_session_stats ss = {};
+        {
+            std::lock_guard<std::mutex> lock(session->mutex);
+            ss.session_id = session->session_id;
+            ss.bytes_received = session->bytes_received;
+            ss.chunks_received = session->chunks_received;
+            ss.bad_crc_chunks = session->bad_crc_chunks;
+            ss.expected_streams = session->expected_streams;
+            ss.seen_streams = (int32_t) session->seen_stream_ids.size();
+            ss.done_streams = (int32_t) session->done_stream_ids.size();
+            ss.finalized = session->finalized;
+            ss.validation_ok = session->validation_ok;
+            ss.restore_enqueued = session->restore_enqueued;
+            ss.artifact_path = session->artifact_path.string();
+            ss.validation_error = session->validation_error;
+            ss.last_error = session->last_error;
+            ss.first_frame_unix_us = session->first_frame_unix_us;
+            ss.last_frame_unix_us = session->last_frame_unix_us;
+        }
+
+        const fs::path summary_path = session->session_dir / "session_summary.json";
+        std::ofstream ofs(summary_path, std::ios::trunc);
+        if (!ofs.is_open()) {
+            KVR_WRN("failed to open session summary for write sid=%" PRIu64 " path=%s\n",
+                    session->session_id, summary_path.c_str());
+            return;
+        }
+        const json out = {
+            {"session_id", ss.session_id},
+            {"bytes_received", ss.bytes_received},
+            {"chunks_received", ss.chunks_received},
+            {"bad_crc_chunks", ss.bad_crc_chunks},
+            {"expected_streams", ss.expected_streams},
+            {"seen_streams", ss.seen_streams},
+            {"done_streams", ss.done_streams},
+            {"finalized", ss.finalized},
+            {"validation_ok", ss.validation_ok},
+            {"restore_enqueued", ss.restore_enqueued},
+            {"artifact_path", ss.artifact_path},
+            {"validation_error", ss.validation_error},
+            {"last_error", ss.last_error},
+            {"first_frame_unix_us", ss.first_frame_unix_us},
+            {"last_frame_unix_us", ss.last_frame_unix_us},
+        };
+        ofs << out.dump(2) << "\n";
     }
 
     bool persist_chunk(const std::shared_ptr<session_state> & session, uint64_t seq_no, const std::vector<uint8_t> & payload, std::string * error) {
@@ -1060,6 +1285,11 @@ struct kv_receiver_service::impl {
         };
 
         const int id_task = queue_tasks.post(std::move(task));
+        stat_restore_tasks_enqueued.fetch_add(1);
+        {
+            std::lock_guard<std::mutex> lock(session->mutex);
+            session->restore_enqueued = true;
+        }
         KVR_INF("queued slot restore sid=%" PRIu64 " slot=%d task_id=%d\n",
                 session->session_id, config.slot_id, id_task);
     }
@@ -1090,18 +1320,52 @@ struct kv_receiver_service::impl {
 
         std::string err;
         if (!reassemble_session_artifact(session, &err)) {
+            mark_session_error(session, err);
+            write_session_summary(session);
             KVR_WRN("session finalize failed sid=%" PRIu64 " err=%s\n", session->session_id, err.c_str());
+            return;
+        }
+        stat_artifacts_reassembled.fetch_add(1);
+
+        std::string validation_err;
+        const bool validation_ok = validate_artifact(session, &validation_err);
+        {
+            std::lock_guard<std::mutex> lock(session->mutex);
+            session->validation_ok = validation_ok;
+            session->validation_error = validation_ok ? "" : validation_err;
+        }
+        if (!validation_ok) {
+            mark_session_error(session, validation_err);
+            write_session_summary(session);
+            KVR_WRN("artifact validation failed sid=%" PRIu64 " err=%s\n", session->session_id, validation_err.c_str());
+            return;
+        }
+        stat_artifacts_validated.fetch_add(1);
+
+        if (config.dry_run) {
+            stat_restore_tasks_skipped_dry_run.fetch_add(1);
+            KVR_INF("dry-run mode: skipping slot restore sid=%" PRIu64 " artifact=%s\n",
+                    session->session_id, session->artifact_path.c_str());
+            write_session_summary(session);
             return;
         }
 
         enqueue_slot_restore(session);
+        write_session_summary(session);
     }
 
     void process_frame(int fd, const tbp_frame & frame) {
+        (void) fd;
+        stat_frames_total.fetch_add(1);
         std::shared_ptr<session_state> session = get_or_create_session(frame.session_id);
 
         {
             std::lock_guard<std::mutex> lock(session->mutex);
+            const uint64_t now_us = unix_now_us();
+            if (session->first_frame_unix_us == 0) {
+                session->first_frame_unix_us = now_us;
+            }
+            session->last_frame_unix_us = now_us;
             if (frame.stream_id > 0) {
                 session->seen_stream_ids.insert(frame.stream_id);
             }
@@ -1143,6 +1407,7 @@ struct kv_receiver_service::impl {
                 if (crc_ok) {
                     std::string write_err;
                     if (!persist_chunk(session, frame.seq_no, frame.payload, &write_err)) {
+                        mark_session_error(session, write_err);
                         KVR_WRN("persist chunk failed sid=%" PRIu64 " seq=%" PRIu64 " err=%s\n",
                                 frame.session_id, frame.seq_no, write_err.c_str());
                     }
@@ -1160,8 +1425,15 @@ struct kv_receiver_service::impl {
                                         reinterpret_cast<const uint8_t *>(ack_payload.data()),
                                         ack_payload.size(),
                                         &ack_err)) {
+                        mark_session_error(session, ack_err);
                         KVR_WRN("failed sending ACK sid=%" PRIu64 " stream=%" PRIu64 " seq=%" PRIu64 " err=%s\n",
                                 frame.session_id, frame.stream_id, frame.seq_no, ack_err.c_str());
+                    } else {
+                        if (ack_payload == "ack=1") {
+                            stat_ack_sent.fetch_add(1);
+                        } else {
+                            stat_nack_sent.fetch_add(1);
+                        }
                     }
                 }
             } break;
@@ -1192,6 +1464,7 @@ struct kv_receiver_service::impl {
             const int timeout_ms = std::max<int32_t>(1, config.idle_timeout_sec) * 1000;
             if (!recv_tbp_frame(fd, timeout_ms, stop_requested, &frame, &recv_err)) {
                 if (!stop_requested.load() && recv_err != "peer closed connection" && recv_err != "receiver stopping") {
+                    stat_frames_bad.fetch_add(1);
                     KVR_DBG("connection frame receive stopped fd=%d err=%s\n", fd, recv_err.c_str());
                 }
                 break;
@@ -1217,6 +1490,7 @@ kv_receiver_config kv_receiver_config_from_params(const gpt_params & params) {
 
     cfg.slot_id = params.kv_receiver_slot_id;
     cfg.output_dir = params.kv_receiver_output_dir;
+    cfg.dry_run = params.kv_receiver_dry_run;
 
     cfg.ack_enabled = params.kv_receiver_ack;
     cfg.nack_on_crc_bad = params.kv_receiver_nack_on_crc_bad;
@@ -1258,4 +1532,8 @@ void kv_receiver_service::stop() {
 
 kv_receiver_runtime kv_receiver_service::runtime() const {
     return pimpl->runtime();
+}
+
+kv_receiver_stats kv_receiver_service::stats() const {
+    return pimpl->stats();
 }

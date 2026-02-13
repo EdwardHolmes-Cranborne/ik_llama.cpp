@@ -365,6 +365,7 @@ struct gpt_params {
     int32_t kv_receiver_port = -1;
     int32_t kv_receiver_slot_id = 0;
     std::string kv_receiver_output_dir = "";
+    bool kv_receiver_dry_run = false;
     bool kv_receiver_ack = true;
     bool kv_receiver_nack_on_crc_bad = true;
     int32_t kv_receiver_max_connections = 32;
