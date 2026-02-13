@@ -47,6 +47,7 @@ struct kv_receiver_session_stats {
     uint64_t chunks_received = 0;
     uint64_t bad_crc_chunks = 0;
     uint64_t expected_chunks = 0;
+    uint64_t expected_payload_bytes = 0;
     int32_t expected_streams = 0;
     int32_t seen_streams = 0;
     int32_t done_streams = 0;

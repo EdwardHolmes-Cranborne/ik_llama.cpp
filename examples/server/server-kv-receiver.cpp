@@ -91,6 +91,7 @@ struct session_state {
     uint64_t chunks_received = 0;
     uint64_t bad_crc_chunks = 0;
     uint64_t expected_chunks = 0;
+    uint64_t expected_payload_bytes = 0;
     uint64_t first_frame_unix_us = 0;
     uint64_t last_frame_unix_us = 0;
 
@@ -865,6 +866,7 @@ struct kv_receiver_service::impl {
             ss.chunks_received = s->chunks_received;
             ss.bad_crc_chunks = s->bad_crc_chunks;
             ss.expected_chunks = s->expected_chunks;
+            ss.expected_payload_bytes = s->expected_payload_bytes;
             ss.expected_streams = s->expected_streams;
             ss.seen_streams = (int32_t) s->seen_stream_ids.size();
             ss.done_streams = (int32_t) s->done_stream_ids.size();
@@ -1146,6 +1148,7 @@ struct kv_receiver_service::impl {
             ss.chunks_received = session->chunks_received;
             ss.bad_crc_chunks = session->bad_crc_chunks;
             ss.expected_chunks = session->expected_chunks;
+            ss.expected_payload_bytes = session->expected_payload_bytes;
             ss.expected_streams = session->expected_streams;
             ss.seen_streams = (int32_t) session->seen_stream_ids.size();
             ss.done_streams = (int32_t) session->done_stream_ids.size();
@@ -1172,6 +1175,7 @@ struct kv_receiver_service::impl {
             {"chunks_received", ss.chunks_received},
             {"bad_crc_chunks", ss.bad_crc_chunks},
             {"expected_chunks", ss.expected_chunks},
+            {"expected_payload_bytes", ss.expected_payload_bytes},
             {"expected_streams", ss.expected_streams},
             {"seen_streams", ss.seen_streams},
             {"done_streams", ss.done_streams},
@@ -1247,12 +1251,16 @@ struct kv_receiver_service::impl {
             }
             return false;
         }
+        uint64_t expected_chunks = 0;
+        uint64_t expected_payload_bytes = 0;
         {
             std::lock_guard<std::mutex> lock(session->mutex);
-            if (session->expected_chunks > 0 && chunk_files.size() < session->expected_chunks) {
+            expected_chunks = session->expected_chunks;
+            expected_payload_bytes = session->expected_payload_bytes;
+            if (expected_chunks > 0 && chunk_files.size() < expected_chunks) {
                 if (error) {
                     *error = "incomplete chunk set: got " + std::to_string(chunk_files.size()) +
-                             " expected " + std::to_string(session->expected_chunks);
+                             " expected " + std::to_string(expected_chunks);
                 }
                 return false;
             }
@@ -1295,6 +1303,14 @@ struct kv_receiver_service::impl {
         if (!out.good()) {
             if (error) {
                 *error = "failed finalizing reassembled artifact";
+            }
+            return false;
+        }
+
+        if (expected_payload_bytes > 0 && written != expected_payload_bytes) {
+            if (error) {
+                *error = "reassembled artifact byte mismatch: got " + std::to_string(written) +
+                         " expected " + std::to_string(expected_payload_bytes);
             }
             return false;
         }
@@ -1425,9 +1441,30 @@ struct kv_receiver_service::impl {
                     } catch (...) {
                     }
                 }
+
+                auto bytes_it = kv.find("bytes");
+                if (bytes_it != kv.end()) {
+                    try {
+                        const uint64_t expected_bytes = (uint64_t) std::stoull(bytes_it->second);
+                        std::lock_guard<std::mutex> lock(session->mutex);
+                        session->expected_payload_bytes = std::max(session->expected_payload_bytes, expected_bytes);
+                    } catch (...) {
+                    }
+                }
             } break;
             case TBP_MSG_KV_SEGMENT_BEGIN:
-                break;
+            {
+                const auto kv = parse_sc_kv(frame.payload);
+                auto payload_it = kv.find("payload_bytes");
+                if (payload_it != kv.end()) {
+                    try {
+                        const uint64_t expected_bytes = (uint64_t) std::stoull(payload_it->second);
+                        std::lock_guard<std::mutex> lock(session->mutex);
+                        session->expected_payload_bytes = std::max(session->expected_payload_bytes, expected_bytes);
+                    } catch (...) {
+                    }
+                }
+            } break;
             case TBP_MSG_KV_CHUNK:
             {
                 const uint32_t calc_crc = frame.payload.empty() ? 0u : crc32_u32(frame.payload.data(), frame.payload.size());
