@@ -507,6 +507,14 @@ struct llama_context_params {
   void *abort_callback_data;
   void *offload_policy;
   void *cuda_params;
+
+  // RTX Accelerated Prefill Streaming
+  bool prefill_streaming;    // enable 2-buffer GPU rotation streaming prefill
+  bool prefill_telemetry;    // emit per-layer timing telemetry
+  bool prefill_overlap;      // overlap upload and compute (Phase 2)
+  int32_t prefill_buffers;   // number of GPU rotation buffers (default: 2)
+  int32_t prefill_prefetch;  // layer lookahead distance
+  size_t prefill_slab_bytes; // upload chunk size in bytes
 };
 
 // model quantization parameters

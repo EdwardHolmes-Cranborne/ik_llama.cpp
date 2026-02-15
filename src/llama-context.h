@@ -231,6 +231,11 @@ struct llama_context {
 
   // === RTX Accelerated Prefill Streaming State ===
   bool prefill_streaming = false;
+  bool prefill_telemetry = true;
+  bool prefill_overlap = false;
+  int prefill_buffers = 2;
+  int prefill_prefetch = 1;
+  size_t prefill_slab_bytes = 16 * 1024 * 1024;
 
   // Per-layer callbacks for streaming prefill weight upload
   std::function<void(int, int)> pre_layer_cb;
