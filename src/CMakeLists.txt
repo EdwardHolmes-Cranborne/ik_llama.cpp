@@ -63,6 +63,17 @@ add_library(llama
             kv-bridge/ik-kv-compat-types.cpp
             kv-bridge/ik-kv-compat.h
             kv-bridge/ik-kv-compat.cpp
+            # RTX Accelerated Prefill Streaming module
+            llama-kv-artifact.h
+            llama-kv-artifact.cpp
+            llama-tb-transport.h
+            llama-tb-transport.cpp
+            llama-prefill-telemetry.h
+            llama-prefill-telemetry.cpp
+            llama-decode-handoff.h
+            llama-decode-handoff.cpp
+            llama-prefill-stream.h
+            llama-prefill-stream.cpp
             )
 
 target_include_directories(llama PUBLIC . ../include)
