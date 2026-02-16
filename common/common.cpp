@@ -522,6 +522,35 @@ void gpt_params_parse_from_env(gpt_params &params) {
           params.kv_receiver_socket_send_buf);
   get_env("LLAMA_ARG_KV_RECV_SOCKET_RECV_BUF",
           params.kv_receiver_socket_recv_buf);
+  get_env("LLAMA_ARG_PREFILL_DECODE_MODE", params.prefill_decode_mode);
+  get_env("LLAMA_ARG_PREFILL_TRANSPORT_MODE", params.prefill_transport_mode);
+  get_env("LLAMA_ARG_PREFILL_EXECUTION_MODE", params.prefill_execution_mode);
+  get_env("LLAMA_ARG_DECODE_GPU_LAYERS_HINT", params.decode_gpu_layers_hint);
+  get_env("LLAMA_ARG_DECODE_REMOTE_LAYERS_HINT",
+          params.decode_remote_layers_hint);
+  get_env("LLAMA_ARG_DECODE_REMOTE_NODES_HINT", params.decode_remote_nodes_hint);
+  get_env("LLAMA_ARG_DECODE_REMOTE_RANGES", params.decode_remote_ranges);
+  get_env("LLAMA_ARG_DECODE_REMOTE_FAILOVER_POLICY",
+          params.decode_remote_failover_policy);
+  get_env("LLAMA_ARG_PREFILL_TRANSPORT_CHUNK_BYTES",
+          params.prefill_transport_chunk_bytes);
+  get_env("LLAMA_ARG_PREFILL_DECODE_TRANSPORT_REQUIRED",
+          params.prefill_decode_transport_required);
+  get_env("LLAMA_ARG_PREFILL_TRANSPORT_SESSION_DIR",
+          params.prefill_transport_session_dir);
+  get_env("LLAMA_ARG_PREFILL_MIN_STREAM_BATCH_TOKENS",
+          params.prefill_min_stream_batch_tokens);
+  get_env("LLAMA_ARG_KV_HOST", params.kv_host);
+  get_env("LLAMA_ARG_KV_PORT", params.kv_port);
+  get_env("LLAMA_ARG_KV_STREAMS", params.kv_streams);
+  get_env("LLAMA_ARG_KV_STREAM_CHUNK_BYTES", params.kv_stream_chunk_bytes);
+  get_env("LLAMA_ARG_KV_MAX_INFLIGHT_BYTES", params.kv_max_inflight_bytes);
+  get_env("LLAMA_ARG_KV_SOCKET_SEND_BUF", params.kv_socket_send_buf);
+  get_env("LLAMA_ARG_KV_SOCKET_RECV_BUF", params.kv_socket_recv_buf);
+  get_env("LLAMA_ARG_KV_BIND_ADDRS", params.kv_bind_addrs);
+  get_env("LLAMA_ARG_KV_PEER_ADDRS", params.kv_peer_addrs);
+  get_env("LLAMA_ARG_KV_BALANCE", params.kv_balance);
+  get_env("LLAMA_ARG_TB_DIRECT_ENDPOINT", params.tb_direct_endpoint);
   get_env("LLAMA_ARG_KV_BRIDGE_MODE", params.kv_bridge_mode);
   get_env("LLAMA_ARG_KV_BRIDGE_PLAN_CACHE_DIR",
           params.kv_bridge_plan_cache_dir);
@@ -585,6 +614,65 @@ bool parse_buft_overrides(
   }
   return true;
 }
+
+bool parse_prefill_decode_mode(const std::string & value, std::string & out_mode) {
+  const std::string mode = string_lower(value);
+  if (mode == "auto" || mode == "cpu_kv" || mode == "gpu_kv" ||
+      mode == "hybrid" || mode == "split_thunderbolt") {
+    out_mode = mode;
+    return true;
+  }
+  if (mode == "cpu") {
+    out_mode = "cpu_kv";
+    return true;
+  }
+  if (mode == "gpu") {
+    out_mode = "gpu_kv";
+    return true;
+  }
+  if (mode == "split" || mode == "split-tb" ||
+      mode == "split-thunderbolt" || mode == "tb") {
+    out_mode = "split_thunderbolt";
+    return true;
+  }
+  return false;
+}
+
+bool parse_prefill_transport_mode(const std::string & value, std::string & out_mode) {
+  const std::string mode = string_lower(value);
+  if (mode == "disabled" || mode == "bulk" || mode == "progressive") {
+    out_mode = mode;
+    return true;
+  }
+  if (mode == "off") {
+    out_mode = "disabled";
+    return true;
+  }
+  if (mode == "on") {
+    out_mode = "progressive";
+    return true;
+  }
+  return false;
+}
+
+bool parse_prefill_execution_mode(const std::string & value, std::string & out_mode) {
+  const std::string mode = string_lower(value);
+  if (mode == "coupled" || mode == "decoupled") {
+    out_mode = mode;
+    return true;
+  }
+  return false;
+}
+
+bool parse_decode_remote_failover_policy(const std::string & value, std::string & out_mode) {
+  const std::string mode = string_lower(value);
+  if (mode == "reroute" || mode == "local" || mode == "fail") {
+    out_mode = mode;
+    return true;
+  }
+  return false;
+}
+
 template <class T1, class T2>
 std::vector<std::pair<T1, T2>> string_split_pairs(const std::string &str,
                                                   char delim) {
@@ -1583,6 +1671,133 @@ bool gpt_params_find_arg(int argc, char **argv, const std::string &arg,
   if (arg == "--prefill-slab-bytes") {
     CHECK_ARG
     params.prefill_slab_bytes = std::stoull(argv[i]);
+    return true;
+  }
+  if (arg == "--prefill-min-stream-batch-tokens") {
+    CHECK_ARG
+    params.prefill_min_stream_batch_tokens = std::stoi(argv[i]);
+    return true;
+  }
+  if (arg == "--prefill-decode-mode" || arg == "--decode-mode") {
+    CHECK_ARG
+    if (!parse_prefill_decode_mode(argv[i], params.prefill_decode_mode)) {
+      invalid_param = true;
+    }
+    return true;
+  }
+  if (arg == "--prefill-transport-mode") {
+    CHECK_ARG
+    if (!parse_prefill_transport_mode(argv[i], params.prefill_transport_mode)) {
+      invalid_param = true;
+    }
+    return true;
+  }
+  if (arg == "--prefill-execution-mode") {
+    CHECK_ARG
+    if (!parse_prefill_execution_mode(argv[i], params.prefill_execution_mode)) {
+      invalid_param = true;
+    }
+    return true;
+  }
+  if (arg == "--prefill-decode-transport-required" ||
+      arg == "--decode-transport-required") {
+    params.prefill_decode_transport_required = true;
+    return true;
+  }
+  if (arg == "--prefill-transport-chunk-bytes") {
+    CHECK_ARG
+    params.prefill_transport_chunk_bytes = std::stoi(argv[i]);
+    return true;
+  }
+  if (arg == "--prefill-transport-session-dir") {
+    CHECK_ARG
+    params.prefill_transport_session_dir = argv[i];
+    return true;
+  }
+  if (arg == "--prefill-decode-gpu-layers" || arg == "--decode-gpu-layers") {
+    CHECK_ARG
+    params.decode_gpu_layers_hint = std::stoi(argv[i]);
+    return true;
+  }
+  if (arg == "--prefill-decode-remote-layers" ||
+      arg == "--decode-remote-layers") {
+    CHECK_ARG
+    params.decode_remote_layers_hint = std::stoi(argv[i]);
+    return true;
+  }
+  if (arg == "--prefill-decode-remote-nodes" || arg == "--decode-remote-nodes") {
+    CHECK_ARG
+    params.decode_remote_nodes_hint = std::stoi(argv[i]);
+    return true;
+  }
+  if (arg == "--prefill-decode-remote-ranges" ||
+      arg == "--decode-remote-ranges") {
+    CHECK_ARG
+    params.decode_remote_ranges = argv[i];
+    return true;
+  }
+  if (arg == "--prefill-decode-remote-failover" ||
+      arg == "--decode-remote-failover") {
+    CHECK_ARG
+    if (!parse_decode_remote_failover_policy(argv[i],
+                                             params.decode_remote_failover_policy)) {
+      invalid_param = true;
+    }
+    return true;
+  }
+  if (arg == "--tb-direct-endpoint") {
+    CHECK_ARG
+    params.tb_direct_endpoint = argv[i];
+    return true;
+  }
+  if (arg == "--kv-host") {
+    CHECK_ARG
+    params.kv_host = argv[i];
+    return true;
+  }
+  if (arg == "--kv-port") {
+    CHECK_ARG
+    params.kv_port = std::stoi(argv[i]);
+    return true;
+  }
+  if (arg == "--kv-streams") {
+    CHECK_ARG
+    params.kv_streams = std::stoi(argv[i]);
+    return true;
+  }
+  if (arg == "--kv-stream-chunk-bytes") {
+    CHECK_ARG
+    params.kv_stream_chunk_bytes = std::stoi(argv[i]);
+    return true;
+  }
+  if (arg == "--kv-max-inflight-bytes" || arg == "--kv-max-inflight") {
+    CHECK_ARG
+    params.kv_max_inflight_bytes = std::stoi(argv[i]);
+    return true;
+  }
+  if (arg == "--kv-socket-send-buf") {
+    CHECK_ARG
+    params.kv_socket_send_buf = std::stoi(argv[i]);
+    return true;
+  }
+  if (arg == "--kv-socket-recv-buf") {
+    CHECK_ARG
+    params.kv_socket_recv_buf = std::stoi(argv[i]);
+    return true;
+  }
+  if (arg == "--kv-bind-addrs") {
+    CHECK_ARG
+    params.kv_bind_addrs = argv[i];
+    return true;
+  }
+  if (arg == "--kv-peer-addrs") {
+    CHECK_ARG
+    params.kv_peer_addrs = argv[i];
+    return true;
+  }
+  if (arg == "--kv-balance") {
+    CHECK_ARG
+    params.kv_balance = argv[i];
     return true;
   }
   if (arg == "-smf16" || arg == "--split-mode-f16") {
@@ -2761,6 +2976,81 @@ void gpt_params_print_usage(int /*argc*/, char **argv,
        "assistant message (default: prefill enabled)\n"
        "when this flag is set, if the last message is an assistant message "
        "then it will be treated as a full message and not prefilled\n"});
+  options.push_back({"prefill"});
+  options.push_back({"prefill", "-ps,   --prefill-streaming",
+                     "enable streaming prefill path (default: %s)",
+                     params.prefill_streaming ? "enabled" : "disabled"});
+  options.push_back({"prefill", "       --no-prefill-telemetry",
+                     "disable prefill per-layer telemetry logs (default: enabled)"});
+  options.push_back({"prefill", "       --prefill-overlap",
+                     "enable overlap between upload and compute (default: disabled)"});
+  options.push_back({"prefill", "       --prefill-buffers N",
+                     "number of prefill rotation buffers (default: %d)",
+                     params.prefill_buffers});
+  options.push_back({"prefill", "       --prefill-prefetch N",
+                     "prefill layer lookahead distance (default: %d)",
+                     params.prefill_prefetch});
+  options.push_back({"prefill", "       --prefill-slab-bytes N",
+                     "prefill upload slab bytes (default: %zu)",
+                     params.prefill_slab_bytes});
+  options.push_back({"prefill", "       --prefill-min-stream-batch-tokens N",
+                     "minimum prompt batch size for streaming prefill "
+                     "(-1 = runtime crossover logic, default: %d)",
+                     params.prefill_min_stream_batch_tokens});
+  options.push_back({"prefill", "       --prefill-decode-mode MODE",
+                     "decode handoff mode: auto|cpu_kv|gpu_kv|hybrid|split_thunderbolt "
+                     "(alias: --decode-mode)"});
+  options.push_back({"prefill", "       --prefill-transport-mode MODE",
+                     "prefill transport mode: disabled|bulk|progressive "
+                     "(default: %s)",
+                     params.prefill_transport_mode.c_str()});
+  options.push_back({"prefill", "       --prefill-execution-mode MODE",
+                     "prefill execution mode: coupled|decoupled (default: %s)",
+                     params.prefill_execution_mode.c_str()});
+  options.push_back({"prefill", "       --prefill-decode-transport-required",
+                     "require network transport publish; fail if unavailable"});
+  options.push_back({"prefill", "       --prefill-transport-chunk-bytes N",
+                     "base transport chunk size used for bulk/progressive publish "
+                     "(default: %d)",
+                     params.prefill_transport_chunk_bytes});
+  options.push_back({"prefill", "       --prefill-transport-session-dir PATH",
+                     "override transport session directory for split handoff"});
+  options.push_back({"prefill", "       --prefill-decode-gpu-layers N",
+                     "decode GPU layer hint for hybrid mode (default: %d)",
+                     params.decode_gpu_layers_hint});
+  options.push_back({"prefill", "       --prefill-decode-remote-layers N",
+                     "decode remote layer hint for split mode (default: %d)",
+                     params.decode_remote_layers_hint});
+  options.push_back({"prefill", "       --prefill-decode-remote-nodes N",
+                     "decode remote node hint for split mode (default: %d)",
+                     params.decode_remote_nodes_hint});
+  options.push_back({"prefill", "       --prefill-decode-remote-ranges SPEC",
+                     "explicit remote layer map: node:start-end,node:start-end"});
+  options.push_back({"prefill", "       --prefill-decode-remote-failover POLICY",
+                     "remote failover policy: reroute|local|fail (default: %s)",
+                     params.decode_remote_failover_policy.c_str()});
+  options.push_back({"prefill", "       --kv-host HOST",
+                     "sender transport host override"});
+  options.push_back({"prefill", "       --kv-port PORT",
+                     "sender transport port override"});
+  options.push_back({"prefill", "       --kv-streams N",
+                     "sender stream count override"});
+  options.push_back({"prefill", "       --kv-stream-chunk-bytes N",
+                     "sender per-stream chunk bytes override"});
+  options.push_back({"prefill", "       --kv-max-inflight-bytes N",
+                     "sender max in-flight bytes override"});
+  options.push_back({"prefill", "       --kv-socket-send-buf N",
+                     "sender socket SO_SNDBUF override"});
+  options.push_back({"prefill", "       --kv-socket-recv-buf N",
+                     "sender socket SO_RCVBUF override"});
+  options.push_back({"prefill", "       --kv-bind-addrs CSV",
+                     "sender bind-address list override"});
+  options.push_back({"prefill", "       --kv-peer-addrs CSV",
+                     "sender peer-address list override"});
+  options.push_back({"prefill", "       --kv-balance MODE",
+                     "sender multi-peer balancing policy override"});
+  options.push_back({"prefill", "       --tb-direct-endpoint ENDPOINT",
+                     "sender direct endpoint override for TB transport"});
   options.push_back({"grammar"});
   options.push_back({"*", "       --grammar GRAMMAR",
                      "BNF-like grammar to constrain generations (see samples "
@@ -4114,6 +4404,73 @@ llama_context_params_from_gpt_params(const gpt_params &params) {
   cparams.prefill_buffers = params.prefill_buffers;
   cparams.prefill_prefetch = params.prefill_prefetch;
   cparams.prefill_slab_bytes = params.prefill_slab_bytes;
+  cparams.prefill_min_stream_batch_tokens = params.prefill_min_stream_batch_tokens;
+
+  const std::string decode_mode = string_lower(params.prefill_decode_mode);
+  if (decode_mode == "cpu_kv" || decode_mode == "cpu") {
+    cparams.prefill_decode_mode = LLAMA_PREFILL_DECODE_MODE_CPU_KV;
+  } else if (decode_mode == "gpu_kv" || decode_mode == "gpu") {
+    cparams.prefill_decode_mode = LLAMA_PREFILL_DECODE_MODE_GPU_KV;
+  } else if (decode_mode == "hybrid") {
+    cparams.prefill_decode_mode = LLAMA_PREFILL_DECODE_MODE_HYBRID;
+  } else if (decode_mode == "split_thunderbolt" || decode_mode == "split" ||
+             decode_mode == "split-thunderbolt" || decode_mode == "split-tb") {
+    cparams.prefill_decode_mode = LLAMA_PREFILL_DECODE_MODE_SPLIT_THUNDERBOLT;
+  } else {
+    cparams.prefill_decode_mode = LLAMA_PREFILL_DECODE_MODE_AUTO;
+  }
+
+  const std::string transport_mode = string_lower(params.prefill_transport_mode);
+  if (transport_mode == "bulk") {
+    cparams.prefill_transport_mode = LLAMA_PREFILL_TRANSPORT_MODE_BULK;
+  } else if (transport_mode == "progressive" || transport_mode == "on") {
+    cparams.prefill_transport_mode = LLAMA_PREFILL_TRANSPORT_MODE_PROGRESSIVE;
+  } else {
+    cparams.prefill_transport_mode = LLAMA_PREFILL_TRANSPORT_MODE_DISABLED;
+  }
+
+  const std::string execution_mode = string_lower(params.prefill_execution_mode);
+  cparams.prefill_execution_mode = execution_mode == "decoupled"
+                                       ? LLAMA_PREFILL_EXECUTION_MODE_DECOUPLED
+                                       : LLAMA_PREFILL_EXECUTION_MODE_COUPLED;
+
+  cparams.decode_gpu_layers_hint = params.decode_gpu_layers_hint;
+  cparams.decode_remote_layers_hint = params.decode_remote_layers_hint;
+  cparams.decode_remote_nodes_hint = params.decode_remote_nodes_hint;
+  cparams.prefill_transport_chunk_bytes = params.prefill_transport_chunk_bytes;
+  cparams.prefill_decode_transport_required =
+      params.prefill_decode_transport_required;
+
+  cparams.decode_remote_ranges = params.decode_remote_ranges.empty()
+                                     ? nullptr
+                                     : params.decode_remote_ranges.c_str();
+  cparams.decode_remote_failover_policy =
+      params.decode_remote_failover_policy.empty()
+          ? nullptr
+          : params.decode_remote_failover_policy.c_str();
+  cparams.prefill_transport_session_dir =
+      params.prefill_transport_session_dir.empty()
+          ? nullptr
+          : params.prefill_transport_session_dir.c_str();
+  cparams.kv_transport =
+      params.kv_transport.empty() ? nullptr : params.kv_transport.c_str();
+  cparams.tb_direct_endpoint = params.tb_direct_endpoint.empty()
+                                   ? nullptr
+                                   : params.tb_direct_endpoint.c_str();
+  cparams.kv_host = params.kv_host.empty() ? nullptr : params.kv_host.c_str();
+  cparams.kv_port = params.kv_port;
+  cparams.kv_streams = params.kv_streams;
+  cparams.kv_stream_chunk_bytes = params.kv_stream_chunk_bytes;
+  cparams.kv_max_inflight_bytes = params.kv_max_inflight_bytes;
+  cparams.kv_socket_send_buf = params.kv_socket_send_buf;
+  cparams.kv_socket_recv_buf = params.kv_socket_recv_buf;
+  cparams.kv_bind_addrs =
+      params.kv_bind_addrs.empty() ? nullptr : params.kv_bind_addrs.c_str();
+  cparams.kv_peer_addrs =
+      params.kv_peer_addrs.empty() ? nullptr : params.kv_peer_addrs.c_str();
+  cparams.kv_balance =
+      params.kv_balance.empty() ? nullptr : params.kv_balance.c_str();
+  cparams.kv_transport_fallback = params.kv_transport_fallback;
 
   return cparams;
 }

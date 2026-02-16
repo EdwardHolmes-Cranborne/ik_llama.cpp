@@ -24,6 +24,11 @@ struct llama_tb_transfer_options {
     int32_t     socket_recv_buf = 0;
     bool        progressive = false;
     int32_t     remote_nodes = 1;
+    int32_t     expected_gpu_layers = 0;
+    int32_t     expected_remote_layers = 0;
+    std::string layer_map;
+    std::string remote_ranges;
+    std::string remote_failover_policy;
 };
 
 struct llama_tb_transfer_result {

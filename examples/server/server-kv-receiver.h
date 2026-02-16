@@ -52,6 +52,14 @@ struct kv_receiver_session_stats {
     uint64_t expected_chunks = 0;
     uint64_t expected_payload_bytes = 0;
     bool ack_required = true;
+    int32_t remote_nodes = 1;
+    int32_t expected_gpu_layers = 0;
+    int32_t expected_remote_layers = 0;
+    std::string execution_mode;
+    std::string balance;
+    std::string remote_ranges;
+    std::string remote_failover_policy;
+    std::string layer_map;
     int32_t expected_streams = 0;
     int32_t seen_streams = 0;
     int32_t done_streams = 0;

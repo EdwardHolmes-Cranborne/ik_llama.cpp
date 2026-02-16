@@ -471,6 +471,33 @@ struct gpt_params {
   int32_t prefill_buffers = 2;    // number of GPU rotation buffers
   int32_t prefill_prefetch = 1;   // layer lookahead distance
   size_t prefill_slab_bytes = 16 * 1024 * 1024; // upload chunk size
+  int32_t prefill_min_stream_batch_tokens = -1; // -1 keeps runtime crossover logic
+
+  // Prefill->decode handoff planner/runtime controls
+  std::string prefill_decode_mode = "auto";      // auto|cpu_kv|gpu_kv|hybrid|split_thunderbolt
+  std::string prefill_transport_mode = "disabled"; // disabled|bulk|progressive
+  std::string prefill_execution_mode = "coupled";  // coupled|decoupled
+  int32_t decode_gpu_layers_hint = -1;             // -1 = auto
+  int32_t decode_remote_layers_hint = 0;
+  int32_t decode_remote_nodes_hint = 1;
+  std::string decode_remote_ranges = "";
+  std::string decode_remote_failover_policy = "reroute"; // reroute|local|fail
+  int32_t prefill_transport_chunk_bytes = 4 * 1024 * 1024;
+  bool prefill_decode_transport_required = false;
+  std::string prefill_transport_session_dir = "";
+
+  // Sender-side transport settings used by split handoff publish
+  std::string kv_host = "";
+  int32_t kv_port = 0;
+  int32_t kv_streams = 0;
+  int32_t kv_stream_chunk_bytes = 0;
+  int32_t kv_max_inflight_bytes = 0;
+  int32_t kv_socket_send_buf = 0;
+  int32_t kv_socket_recv_buf = 0;
+  std::string kv_bind_addrs = "";
+  std::string kv_peer_addrs = "";
+  std::string kv_balance = "";
+  std::string tb_direct_endpoint = "";
 
   float slot_prompt_similarity = 0.1f;
   int32_t cache_ram_mib = 8192; // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.

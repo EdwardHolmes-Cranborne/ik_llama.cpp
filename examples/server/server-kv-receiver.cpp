@@ -93,6 +93,14 @@ struct session_state {
     uint64_t expected_chunks = 0;
     uint64_t expected_payload_bytes = 0;
     bool ack_required = true;
+    int32_t remote_nodes = 1;
+    int32_t expected_gpu_layers = 0;
+    int32_t expected_remote_layers = 0;
+    std::string execution_mode = "coupled";
+    std::string balance = "roundrobin";
+    std::string remote_ranges;
+    std::string remote_failover_policy = "reroute";
+    std::string layer_map;
     uint64_t first_frame_unix_us = 0;
     uint64_t last_frame_unix_us = 0;
 
@@ -895,6 +903,14 @@ struct kv_receiver_service::impl {
             ss.expected_chunks = s->expected_chunks;
             ss.expected_payload_bytes = s->expected_payload_bytes;
             ss.ack_required = s->ack_required;
+            ss.remote_nodes = s->remote_nodes;
+            ss.expected_gpu_layers = s->expected_gpu_layers;
+            ss.expected_remote_layers = s->expected_remote_layers;
+            ss.execution_mode = s->execution_mode;
+            ss.balance = s->balance;
+            ss.remote_ranges = s->remote_ranges;
+            ss.remote_failover_policy = s->remote_failover_policy;
+            ss.layer_map = s->layer_map;
             ss.expected_streams = s->expected_streams;
             ss.seen_streams = (int32_t) s->seen_stream_ids.size();
             ss.done_streams = (int32_t) s->done_stream_ids.size();
@@ -1298,6 +1314,14 @@ struct kv_receiver_service::impl {
             ss.expected_chunks = session->expected_chunks;
             ss.expected_payload_bytes = session->expected_payload_bytes;
             ss.ack_required = session->ack_required;
+            ss.remote_nodes = session->remote_nodes;
+            ss.expected_gpu_layers = session->expected_gpu_layers;
+            ss.expected_remote_layers = session->expected_remote_layers;
+            ss.execution_mode = session->execution_mode;
+            ss.balance = session->balance;
+            ss.remote_ranges = session->remote_ranges;
+            ss.remote_failover_policy = session->remote_failover_policy;
+            ss.layer_map = session->layer_map;
             ss.expected_streams = session->expected_streams;
             ss.seen_streams = (int32_t) session->seen_stream_ids.size();
             ss.done_streams = (int32_t) session->done_stream_ids.size();
@@ -1326,6 +1350,14 @@ struct kv_receiver_service::impl {
             {"expected_chunks", ss.expected_chunks},
             {"expected_payload_bytes", ss.expected_payload_bytes},
             {"ack_required", ss.ack_required},
+            {"remote_nodes", ss.remote_nodes},
+            {"expected_gpu_layers", ss.expected_gpu_layers},
+            {"expected_remote_layers", ss.expected_remote_layers},
+            {"execution_mode", ss.execution_mode},
+            {"balance", ss.balance},
+            {"remote_ranges", ss.remote_ranges},
+            {"remote_failover_policy", ss.remote_failover_policy},
+            {"layer_map", ss.layer_map},
             {"expected_streams", ss.expected_streams},
             {"seen_streams", ss.seen_streams},
             {"done_streams", ss.done_streams},
@@ -1487,6 +1519,16 @@ struct kv_receiver_service::impl {
             {"id_slot", config.slot_id},
             {"filename", session->artifact_path.filename().string()},
             {"filepath", session->artifact_path.string()},
+            {"prefill_handoff", {
+                {"remote_nodes", session->remote_nodes},
+                {"expected_gpu_layers", session->expected_gpu_layers},
+                {"expected_remote_layers", session->expected_remote_layers},
+                {"execution_mode", session->execution_mode},
+                {"balance", session->balance},
+                {"remote_ranges", session->remote_ranges},
+                {"remote_failover_policy", session->remote_failover_policy},
+                {"layer_map", session->layer_map},
+            }},
         };
 
         const int id_task = queue_tasks.post(std::move(task));
@@ -1621,6 +1663,66 @@ struct kv_receiver_service::impl {
                 if (ack_it != kv.end()) {
                     std::lock_guard<std::mutex> lock(session->mutex);
                     session->ack_required = parse_boolish(ack_it->second, session->ack_required);
+                }
+
+                auto remote_nodes_it = kv.find("remote_nodes");
+                if (remote_nodes_it != kv.end()) {
+                    try {
+                        const int32_t remote_nodes = std::max<int32_t>(1, std::stoi(remote_nodes_it->second));
+                        std::lock_guard<std::mutex> lock(session->mutex);
+                        session->remote_nodes = std::max(session->remote_nodes, remote_nodes);
+                    } catch (...) {
+                    }
+                }
+
+                auto expected_gpu_it = kv.find("expected_gpu_layers");
+                if (expected_gpu_it != kv.end()) {
+                    try {
+                        const int32_t expected_gpu_layers = std::max<int32_t>(0, std::stoi(expected_gpu_it->second));
+                        std::lock_guard<std::mutex> lock(session->mutex);
+                        session->expected_gpu_layers = std::max(session->expected_gpu_layers, expected_gpu_layers);
+                    } catch (...) {
+                    }
+                }
+
+                auto expected_remote_it = kv.find("expected_remote_layers");
+                if (expected_remote_it != kv.end()) {
+                    try {
+                        const int32_t expected_remote_layers = std::max<int32_t>(0, std::stoi(expected_remote_it->second));
+                        std::lock_guard<std::mutex> lock(session->mutex);
+                        session->expected_remote_layers = std::max(session->expected_remote_layers, expected_remote_layers);
+                    } catch (...) {
+                    }
+                }
+
+                auto execution_mode_it = kv.find("execution_mode");
+                if (execution_mode_it != kv.end()) {
+                    std::lock_guard<std::mutex> lock(session->mutex);
+                    session->execution_mode = execution_mode_it->second;
+                }
+
+                auto balance_it = kv.find("balance");
+                if (balance_it != kv.end()) {
+                    std::lock_guard<std::mutex> lock(session->mutex);
+                    session->balance = balance_it->second;
+                }
+
+                auto remote_ranges_it = kv.find("remote_ranges");
+                if (remote_ranges_it != kv.end()) {
+                    std::lock_guard<std::mutex> lock(session->mutex);
+                    session->remote_ranges = remote_ranges_it->second;
+                }
+
+                auto remote_failover_it = kv.find("remote_failover");
+                if (remote_failover_it != kv.end()) {
+                    std::lock_guard<std::mutex> lock(session->mutex);
+                    session->remote_failover_policy = remote_failover_it->second;
+                }
+
+                auto layer_map_it = kv.find("layer_map");
+                if (layer_map_it != kv.end()) {
+                    std::lock_guard<std::mutex> lock(session->mutex);
+                    session->layer_map = layer_map_it->second;
                 }
             } break;
             case TBP_MSG_KV_SEGMENT_BEGIN:

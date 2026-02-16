@@ -1,5 +1,38 @@
 # RDMA + KV Handoff Implementation Log
 
+## 2026-02-16
+
+### Scope completed this cycle
+
+1. Removed RTX multi-active-stream import limitation in KV bridge:
+   - `convert_rtx_seq_blob_to_ik()` now merges multiple active RTX stream blocks into one IK sequence-state stream.
+   - Merge path preserves stream-order cell metadata and concatenates per-layer K/V payload rows safely.
+   - Cross-stream layout mismatches now fail with explicit compatibility/header parse errors.
+2. Updated RTX source-shape normalization for planning:
+   - RTX payload descriptors now report effective single-stream compatibility for bridge planning because merge is performed at conversion time.
+3. Updated parser coverage:
+   - `KVB-UT-017` now validates multi-active-stream merge success (cell count + payload concatenation assertions).
+4. Removed obsolete Phase-1 queue guardrail:
+   - External command submit no longer rejects `--kv-streams != 1`.
+   - Queue self-test and operator docs updated accordingly.
+5. Updated deployment/test docs:
+   - Dual-Mac setup and test guides now describe multi-stream import as supported (instead of constrained to single stream).
+6. Finished queue/wrapper stream-count plumbing:
+   - Added `--kv-streams` passthrough and validation in:
+     - `scripts/run_phase1_prefill_handoff_job.sh`
+     - `scripts/run_phase2_prefill_to_artifact.sh`
+     - `scripts/run_single_machine_buffered_e2e.sh`
+   - Added queue submit/request support for `--kv-streams` and propagated it through single-machine + Phase-2 worker stages.
+   - Extended Phase-2 queue self-test to assert `--kv-streams` propagation into prefill stage wrappers.
+
+### Verification completed
+
+1. Build:
+   - `cmake --build build_codex --target test-kv-bridge-parser -j8` passes.
+2. Tests:
+   - `build_codex/bin/test-kv-bridge-parser` passes.
+   - `ctest --test-dir build_codex -L kv-bridge --output-on-failure` passes.
+
 ## 2026-02-15
 
 ### Scope completed this cycle

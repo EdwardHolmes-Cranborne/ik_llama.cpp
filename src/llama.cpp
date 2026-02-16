@@ -9,9 +9,11 @@
 #include "llama-build-context.h"
 #include "llama-context.h"
 #include "llama-cparams.h"
+#include "llama-decode-handoff.h"
 #include "llama-grammar.h"
 #include "llama-hparams.h"
 #include "llama-impl.h"
+#include "llama-kv-artifact.h"
 #include "llama-mmap.h"
 #include "llama-model-loader.h"
 #include "llama-model.h"
@@ -96,13 +98,16 @@
 #include <cstdarg>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <future>
 #include <initializer_list>
+#include <limits>
 #include <locale>
 #include <map>
 #include <memory>
@@ -3310,6 +3315,378 @@ static void llama_graph_compute(llama_context &lctx, ggml_cgraph *gf,
   // ggml_backend_sched_get_n_splits(lctx.sched));
 }
 
+static int32_t llama_tensor_layer_out_index(const ggml_tensor * t) {
+  if (t == nullptr || t->name[0] == '\0') {
+    return -1;
+  }
+
+  static constexpr const char *k_prefix = "l_out-";
+  static constexpr size_t k_prefix_len = 6;
+  if (strncmp(t->name, k_prefix, k_prefix_len) != 0) {
+    return -1;
+  }
+
+  const char *layer_str = t->name + k_prefix_len;
+  if (*layer_str == '\0') {
+    return -1;
+  }
+
+  char *end = nullptr;
+  const long value = std::strtol(layer_str, &end, 10);
+  if (end == layer_str || *end != '\0' || value < 0 ||
+      value > std::numeric_limits<int32_t>::max()) {
+    return -1;
+  }
+  return (int32_t) value;
+}
+
+static void llama_layer_eval_start_layer(llama_context & lctx, int32_t il) {
+  auto &state = lctx.layer_eval_callbacks;
+  if (!state.active || il < 0 || il >= state.n_layers) {
+    return;
+  }
+
+  state.current_layer = il;
+  state.current_layer_start_us = ggml_time_us();
+  state.first_layer_started = true;
+  if (lctx.pre_layer_cb) {
+    lctx.pre_layer_cb(il, state.n_layers);
+  }
+}
+
+static void llama_layer_eval_finish_layer(llama_context & lctx, int32_t il) {
+  auto &state = lctx.layer_eval_callbacks;
+  if (!state.active || il < 0 || il >= state.n_layers) {
+    return;
+  }
+
+  if (!state.first_layer_started) {
+    llama_layer_eval_start_layer(lctx, il);
+  }
+
+  if (state.current_layer != il) {
+    state.current_layer = il;
+  }
+
+  if (state.current_layer_start_us > 0 &&
+      il < (int32_t) lctx.last_layer_compute_times_ms.size()) {
+    const int64_t now_us = ggml_time_us();
+    const float elapsed_ms = (float) (now_us - state.current_layer_start_us) /
+                             1000.0f;
+    lctx.last_layer_compute_times_ms[il] += elapsed_ms;
+  }
+
+  if (lctx.post_layer_cb) {
+    lctx.post_layer_cb(il, state.n_layers);
+  }
+
+  const int32_t next_il = il + 1;
+  if (next_il < state.n_layers) {
+    llama_layer_eval_start_layer(lctx, next_il);
+  } else {
+    state.current_layer = -1;
+    state.current_layer_start_us = 0;
+  }
+}
+
+static void llama_layer_eval_begin_ubatch(llama_context & lctx) {
+  auto &state = lctx.layer_eval_callbacks;
+  if (!state.active || state.n_layers <= 0) {
+    return;
+  }
+
+  state.current_layer = -1;
+  state.current_layer_start_us = 0;
+  state.first_layer_started = false;
+  llama_layer_eval_start_layer(lctx, 0);
+}
+
+static bool llama_decode_eval_callback(struct ggml_tensor * t, bool ask,
+                                       void * user_data) {
+  auto *lctx = static_cast<llama_context *>(user_data);
+  if (lctx == nullptr) {
+    return true;
+  }
+
+  auto &state = lctx->layer_eval_callbacks;
+  bool user_need = false;
+  if (state.user_cb) {
+    user_need = state.user_cb(t, ask, state.user_cb_user_data);
+    if (ask && user_need) {
+      state.user_observed_nodes.insert(t);
+    }
+  }
+
+  if (ask) {
+    if (!state.active) {
+      return user_need;
+    }
+    const int32_t il = llama_tensor_layer_out_index(t);
+    return user_need || il >= 0;
+  }
+
+  if (state.active) {
+    const int32_t il = llama_tensor_layer_out_index(t);
+    if (il >= 0 && il < state.n_layers) {
+      llama_layer_eval_finish_layer(*lctx, il);
+    }
+  }
+
+  if (state.user_cb) {
+    const auto it = state.user_observed_nodes.find(t);
+    if (it != state.user_observed_nodes.end()) {
+      state.user_observed_nodes.erase(it);
+      return state.user_cb(t, false, state.user_cb_user_data);
+    }
+  }
+
+  return true;
+}
+
+static void llama_decode_eval_prepare(llama_context & lctx) {
+  auto &state = lctx.layer_eval_callbacks;
+  state.user_cb = lctx.cparams.cb_eval;
+  state.user_cb_user_data = lctx.cparams.cb_eval_user_data;
+  state.active = (bool) lctx.pre_layer_cb || (bool) lctx.post_layer_cb;
+  state.n_layers = std::max<int32_t>(0, (int32_t) lctx.model.hparams.n_layer);
+  state.current_layer = -1;
+  state.current_layer_start_us = 0;
+  state.first_layer_started = false;
+  state.user_observed_nodes.clear();
+
+  if (state.active) {
+    lctx.last_layer_compute_times_ms.assign(state.n_layers, 0.0f);
+  } else {
+    lctx.last_layer_compute_times_ms.clear();
+  }
+}
+
+static void llama_decode_eval_install(llama_context & lctx) {
+  const auto &state = lctx.layer_eval_callbacks;
+  if (state.active || state.user_cb) {
+    ggml_backend_sched_set_eval_callback(lctx.sched, llama_decode_eval_callback,
+                                         &lctx);
+  } else {
+    ggml_backend_sched_set_eval_callback(lctx.sched, nullptr, nullptr);
+  }
+}
+
+static bool llama_decode_handoff_requested(const llama_context & ctx) {
+  return ctx.prefill_decode_mode != LLAMA_PREFILL_DECODE_MODE_AUTO ||
+         ctx.prefill_transport_mode != LLAMA_PREFILL_TRANSPORT_MODE_DISABLED ||
+         ctx.prefill_decode_transport_required;
+}
+
+static bool llama_decode_has_gpu_backend(const llama_context & ctx) {
+  for (ggml_backend_t backend : ctx.backends) {
+    if (backend != nullptr && !ggml_backend_is_cpu(backend)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static llama_seq_id llama_batch_primary_seq_id(const llama_batch & batch,
+                                               bool * has_multiple) {
+  std::set<llama_seq_id> seq_ids;
+  if (batch.seq_id != nullptr && batch.n_seq_id != nullptr) {
+    for (int32_t i = 0; i < batch.n_tokens; ++i) {
+      if (batch.n_seq_id[i] <= 0 || batch.seq_id[i] == nullptr) {
+        continue;
+      }
+      for (int32_t s = 0; s < batch.n_seq_id[i]; ++s) {
+        seq_ids.insert(batch.seq_id[i][s]);
+      }
+    }
+  }
+
+  if (has_multiple) {
+    *has_multiple = seq_ids.size() > 1;
+  }
+
+  if (!seq_ids.empty()) {
+    return *seq_ids.begin();
+  }
+
+  return batch.all_seq_id;
+}
+
+static int llama_decode_publish_prefill_kv_handoff(llama_context * ctx,
+                                                   const llama_batch & batch,
+                                                   const char * caller) {
+  if (ctx == nullptr || batch.n_tokens <= 1 ||
+      !llama_decode_handoff_requested(*ctx)) {
+    return 0;
+  }
+
+  llama_decode_handoff_runtime runtime;
+  runtime.n_layers = (int32_t) ctx->model.hparams.n_layer;
+  runtime.offload_kqv = ctx->cparams.offload_kqv;
+  runtime.has_gpu_backend = llama_decode_has_gpu_backend(*ctx);
+  runtime.model_gpu_layers = ctx->model.n_gpu_layers;
+  runtime.decode_mode = ctx->prefill_decode_mode;
+  runtime.gpu_layers_hint = ctx->decode_gpu_layers_hint;
+  runtime.remote_layers_hint = ctx->decode_remote_layers_hint;
+  runtime.remote_nodes_hint = ctx->decode_remote_nodes_hint;
+  runtime.remote_ranges_hint = ctx->decode_remote_ranges;
+  runtime.remote_failover_policy = ctx->decode_remote_failover_policy;
+  runtime.transport_mode = ctx->prefill_transport_mode;
+  runtime.execution_mode = ctx->prefill_execution_mode;
+  runtime.tb_chunk_bytes = ctx->prefill_transport_chunk_bytes;
+  runtime.transport_session_dir = ctx->prefill_transport_session_dir;
+  runtime.kv_transport = ctx->kv_transport;
+  runtime.tb_direct_endpoint = ctx->tb_direct_endpoint;
+  runtime.kv_host = ctx->kv_host;
+  runtime.kv_port = ctx->kv_port;
+  runtime.kv_streams = ctx->kv_streams;
+  runtime.kv_stream_chunk_bytes = ctx->kv_stream_chunk_bytes;
+  runtime.kv_max_inflight_bytes = ctx->kv_max_inflight_bytes;
+  runtime.kv_socket_send_buf = ctx->kv_socket_send_buf;
+  runtime.kv_socket_recv_buf = ctx->kv_socket_recv_buf;
+  runtime.kv_bind_addrs = ctx->kv_bind_addrs;
+  runtime.kv_peer_addrs = ctx->kv_peer_addrs;
+  runtime.kv_balance = ctx->kv_balance;
+  runtime.kv_transport_fallback = ctx->kv_transport_fallback;
+  runtime.transport_required = ctx->prefill_decode_transport_required;
+
+  const llama_decode_handoff_plan plan = llama_decode_handoff_build_plan(runtime);
+  const bool required = plan.transport_required;
+
+  auto fail_or_warn = [&](const std::string & reason) -> int {
+    if (required) {
+      LLAMA_LOG_ERROR("%s: prefill KV handoff failed: %s\n", caller,
+                      reason.c_str());
+      return -1;
+    }
+    LLAMA_LOG_WARN("%s: prefill KV handoff skipped: %s\n", caller,
+                   reason.c_str());
+    return 0;
+  };
+
+  LLAMA_LOG_INFO("%s: %s\n", caller,
+                 llama_decode_handoff_plan_to_string(plan).c_str());
+
+  if (required && !plan.use_transport) {
+    return fail_or_warn(
+        "transport-required handoff resolved to a non-transport plan");
+  }
+
+  std::string executor_fallback_reason;
+  auto executor = llama_decode_executor_create(plan, &executor_fallback_reason);
+  if (!executor) {
+    return fail_or_warn("failed to create decode handoff executor");
+  }
+  if (!executor_fallback_reason.empty()) {
+    LLAMA_LOG_WARN("%s: decode handoff executor fallback: %s\n", caller,
+                   executor_fallback_reason.c_str());
+  }
+
+  std::string begin_status;
+  if (!executor->begin_session(plan, begin_status)) {
+    return fail_or_warn(begin_status.empty() ? "begin_session failed"
+                                             : begin_status);
+  }
+  if (!begin_status.empty()) {
+    LLAMA_LOG_INFO("%s: decode handoff begin: %s\n", caller,
+                   begin_status.c_str());
+  }
+
+  bool has_multiple_seq = false;
+  const llama_seq_id seq_id =
+      llama_batch_primary_seq_id(batch, &has_multiple_seq);
+  if (has_multiple_seq) {
+    LLAMA_LOG_WARN("%s: batch contains multiple sequence IDs; exporting seq_id=%d "
+                   "only\n",
+                   caller, (int) seq_id);
+  }
+
+  const size_t payload_size = llama_state_seq_get_size(ctx, seq_id);
+  if (payload_size == 0) {
+    return fail_or_warn("empty KV payload for selected sequence");
+  }
+
+  std::vector<uint8_t> payload(payload_size);
+  const size_t bytes_written = llama_state_seq_get_data(
+      ctx, payload.data(), payload.size(), seq_id);
+  if (bytes_written == 0) {
+    return fail_or_warn("failed to serialize KV payload from context");
+  }
+  if (bytes_written != payload.size()) {
+    payload.resize(bytes_written);
+  }
+
+  llama_kv_artifact_metadata meta = {};
+  meta.n_layers = (uint32_t) ctx->model.hparams.n_layer;
+  meta.n_ctx = (uint32_t) ctx->cparams.n_ctx;
+  meta.token_count = (uint32_t) batch.n_tokens;
+  meta.type_k = (uint16_t) ctx->kv_self.type_k;
+  meta.type_v = (uint16_t) ctx->kv_self.type_v;
+  if (plan.transport_mode == LLAMA_PREFILL_TRANSPORT_MODE_PROGRESSIVE) {
+    meta.flags |= LLAMA_KV_ARTIFACT_FLAG_PROGRESSIVE;
+  }
+
+  const std::filesystem::path artifact_dir =
+      plan.transport_session_dir.empty()
+          ? std::filesystem::path("/tmp/ik_kv_handoff")
+          : std::filesystem::path(plan.transport_session_dir);
+  std::error_code dir_ec;
+  std::filesystem::create_directories(artifact_dir, dir_ec);
+  if (dir_ec) {
+    return fail_or_warn("failed to create artifact directory '" +
+                        artifact_dir.string() + "': " + dir_ec.message());
+  }
+
+  const std::string artifact_name =
+      "kv_artifact_seq" + std::to_string((int) seq_id) + "_" +
+      std::to_string((long long) ggml_time_us()) + ".bin";
+  const std::filesystem::path artifact_path = artifact_dir / artifact_name;
+  const std::string artifact_path_str = artifact_path.string();
+
+  llama_kv_artifact_summary artifact_summary = {};
+  std::string artifact_error;
+  if (!llama_kv_artifact_write(artifact_path_str, payload, meta,
+                               &artifact_summary, &artifact_error)) {
+    return fail_or_warn(artifact_error.empty()
+                            ? "failed to write KV artifact"
+                            : artifact_error);
+  }
+
+  LLAMA_LOG_INFO("%s: wrote KV artifact: %s (%llu bytes, crc32=%u)\n", caller,
+                 artifact_path_str.c_str(),
+                 (unsigned long long) artifact_summary.payload_bytes,
+                 artifact_summary.payload_crc32);
+
+  llama_decode_publish_diag publish_diag = {};
+  std::string publish_status;
+  if (!executor->publish_kv_artifact(artifact_path_str, plan, publish_status,
+                                     &publish_diag)) {
+    return fail_or_warn(publish_status.empty() ? "publish_kv_artifact failed"
+                                               : publish_status);
+  }
+  if (!publish_status.empty()) {
+    LLAMA_LOG_INFO("%s: decode handoff publish: %s\n", caller,
+                   publish_status.c_str());
+  }
+
+  if (required && !publish_diag.transport_used) {
+    return fail_or_warn("transport-required handoff did not use network transport");
+  }
+
+  if (publish_diag.transport_used) {
+    LLAMA_LOG_INFO(
+        "%s: transport publish metrics: backend=%s bytes=%llu chunks=%u "
+        "streams=%d transfer_ms=%.2f throughput_gbps=%.2f retransmit_chunks=%u "
+        "window_stalls_ms=%llu\n",
+        caller, publish_diag.transport_backend.c_str(),
+        (unsigned long long) publish_diag.bytes_sent, publish_diag.chunks_sent,
+        publish_diag.stream_count, publish_diag.transfer_ms,
+        publish_diag.throughput_gbps, publish_diag.retransmit_chunks,
+        (unsigned long long) publish_diag.window_stalls_ms);
+  }
+
+  return 0;
+}
+
 // decode a batch of tokens by evaluating the transformer
 //
 //   - lctx:      llama context
@@ -3337,6 +3714,7 @@ llama_decode_internal(llama_context &lctx,
   const auto &model = lctx.model;
   const auto &hparams = model.hparams;
   const auto &cparams = lctx.cparams;
+  llama_decode_eval_prepare(lctx);
 
   GGML_ASSERT((!batch_all.token && batch_all.embd) ||
               (batch_all.token && !batch_all.embd)); // NOLINT
@@ -3537,8 +3915,6 @@ llama_decode_internal(llama_context &lctx,
     ggml_cgraph *gf = nullptr;
     if (!lctx.can_reuse_graph(u_batch)) {
       lctx.reset_scheduler();
-      ggml_backend_sched_set_eval_callback(lctx.sched, lctx.cparams.cb_eval,
-                                           lctx.cparams.cb_eval_user_data);
 #if IK_PRINT_TIMING
       tim2 = ggml_time_us();
       printf("sched_reset(...): %d us\n", int(tim2 - tim1));
@@ -3571,6 +3947,7 @@ llama_decode_internal(llama_context &lctx,
       // printf("Reusing graph\n");
       gf = lctx.prev->graph;
     }
+    llama_decode_eval_install(lctx);
 
     // the output is always the last tensor in the graph
     struct ggml_tensor *res = gf->nodes[gf->n_nodes - 1];
@@ -3610,6 +3987,7 @@ llama_decode_internal(llama_context &lctx,
 #if IK_PRINT_TIMING
     tim1 = ggml_time_us();
 #endif
+    llama_layer_eval_begin_ubatch(lctx);
     llama_graph_compute(lctx, gf, n_threads);
 #if IK_PRINT_TIMING
     llama_synchronize(&lctx);
@@ -4584,6 +4962,31 @@ struct llama_context_params llama_context_default_params() {
       /*.prefill_buffers             =*/2,
       /*.prefill_prefetch            =*/1,
       /*.prefill_slab_bytes          =*/16 * 1024 * 1024,
+      /*.prefill_min_stream_batch_tokens=*/-1,
+      /*.prefill_decode_mode         =*/LLAMA_PREFILL_DECODE_MODE_AUTO,
+      /*.prefill_transport_mode      =*/LLAMA_PREFILL_TRANSPORT_MODE_DISABLED,
+      /*.prefill_execution_mode      =*/LLAMA_PREFILL_EXECUTION_MODE_COUPLED,
+      /*.decode_gpu_layers_hint      =*/-1,
+      /*.decode_remote_layers_hint   =*/0,
+      /*.decode_remote_nodes_hint    =*/1,
+      /*.prefill_transport_chunk_bytes=*/4 * 1024 * 1024,
+      /*.prefill_decode_transport_required=*/false,
+      /*.decode_remote_ranges        =*/nullptr,
+      /*.decode_remote_failover_policy=*/nullptr,
+      /*.prefill_transport_session_dir=*/nullptr,
+      /*.kv_transport                =*/nullptr,
+      /*.tb_direct_endpoint          =*/nullptr,
+      /*.kv_host                     =*/nullptr,
+      /*.kv_port                     =*/0,
+      /*.kv_streams                  =*/0,
+      /*.kv_stream_chunk_bytes       =*/0,
+      /*.kv_max_inflight_bytes       =*/0,
+      /*.kv_socket_send_buf          =*/0,
+      /*.kv_socket_recv_buf          =*/0,
+      /*.kv_bind_addrs               =*/nullptr,
+      /*.kv_peer_addrs               =*/nullptr,
+      /*.kv_balance                  =*/nullptr,
+      /*.kv_transport_fallback       =*/false,
   };
 
   return result;
@@ -4988,6 +5391,40 @@ llama_new_context_with_model(struct llama_model *model,
   ctx->prefill_buffers = params.prefill_buffers;
   ctx->prefill_prefetch = params.prefill_prefetch;
   ctx->prefill_slab_bytes = params.prefill_slab_bytes;
+  ctx->prefill_min_stream_batch_tokens = params.prefill_min_stream_batch_tokens;
+  ctx->prefill_decode_mode = params.prefill_decode_mode;
+  ctx->prefill_transport_mode = params.prefill_transport_mode;
+  ctx->prefill_execution_mode = params.prefill_execution_mode;
+  ctx->decode_gpu_layers_hint = params.decode_gpu_layers_hint;
+  ctx->decode_remote_layers_hint = params.decode_remote_layers_hint;
+  ctx->decode_remote_nodes_hint = params.decode_remote_nodes_hint;
+  ctx->prefill_transport_chunk_bytes = params.prefill_transport_chunk_bytes;
+  ctx->prefill_decode_transport_required =
+      params.prefill_decode_transport_required;
+  ctx->decode_remote_ranges =
+      params.decode_remote_ranges ? params.decode_remote_ranges : "";
+  ctx->decode_remote_failover_policy =
+      params.decode_remote_failover_policy
+          ? params.decode_remote_failover_policy
+          : "reroute";
+  ctx->prefill_transport_session_dir =
+      params.prefill_transport_session_dir
+          ? params.prefill_transport_session_dir
+          : "";
+  ctx->kv_transport = params.kv_transport ? params.kv_transport : "";
+  ctx->tb_direct_endpoint =
+      params.tb_direct_endpoint ? params.tb_direct_endpoint : "";
+  ctx->kv_host = params.kv_host ? params.kv_host : "";
+  ctx->kv_port = params.kv_port;
+  ctx->kv_streams = params.kv_streams;
+  ctx->kv_stream_chunk_bytes = params.kv_stream_chunk_bytes;
+  ctx->kv_max_inflight_bytes = params.kv_max_inflight_bytes;
+  ctx->kv_socket_send_buf = params.kv_socket_send_buf;
+  ctx->kv_socket_recv_buf = params.kv_socket_recv_buf;
+  ctx->kv_bind_addrs = params.kv_bind_addrs ? params.kv_bind_addrs : "";
+  ctx->kv_peer_addrs = params.kv_peer_addrs ? params.kv_peer_addrs : "";
+  ctx->kv_balance = params.kv_balance ? params.kv_balance : "";
+  ctx->kv_transport_fallback = params.kv_transport_fallback;
 
   cparams.reduce_type = params.type_reduce;
   cparams.pooling_type = params.pooling_type;
@@ -7460,7 +7897,10 @@ int32_t llama_decode(struct llama_context *ctx, struct llama_batch batch) {
   // RTX Accelerated Prefill Streaming dispatch:
   // When streaming is enabled and this is a prefill batch (n_tokens > 1),
   // route through the streaming prefill path instead of the standard decode.
-  if (ctx->prefill_streaming && batch.n_tokens > 1) {
+  const bool stream_threshold_met =
+      ctx->prefill_min_stream_batch_tokens < 0 ||
+      batch.n_tokens >= ctx->prefill_min_stream_batch_tokens;
+  if (ctx->prefill_streaming && batch.n_tokens > 1 && stream_threshold_met) {
     llama_prefill_stream_params sp = {};
     sp.n_buffers = ctx->prefill_buffers;
     sp.telemetry = ctx->prefill_telemetry;
@@ -7474,7 +7914,7 @@ int32_t llama_decode(struct llama_context *ctx, struct llama_batch batch) {
       LLAMA_LOG_INFO(
           "%s: streaming prefill completed in %.1f ms (%.1f tok/s)\n", __func__,
           result.total_time_ms, result.total_tok_s);
-      return 0;
+      return llama_decode_publish_prefill_kv_handoff(ctx, batch, __func__);
     }
     // If streaming prefill failed or isn't available, fall through to normal
     // decode
@@ -7486,6 +7926,15 @@ int32_t llama_decode(struct llama_context *ctx, struct llama_batch batch) {
   const int ret = llama_decode_internal(*ctx, batch);
   if (ret < 0) {
     LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
+    return ret;
+  }
+
+  if (ret == 0 && batch.n_tokens > 1) {
+    const int handoff_ret = llama_decode_publish_prefill_kv_handoff(
+        ctx, batch, __func__);
+    if (handoff_ret < 0) {
+      return handoff_ret;
+    }
   }
 
   return ret;

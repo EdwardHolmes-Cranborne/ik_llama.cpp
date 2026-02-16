@@ -27,16 +27,22 @@ set -euo pipefail
 
 OUTPUT_DIR=""
 PROMPT_FILE=""
+KV_STREAMS=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
     --prompt-file) PROMPT_FILE="$2"; shift 2 ;;
+    --kv-streams) KV_STREAMS="$2"; shift 2 ;;
     *) shift 1 ;;
   esac
 done
 
 if [[ -z "${OUTPUT_DIR}" || -z "${PROMPT_FILE}" ]]; then
   echo "missing output or prompt" >&2
+  exit 2
+fi
+if [[ "${KV_STREAMS}" != "3" ]]; then
+  echo "expected --kv-streams 3 in prefill stage, got '${KV_STREAMS}'" >&2
   exit 2
 fi
 
@@ -129,6 +135,7 @@ python3 "${QUEUE_SCRIPT}" --spool-dir "${SPOOL_DIR}" submit \
   --decode-host 127.0.0.1 \
   --kv-transport rdma \
   --no-kv-transport-fallback \
+  --kv-streams 3 \
   --decode-smoke \
   --priority 10 \
   --max-prefill-retries 0 \
@@ -142,6 +149,7 @@ python3 "${QUEUE_SCRIPT}" --spool-dir "${SPOOL_DIR}" submit \
   --decode-host 127.0.0.1 \
   --kv-transport rdma \
   --no-kv-transport-fallback \
+  --kv-streams 3 \
   --decode-smoke \
   --priority 5 \
   --max-prefill-retries 0 \

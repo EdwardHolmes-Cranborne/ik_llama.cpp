@@ -628,6 +628,21 @@ class llama_decode_executor_tb_split final : public llama_decode_executor_i {
         opts.progressive = plan.transport_mode == LLAMA_PREFILL_TRANSPORT_MODE_PROGRESSIVE;
         opts.chunk_bytes = plan.tb_chunk_bytes > 0 ? (size_t) plan.tb_chunk_bytes : 4 * 1024 * 1024;
         opts.remote_nodes = std::max(1, plan.remote_nodes);
+        opts.expected_gpu_layers = std::max(0, plan.expected_gpu_layers);
+        opts.expected_remote_layers = std::max(0, plan.expected_remote_layers);
+        opts.remote_ranges = plan.remote_ranges;
+        opts.remote_failover_policy = plan.remote_failover_policy;
+        {
+            std::ostringstream layer_map;
+            for (size_t i = 0; i < plan.layer_map.size(); ++i) {
+                const auto & e = plan.layer_map[i];
+                if (i > 0) {
+                    layer_map << "|";
+                }
+                layer_map << e.node << ":" << e.layer_start << "-" << e.layer_end;
+            }
+            opts.layer_map = layer_map.str();
+        }
         opts.execution_mode = plan.execution_mode == LLAMA_PREFILL_EXECUTION_MODE_DECOUPLED ? "decoupled" : "coupled";
         const long long session_ts_us = (long long) std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();

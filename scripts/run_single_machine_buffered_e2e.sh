@@ -17,6 +17,7 @@ CTX_SIZE=8192
 PREFILL_N_PREDICT=8
 DECODE_N_PREDICT=16
 PREFILL_MIN_STREAM_BATCH_TOKENS=-1
+KV_STREAMS=1
 KV_CHUNK_BYTES=$((4 * 1024 * 1024))
 KV_MAX_INFLIGHT=$((256 * 1024 * 1024))
 LOOPBACK_IDLE_TIMEOUT=20
@@ -44,6 +45,7 @@ Optional:
   --prefill-min-stream-batch-tokens N
                               prefill streaming threshold (-1 = runtime auto/crossover)
   --decode-n-predict N        decode validation request tokens (default: 16)
+  --kv-streams N              transport stream count (default: 1)
   --kv-chunk-bytes N          replay/send chunk size (default: 4194304)
   --kv-max-inflight N         sender in-flight window bytes (default: 268435456)
   --loopback-idle-timeout N   loopback idle timeout seconds (default: 20)
@@ -78,6 +80,7 @@ while [[ $# -gt 0 ]]; do
         --prefill-n-predict) PREFILL_N_PREDICT="$2"; shift 2 ;;
         --prefill-min-stream-batch-tokens) PREFILL_MIN_STREAM_BATCH_TOKENS="$2"; shift 2 ;;
         --decode-n-predict) DECODE_N_PREDICT="$2"; shift 2 ;;
+        --kv-streams) KV_STREAMS="$2"; shift 2 ;;
         --kv-chunk-bytes) KV_CHUNK_BYTES="$2"; shift 2 ;;
         --kv-max-inflight) KV_MAX_INFLIGHT="$2"; shift 2 ;;
         --loopback-idle-timeout) LOOPBACK_IDLE_TIMEOUT="$2"; shift 2 ;;
@@ -107,6 +110,11 @@ if [[ ! -f "${PROMPT_FILE}" ]]; then
 fi
 if [[ ! -d "${RTX_REPO}" ]]; then
     echo "rtx repo not found: ${RTX_REPO}" >&2
+    exit 2
+fi
+
+if ! [[ "${KV_STREAMS}" =~ ^[0-9]+$ ]] || [[ "${KV_STREAMS}" -lt 1 ]]; then
+    echo "invalid --kv-streams: ${KV_STREAMS} (must be >=1)" >&2
     exit 2
 fi
 
@@ -221,7 +229,7 @@ LLAMA_PREFILL_TB_ENABLE=1 \
   --kv-transport tcp \
   --kv-host 127.0.0.1 \
   --kv-port "${BUFFER_PORT}" \
-  --kv-streams 1 \
+  --kv-streams "${KV_STREAMS}" \
   --kv-stream-chunk-bytes "${KV_CHUNK_BYTES}" \
   --kv-max-inflight-bytes "${KV_MAX_INFLIGHT}" \
   >"${PREFILL_LOG}" 2>&1

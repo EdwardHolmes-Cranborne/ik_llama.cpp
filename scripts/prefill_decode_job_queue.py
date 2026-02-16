@@ -200,10 +200,6 @@ def has_flag(argv: List[str], flag: str) -> bool:
 
 def validate_external_command_guardrails(command_text: str) -> None:
     argv = shlex.split(command_text)
-    kv_streams = parse_flag_value(argv, "--kv-streams")
-    if kv_streams is not None and kv_streams != "1":
-        raise SystemExit("guardrail violation: external command uses --kv-streams != 1")
-
     split_mode = parse_flag_value(argv, "--split-mode")
     if split_mode == "graph":
         if has_flag(argv, "--no-flash-attn"):
@@ -283,6 +279,7 @@ def run_job_command(
             "--prefill-n-predict", str(req["prefill_n_predict"]),
             "--prefill-min-stream-batch-tokens", str(req["prefill_min_stream_batch_tokens"]),
             "--decode-n-predict", str(req["decode_n_predict"]),
+            "--kv-streams", str(req.get("kv_streams", 1)),
             "--kv-chunk-bytes", str(req["kv_chunk_bytes"]),
             "--kv-max-inflight", str(req["kv_max_inflight"]),
             "--loopback-idle-timeout", str(req["loopback_idle_timeout"]),
@@ -354,6 +351,7 @@ def run_phase2_prefill_stage(
         "--n-predict", str(req["prefill_n_predict"]),
         "--prefill-min-stream-batch-tokens", str(req["prefill_min_stream_batch_tokens"]),
         "--kv-transport", str(req.get("kv_transport", "auto")),
+        "--kv-streams", str(req.get("kv_streams", 1)),
         "--kv-stream-chunk-bytes", str(req["kv_chunk_bytes"]),
         "--kv-max-inflight-bytes", str(req["kv_max_inflight"]),
         "--buffer-port", str(req["prefill_buffer_port"]),
@@ -540,6 +538,8 @@ def cmd_submit(args: argparse.Namespace) -> int:
     mode = str(args.mode)
     if mode not in (JOB_MODE_SINGLE_MACHINE, JOB_MODE_EXTERNAL_COMMAND, JOB_MODE_PHASE2_SPLIT_PIPELINE):
         raise SystemExit(f"invalid mode: {mode}")
+    if int(args.kv_streams) < 1:
+        raise SystemExit("--kv-streams must be >= 1")
 
     if mode == JOB_MODE_SINGLE_MACHINE:
         if not args.model or not args.prompt_file:
@@ -608,6 +608,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
             "prefill_min_stream_batch_tokens": int(args.prefill_min_stream_batch_tokens),
             "prefill_buffer_port": int(args.prefill_buffer_port),
             "decode_n_predict": int(args.decode_n_predict),
+            "kv_streams": int(args.kv_streams),
             "kv_chunk_bytes": int(args.kv_chunk_bytes),
             "kv_max_inflight": int(args.kv_max_inflight),
             "loopback_idle_timeout": int(args.loopback_idle_timeout),
@@ -1077,6 +1078,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_submit.add_argument("--prefill-min-stream-batch-tokens", type=int, default=-1)
     p_submit.add_argument("--prefill-buffer-port", type=int, default=29001)
     p_submit.add_argument("--decode-n-predict", type=int, default=16)
+    p_submit.add_argument("--kv-streams", type=int, default=1)
 
     p_submit.add_argument("--kv-chunk-bytes", type=int, default=4 * 1024 * 1024)
     p_submit.add_argument("--kv-max-inflight", type=int, default=256 * 1024 * 1024)

@@ -761,10 +761,21 @@ bool send_artifact_over_tcp(const fs::path & src, const std::vector<std::string>
                     << ";artifact=" << src.filename().string()
                     << ";bytes=" << payload_bytes
                     << ";remote_nodes=" << std::max(1, options.remote_nodes)
+                    << ";expected_gpu_layers=" << std::max(0, options.expected_gpu_layers)
+                    << ";expected_remote_layers=" << std::max(0, options.expected_remote_layers)
                     << ";execution_mode=" << (options.execution_mode.empty() ? "coupled" : options.execution_mode)
                     << ";streams=" << stream_count
                     << ";ack_required=" << (ack_required ? 1 : 0)
                     << ";balance=" << balance;
+    if (!options.remote_ranges.empty()) {
+        session_payload << ";remote_ranges=" << options.remote_ranges;
+    }
+    if (!options.remote_failover_policy.empty()) {
+        session_payload << ";remote_failover=" << options.remote_failover_policy;
+    }
+    if (!options.layer_map.empty()) {
+        session_payload << ";layer_map=" << options.layer_map;
+    }
     for (auto & stream : streams) {
         if (!send_frame_str(stream, TBP_MSG_SESSION_START, 0, session_payload.str())) {
             close_all(streams);
@@ -1236,7 +1247,12 @@ bool llama_tb_transport_send_artifact(const std::string &          artifact_path
         meta << "bytes=" << payload_bytes << "\n";
         meta << "chunks=" << chunks_sent << "\n";
         meta << "remote_nodes=" << std::max(1, options.remote_nodes) << "\n";
+        meta << "expected_gpu_layers=" << std::max(0, options.expected_gpu_layers) << "\n";
+        meta << "expected_remote_layers=" << std::max(0, options.expected_remote_layers) << "\n";
         meta << "execution_mode=" << (options.execution_mode.empty() ? "coupled" : options.execution_mode) << "\n";
+        meta << "remote_ranges=" << options.remote_ranges << "\n";
+        meta << "remote_failover=" << options.remote_failover_policy << "\n";
+        meta << "layer_map=" << options.layer_map << "\n";
         meta << "transport_mode=" << resolved_transport_mode << "\n";
         meta << "transport_backend=" << backend_desc << "\n";
         meta << "endpoint=" << endpoint_desc << "\n";

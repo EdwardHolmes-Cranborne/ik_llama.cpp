@@ -10,6 +10,7 @@ struct llama_model;
 #include <map>
 #include <memory>
 #include <set>
+#include <unordered_set>
 #include <vector>
 
 struct llama_kv_cell {
@@ -236,6 +237,34 @@ struct llama_context {
   int prefill_buffers = 2;
   int prefill_prefetch = 1;
   size_t prefill_slab_bytes = 16 * 1024 * 1024;
+  int prefill_min_stream_batch_tokens = -1;
+
+  // Prefill->decode handoff planner/runtime controls
+  int32_t prefill_decode_mode = LLAMA_PREFILL_DECODE_MODE_AUTO;
+  int32_t prefill_transport_mode = LLAMA_PREFILL_TRANSPORT_MODE_DISABLED;
+  int32_t prefill_execution_mode = LLAMA_PREFILL_EXECUTION_MODE_COUPLED;
+  int32_t decode_gpu_layers_hint = -1;
+  int32_t decode_remote_layers_hint = 0;
+  int32_t decode_remote_nodes_hint = 1;
+  int32_t prefill_transport_chunk_bytes = 4 * 1024 * 1024;
+  bool prefill_decode_transport_required = false;
+
+  std::string decode_remote_ranges;
+  std::string decode_remote_failover_policy = "reroute";
+  std::string prefill_transport_session_dir;
+  std::string kv_transport;
+  std::string tb_direct_endpoint;
+  std::string kv_host;
+  int32_t kv_port = 0;
+  int32_t kv_streams = 0;
+  int32_t kv_stream_chunk_bytes = 0;
+  int32_t kv_max_inflight_bytes = 0;
+  int32_t kv_socket_send_buf = 0;
+  int32_t kv_socket_recv_buf = 0;
+  std::string kv_bind_addrs;
+  std::string kv_peer_addrs;
+  std::string kv_balance;
+  bool kv_transport_fallback = false;
 
   // Per-layer callbacks for streaming prefill weight upload
   std::function<void(int, int)> pre_layer_cb;
@@ -243,4 +272,15 @@ struct llama_context {
 
   // Per-layer compute times (populated by build context)
   std::vector<float> last_layer_compute_times_ms;
+
+  struct LayerEvalCallbacksState {
+    ggml_backend_sched_eval_callback user_cb = nullptr;
+    void * user_cb_user_data = nullptr;
+    bool active = false;
+    int32_t n_layers = 0;
+    int32_t current_layer = -1;
+    int64_t current_layer_start_us = 0;
+    bool first_layer_started = false;
+    std::unordered_set<const ggml_tensor *> user_observed_nodes;
+  } layer_eval_callbacks;
 };

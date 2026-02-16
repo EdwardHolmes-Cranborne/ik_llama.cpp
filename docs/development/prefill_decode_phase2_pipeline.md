@@ -50,6 +50,7 @@ Use two terminals/services:
   --decode-host 10.40.0.20 \
   --decode-port 19001 \
   --kv-transport auto \
+  --kv-streams 2 \
   --prefill-min-stream-batch-tokens -1 \
   --max-prefill-retries 1 \
   --max-handoff-retries 2
@@ -79,8 +80,8 @@ Submit additional prompts while decode is busy; they can advance to `artifact_re
 
 1. Prefill crossover logic remains enabled by default with:
    - `--prefill-min-stream-batch-tokens -1`
-2. Import compatibility guardrails still apply:
-   - keep `--kv-streams 1`
+2. Import compatibility guardrails:
+   - multi-stream RTX payload import is supported
    - for decode `--split-mode graph`, keep `--flash-attn` enabled
 3. Phase-2 handoff stage uses replay utility `scripts/tbp_replay_to_kv_receiver.py`.
    - Replay now accepts `--transport-mode auto|rdma|tcp|mixed` plus `--transport-fallback`.

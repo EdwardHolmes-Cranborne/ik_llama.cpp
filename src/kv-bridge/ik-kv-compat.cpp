@@ -522,8 +522,10 @@ static bool parse_rtx_payload_shape(
         return false;
     }
 
-    // Bridge strict-v1 supports effectively single-stream data.
-    *n_stream_out = non_empty_streams <= 1 ? 1u : n_stream_raw;
+    // RTX payload streams are collapsed into a single IK sequence-state stream
+    // during conversion, so compatibility planning remains single-stream.
+    GGML_UNUSED(non_empty_streams);
+    *n_stream_out = 1u;
     *v_trans_out = v_trans;
     return true;
 }
@@ -629,10 +631,29 @@ static ik_kv_compat_convert_result_t convert_rtx_seq_blob_to_ik(
         return false;
     };
 
+    struct rtx_layer_layout_t {
+        int32_t k_type = 0;
+        uint64_t k_row_size = 0;
+        size_t k_data_off = 0;
+        size_t k_data_size = 0;
+
+        int32_t v_type = 0;
+        uint64_t v_row_size = 0; // v_state == 0
+        uint32_t v_size_el = 0;  // v_state == 1
+        uint32_t n_embd_v_gqa = 0; // v_state == 1
+        size_t v_data_off = 0;
+        size_t v_data_size = 0;
+    };
+
     struct rtx_stream_extent_t {
         uint32_t cell_count = 0;
         size_t begin = 0;
         size_t end = 0;
+        size_t meta_begin = 0; // first byte after stream cell_count
+        size_t meta_end = 0;   // first byte after stream metadata cells
+        uint32_t v_state = 2;
+        uint32_t n_layer = 0;
+        std::vector<rtx_layer_layout_t> layers;
     };
 
     auto parse_stream_extent = [&](size_t begin_off, rtx_stream_extent_t * out) -> bool {
@@ -640,9 +661,11 @@ static ik_kv_compat_convert_result_t convert_rtx_seq_blob_to_ik(
             return false;
         }
 
+        *out = {};
         size_t off = begin_off;
         const uint32_t cell_count = rd_u32_le(src + off);
         off += sizeof(uint32_t);
+        out->meta_begin = off;
 
         for (uint32_t i = 0; i < cell_count; ++i) {
             if (off + sizeof(llama_pos) + sizeof(uint32_t) > src_size) {
@@ -662,6 +685,7 @@ static ik_kv_compat_convert_result_t convert_rtx_seq_blob_to_ik(
             }
             off += seq_bytes;
         }
+        out->meta_end = off;
 
         if (cell_count > 0) {
             if (off + sizeof(uint32_t) + sizeof(uint32_t) > src_size) {
@@ -672,22 +696,33 @@ static ik_kv_compat_convert_result_t convert_rtx_seq_blob_to_ik(
             off += sizeof(uint32_t);
             const uint32_t n_layer = rd_u32_le(src + off);
             off += sizeof(uint32_t);
+            if (n_layer > IK_KV_MAX_LAYERS) {
+                return false;
+            }
+
+            out->v_state = v_state;
+            out->n_layer = n_layer;
+            out->layers.assign(n_layer, rtx_layer_layout_t{});
 
             for (uint32_t il = 0; il < n_layer; ++il) {
                 if (off + sizeof(uint32_t) + sizeof(uint64_t) > src_size) {
                     return false;
                 }
-                off += sizeof(uint32_t); // type
-                const uint64_t row_size = rd_u64_le(src + off);
+                rtx_layer_layout_t & layer = out->layers[il];
+                layer.k_type = (int32_t) rd_u32_le(src + off);
+                off += sizeof(uint32_t);
+                layer.k_row_size = rd_u64_le(src + off);
                 off += sizeof(uint64_t);
 
                 size_t bytes = 0;
-                if (mul_size_overflow((size_t) cell_count, (size_t) row_size, &bytes)) {
+                if (mul_size_overflow((size_t) cell_count, (size_t) layer.k_row_size, &bytes)) {
                     return false;
                 }
                 if (off + bytes > src_size) {
                     return false;
                 }
+                layer.k_data_off = off;
+                layer.k_data_size = bytes;
                 off += bytes;
             }
 
@@ -696,17 +731,21 @@ static ik_kv_compat_convert_result_t convert_rtx_seq_blob_to_ik(
                     if (off + sizeof(uint32_t) + sizeof(uint64_t) > src_size) {
                         return false;
                     }
-                    off += sizeof(uint32_t); // type
-                    const uint64_t row_size = rd_u64_le(src + off);
+                    rtx_layer_layout_t & layer = out->layers[il];
+                    layer.v_type = (int32_t) rd_u32_le(src + off);
+                    off += sizeof(uint32_t);
+                    layer.v_row_size = rd_u64_le(src + off);
                     off += sizeof(uint64_t);
 
                     size_t bytes = 0;
-                    if (mul_size_overflow((size_t) cell_count, (size_t) row_size, &bytes)) {
+                    if (mul_size_overflow((size_t) cell_count, (size_t) layer.v_row_size, &bytes)) {
                         return false;
                     }
                     if (off + bytes > src_size) {
                         return false;
                     }
+                    layer.v_data_off = off;
+                    layer.v_data_size = bytes;
                     off += bytes;
                 }
             } else if (v_state == 1) {
@@ -714,21 +753,25 @@ static ik_kv_compat_convert_result_t convert_rtx_seq_blob_to_ik(
                     if (off + sizeof(uint32_t) + sizeof(uint32_t) + sizeof(uint32_t) > src_size) {
                         return false;
                     }
-                    off += sizeof(uint32_t); // type
-                    const uint32_t v_size_el = rd_u32_le(src + off);
+                    rtx_layer_layout_t & layer = out->layers[il];
+                    layer.v_type = (int32_t) rd_u32_le(src + off);
                     off += sizeof(uint32_t);
-                    const uint32_t n_embd_v_gqa = rd_u32_le(src + off);
+                    layer.v_size_el = rd_u32_le(src + off);
+                    off += sizeof(uint32_t);
+                    layer.n_embd_v_gqa = rd_u32_le(src + off);
                     off += sizeof(uint32_t);
 
                     size_t bytes = 0;
                     size_t per_row = 0;
-                    if (mul_size_overflow((size_t) cell_count, (size_t) v_size_el, &per_row) ||
-                            mul_size_overflow(per_row, (size_t) n_embd_v_gqa, &bytes)) {
+                    if (mul_size_overflow((size_t) cell_count, (size_t) layer.v_size_el, &per_row) ||
+                            mul_size_overflow(per_row, (size_t) layer.n_embd_v_gqa, &bytes)) {
                         return false;
                     }
                     if (off + bytes > src_size) {
                         return false;
                     }
+                    layer.v_data_off = off;
+                    layer.v_data_size = bytes;
                     off += bytes;
                 }
             } else if (v_state != 2) {
@@ -748,25 +791,18 @@ static ik_kv_compat_convert_result_t convert_rtx_seq_blob_to_ik(
         return IK_KV_COMPAT_CONVERT_ERR_SRC_PARSE;
     }
 
-    size_t off = sizeof(uint32_t);
-    rtx_stream_extent_t selected = {};
-    bool has_selected = false;
-    uint32_t non_empty_count = 0;
+    std::vector<rtx_stream_extent_t> streams;
+    streams.reserve(n_stream);
 
+    size_t off = sizeof(uint32_t);
     for (uint32_t s = 0; s < n_stream; ++s) {
         rtx_stream_extent_t cur = {};
         if (!parse_stream_extent(off, &cur)) {
             if (reject_reason) *reject_reason = IK_KV_COMPAT_REJECT_HEADER_MALFORMED;
             return IK_KV_COMPAT_CONVERT_ERR_SRC_PARSE;
         }
-        if (cur.cell_count > 0) {
-            ++non_empty_count;
-            if (!has_selected) {
-                selected = cur;
-                has_selected = true;
-            }
-        }
         off = cur.end;
+        streams.push_back(std::move(cur));
     }
 
     if (off != src_size) {
@@ -774,22 +810,201 @@ static ik_kv_compat_convert_result_t convert_rtx_seq_blob_to_ik(
         return IK_KV_COMPAT_CONVERT_ERR_SRC_PARSE;
     }
 
-    if (non_empty_count == 0 || !has_selected) {
+    std::vector<const rtx_stream_extent_t *> active_streams;
+    active_streams.reserve(streams.size());
+    uint64_t total_cells_u64 = 0;
+    for (const auto & stream : streams) {
+        if (stream.cell_count == 0) {
+            continue;
+        }
+        active_streams.push_back(&stream);
+        total_cells_u64 += (uint64_t) stream.cell_count;
+    }
+
+    if (active_streams.empty()) {
         if (reject_reason) *reject_reason = IK_KV_COMPAT_REJECT_PARTIAL_UNSUPPORTED;
         return IK_KV_COMPAT_CONVERT_ERR_DST_MISMATCH;
     }
-    if (non_empty_count > 1) {
-        if (reject_reason) *reject_reason = IK_KV_COMPAT_REJECT_N_STREAM_UNSUPPORTED;
-        return IK_KV_COMPAT_CONVERT_ERR_DST_MISMATCH;
+
+    if (active_streams.size() == 1) {
+        const auto & selected = *active_streams.front();
+        return convert_rtx_stream_block_to_ik(
+            src + selected.begin,
+            selected.end - selected.begin,
+            dst,
+            dst_size,
+            written_out,
+            reject_reason);
     }
 
-    return convert_rtx_stream_block_to_ik(
-        src + selected.begin,
-        selected.end - selected.begin,
-        dst,
-        dst_size,
-        written_out,
-        reject_reason);
+    const rtx_stream_extent_t & ref = *active_streams.front();
+    for (size_t si = 1; si < active_streams.size(); ++si) {
+        const rtx_stream_extent_t & stream = *active_streams[si];
+        if (stream.v_state != ref.v_state || stream.n_layer != ref.n_layer ||
+                stream.layers.size() != ref.layers.size()) {
+            if (reject_reason) *reject_reason = IK_KV_COMPAT_REJECT_HEADER_MALFORMED;
+            return IK_KV_COMPAT_CONVERT_ERR_SRC_PARSE;
+        }
+        for (uint32_t il = 0; il < ref.n_layer; ++il) {
+            const rtx_layer_layout_t & a = ref.layers[il];
+            const rtx_layer_layout_t & b = stream.layers[il];
+            if (a.k_type != b.k_type || a.k_row_size != b.k_row_size) {
+                if (reject_reason) *reject_reason = IK_KV_COMPAT_REJECT_INCOMPATIBLE_PROFILE;
+                return IK_KV_COMPAT_CONVERT_ERR_DST_MISMATCH;
+            }
+            if (ref.v_state == 0) {
+                if (a.v_type != b.v_type || a.v_row_size != b.v_row_size) {
+                    if (reject_reason) *reject_reason = IK_KV_COMPAT_REJECT_INCOMPATIBLE_PROFILE;
+                    return IK_KV_COMPAT_CONVERT_ERR_DST_MISMATCH;
+                }
+            } else if (ref.v_state == 1) {
+                if (a.v_type != b.v_type || a.v_size_el != b.v_size_el ||
+                        a.n_embd_v_gqa != b.n_embd_v_gqa) {
+                    if (reject_reason) *reject_reason = IK_KV_COMPAT_REJECT_INCOMPATIBLE_PROFILE;
+                    return IK_KV_COMPAT_CONVERT_ERR_DST_MISMATCH;
+                }
+            }
+        }
+    }
+
+    if (total_cells_u64 > (uint64_t) std::numeric_limits<uint32_t>::max()) {
+        if (reject_reason) *reject_reason = IK_KV_COMPAT_REJECT_INCOMPATIBLE_PROFILE;
+        return IK_KV_COMPAT_CONVERT_ERR_SIZE;
+    }
+
+    auto ensure_space = [&](size_t bytes) {
+        return *written_out <= dst_size && bytes <= dst_size - *written_out;
+    };
+
+    const uint32_t total_cells = (uint32_t) total_cells_u64;
+    if (!ensure_space(sizeof(uint32_t))) {
+        return IK_KV_COMPAT_CONVERT_ERR_SIZE;
+    }
+    memcpy(dst + *written_out, &total_cells, sizeof(total_cells));
+    *written_out += sizeof(total_cells);
+
+    for (const rtx_stream_extent_t * stream : active_streams) {
+        size_t cell_off = stream->meta_begin;
+        for (uint32_t i = 0; i < stream->cell_count; ++i) {
+            if (cell_off + sizeof(llama_pos) + sizeof(uint32_t) > stream->meta_end) {
+                if (reject_reason) *reject_reason = IK_KV_COMPAT_REJECT_HEADER_MALFORMED;
+                return IK_KV_COMPAT_CONVERT_ERR_SRC_PARSE;
+            }
+
+            const llama_pos pos = (llama_pos) rd_u32_le(src + cell_off);
+            cell_off += sizeof(llama_pos);
+            const uint32_t n_seq_id = rd_u32_le(src + cell_off);
+            cell_off += sizeof(uint32_t);
+
+            size_t seq_bytes = 0;
+            if (mul_size_overflow((size_t) n_seq_id, sizeof(llama_seq_id), &seq_bytes) ||
+                    cell_off + seq_bytes > stream->meta_end) {
+                if (reject_reason) *reject_reason = IK_KV_COMPAT_REJECT_HEADER_MALFORMED;
+                return IK_KV_COMPAT_CONVERT_ERR_SRC_PARSE;
+            }
+
+            if (!ensure_space(sizeof(llama_pos) + sizeof(uint32_t))) {
+                return IK_KV_COMPAT_CONVERT_ERR_SIZE;
+            }
+            memcpy(dst + *written_out, &pos, sizeof(pos));
+            *written_out += sizeof(pos);
+            const uint32_t dst_n_seq_id = 0;
+            memcpy(dst + *written_out, &dst_n_seq_id, sizeof(dst_n_seq_id));
+            *written_out += sizeof(dst_n_seq_id);
+
+            cell_off += seq_bytes;
+        }
+        if (cell_off != stream->meta_end) {
+            if (reject_reason) *reject_reason = IK_KV_COMPAT_REJECT_HEADER_MALFORMED;
+            return IK_KV_COMPAT_CONVERT_ERR_SRC_PARSE;
+        }
+    }
+
+    if (total_cells > 0) {
+        const uint32_t v_state = ref.v_state;
+        const uint32_t n_layer = ref.n_layer;
+
+        if (!ensure_space(sizeof(uint32_t) * 2)) {
+            return IK_KV_COMPAT_CONVERT_ERR_SIZE;
+        }
+        memcpy(dst + *written_out, &v_state, sizeof(v_state));
+        *written_out += sizeof(v_state);
+        memcpy(dst + *written_out, &n_layer, sizeof(n_layer));
+        *written_out += sizeof(n_layer);
+
+        for (uint32_t il = 0; il < n_layer; ++il) {
+            const rtx_layer_layout_t & layer = ref.layers[il];
+            if (!ensure_space(sizeof(uint32_t) + sizeof(uint64_t))) {
+                return IK_KV_COMPAT_CONVERT_ERR_SIZE;
+            }
+            const uint32_t k_type = (uint32_t) layer.k_type;
+            memcpy(dst + *written_out, &k_type, sizeof(k_type));
+            *written_out += sizeof(k_type);
+            memcpy(dst + *written_out, &layer.k_row_size, sizeof(layer.k_row_size));
+            *written_out += sizeof(layer.k_row_size);
+
+            for (const rtx_stream_extent_t * stream : active_streams) {
+                const rtx_layer_layout_t & src_layer = stream->layers[il];
+                if (!ensure_space(src_layer.k_data_size)) {
+                    return IK_KV_COMPAT_CONVERT_ERR_SIZE;
+                }
+                memcpy(dst + *written_out, src + src_layer.k_data_off, src_layer.k_data_size);
+                *written_out += src_layer.k_data_size;
+            }
+        }
+
+        if (v_state == 0) {
+            for (uint32_t il = 0; il < n_layer; ++il) {
+                const rtx_layer_layout_t & layer = ref.layers[il];
+                if (!ensure_space(sizeof(uint32_t) + sizeof(uint64_t))) {
+                    return IK_KV_COMPAT_CONVERT_ERR_SIZE;
+                }
+                const uint32_t v_type = (uint32_t) layer.v_type;
+                memcpy(dst + *written_out, &v_type, sizeof(v_type));
+                *written_out += sizeof(v_type);
+                memcpy(dst + *written_out, &layer.v_row_size, sizeof(layer.v_row_size));
+                *written_out += sizeof(layer.v_row_size);
+
+                for (const rtx_stream_extent_t * stream : active_streams) {
+                    const rtx_layer_layout_t & src_layer = stream->layers[il];
+                    if (!ensure_space(src_layer.v_data_size)) {
+                        return IK_KV_COMPAT_CONVERT_ERR_SIZE;
+                    }
+                    memcpy(dst + *written_out, src + src_layer.v_data_off, src_layer.v_data_size);
+                    *written_out += src_layer.v_data_size;
+                }
+            }
+        } else if (v_state == 1) {
+            for (uint32_t il = 0; il < n_layer; ++il) {
+                const rtx_layer_layout_t & layer = ref.layers[il];
+                if (!ensure_space(sizeof(uint32_t) + sizeof(uint32_t) + sizeof(uint32_t))) {
+                    return IK_KV_COMPAT_CONVERT_ERR_SIZE;
+                }
+                const uint32_t v_type = (uint32_t) layer.v_type;
+                memcpy(dst + *written_out, &v_type, sizeof(v_type));
+                *written_out += sizeof(v_type);
+                memcpy(dst + *written_out, &layer.v_size_el, sizeof(layer.v_size_el));
+                *written_out += sizeof(layer.v_size_el);
+                memcpy(dst + *written_out, &layer.n_embd_v_gqa, sizeof(layer.n_embd_v_gqa));
+                *written_out += sizeof(layer.n_embd_v_gqa);
+
+                for (const rtx_stream_extent_t * stream : active_streams) {
+                    const rtx_layer_layout_t & src_layer = stream->layers[il];
+                    if (!ensure_space(src_layer.v_data_size)) {
+                        return IK_KV_COMPAT_CONVERT_ERR_SIZE;
+                    }
+                    memcpy(dst + *written_out, src + src_layer.v_data_off, src_layer.v_data_size);
+                    *written_out += src_layer.v_data_size;
+                }
+            }
+        } else if (v_state != 2) {
+            if (reject_reason) *reject_reason = IK_KV_COMPAT_REJECT_HEADER_MALFORMED;
+            return IK_KV_COMPAT_CONVERT_ERR_SRC_PARSE;
+        }
+    }
+
+    if (reject_reason) *reject_reason = IK_KV_COMPAT_REJECT_NONE;
+    return IK_KV_COMPAT_CONVERT_OK;
 }
 
 struct ik_stream_layer_layout_t {

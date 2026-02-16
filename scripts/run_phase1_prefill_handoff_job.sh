@@ -11,6 +11,7 @@ DECODE_HOST=""
 DECODE_PORT=19001
 CTX_SIZE=32768
 N_PREDICT=128
+KV_STREAMS=1
 KV_STREAM_CHUNK_BYTES=$((4 * 1024 * 1024))
 KV_MAX_INFLIGHT_BYTES=$((256 * 1024 * 1024))
 PREFILL_MIN_STREAM_BATCH_TOKENS=-1
@@ -33,6 +34,7 @@ Optional:
   --n-predict N               prefill cli generation tokens (default: 128)
   --prefill-min-stream-batch-tokens N
                               prefill streaming threshold (-1 = runtime crossover)
+  --kv-streams N               transport stream count (default: 1)
   --kv-transport MODE         auto|tcp|rdma|mixed|disabled
                               default: IK_PDQ_KV_TRANSPORT env or auto
   --kv-stream-chunk-bytes N   default: 4194304
@@ -52,6 +54,7 @@ while [[ $# -gt 0 ]]; do
         --ctx-size) CTX_SIZE="$2"; shift 2 ;;
         --n-predict) N_PREDICT="$2"; shift 2 ;;
         --prefill-min-stream-batch-tokens) PREFILL_MIN_STREAM_BATCH_TOKENS="$2"; shift 2 ;;
+        --kv-streams) KV_STREAMS="$2"; shift 2 ;;
         --kv-transport) KV_TRANSPORT="$2"; shift 2 ;;
         --kv-stream-chunk-bytes) KV_STREAM_CHUNK_BYTES="$2"; shift 2 ;;
         --kv-max-inflight-bytes) KV_MAX_INFLIGHT_BYTES="$2"; shift 2 ;;
@@ -92,6 +95,11 @@ case "${KV_TRANSPORT}" in
         ;;
 esac
 
+if ! [[ "${KV_STREAMS}" =~ ^[0-9]+$ ]] || [[ "${KV_STREAMS}" -lt 1 ]]; then
+    echo "invalid --kv-streams: ${KV_STREAMS} (must be >=1)" >&2
+    exit 2
+fi
+
 PREFILL_BIN_CANDIDATES=(
     "${RTX_REPO}/prefill_llama.cpp/build_codex/bin/llama-cli"
     "${RTX_REPO}/prefill_llama.cpp/build/bin/llama-cli"
@@ -130,7 +138,7 @@ LLAMA_PREFILL_TB_ENABLE=1 \
   --kv-transport-fallback \
   --kv-host "${DECODE_HOST}" \
   --kv-port "${DECODE_PORT}" \
-  --kv-streams 1 \
+  --kv-streams "${KV_STREAMS}" \
   --kv-stream-chunk-bytes "${KV_STREAM_CHUNK_BYTES}" \
   --kv-max-inflight-bytes "${KV_MAX_INFLIGHT_BYTES}"
 EOF
@@ -141,6 +149,7 @@ cat > "${META_PATH}" <<EOF
   "ik_pdq_job_mode": "${IK_PDQ_JOB_MODE:-}",
   "ik_pdq_kv_transport": "${IK_PDQ_KV_TRANSPORT:-}",
   "resolved_kv_transport": "${KV_TRANSPORT}",
+  "kv_streams": ${KV_STREAMS},
   "decode_host": "${DECODE_HOST}",
   "decode_port": ${DECODE_PORT},
   "prefill_min_stream_batch_tokens": ${PREFILL_MIN_STREAM_BATCH_TOKENS}
@@ -168,7 +177,7 @@ LLAMA_PREFILL_TB_ENABLE=1 \
   --kv-transport-fallback \
   --kv-host "${DECODE_HOST}" \
   --kv-port "${DECODE_PORT}" \
-  --kv-streams 1 \
+  --kv-streams "${KV_STREAMS}" \
   --kv-stream-chunk-bytes "${KV_STREAM_CHUNK_BYTES}" \
   --kv-max-inflight-bytes "${KV_MAX_INFLIGHT_BYTES}" \
   >"${LOG_PATH}" 2>&1

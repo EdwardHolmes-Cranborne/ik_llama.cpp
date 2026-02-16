@@ -47,18 +47,6 @@ python3 "${QUEUE_SCRIPT}" --spool-dir "${SPOOL_DIR}" submit \
   --command "/definitely/not/a/real/command --foo" \
   --priority 0 > "${LAUNCH_FAIL_JOB_JSON}"
 
-set +e
-python3 "${QUEUE_SCRIPT}" --spool-dir "${SPOOL_DIR}" submit \
-  --mode external_command \
-  --command "/bin/echo --kv-streams 2" \
-  >/dev/null 2>&1
-GUARDRAIL_RC=$?
-set -e
-if [[ "${GUARDRAIL_RC}" -eq 0 ]]; then
-  echo "expected guardrail submit rejection for --kv-streams 2"
-  exit 1
-fi
-
 OK_JOB_ID="$(python3 - <<'PY' "${OK_JOB_JSON}"
 import json
 import sys

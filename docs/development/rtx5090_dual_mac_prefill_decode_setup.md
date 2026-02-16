@@ -129,7 +129,7 @@ cd /path/to/RTX_ACCELERATED_MAC_PREFILL_LLAMA/prefill_llama.cpp
   --kv-transport-fallback \
   --kv-host 10.40.0.20 \
   --kv-port 19001 \
-  --kv-streams 1 \
+  --kv-streams 2 \
   --kv-stream-chunk-bytes 4194304 \
   --kv-max-inflight-bytes 268435456
 ```
@@ -150,9 +150,9 @@ Use the same deployment and change only these controls:
 
 ## 7. KV import compatibility constraints (current)
 
-1. Use single-stream payloads for bridge import:
-   - Current bridge import path rejects RTX artifacts with more than one non-empty stream (`reject=N_STREAM_UNSUPPORTED`).
-   - Keep prefill sender at `--kv-streams 1` for production handoff until multi-stream import support lands.
+1. RTX payloads with multiple active KV streams are merged into a single IK sequence-state stream during bridge conversion:
+   - Bridge import no longer requires single-active-stream RTX payloads.
+   - `--kv-streams` can be tuned for transport throughput independently of bridge compatibility.
 2. For decode `--split-mode graph`, keep `--flash-attn` enabled:
    - Graph-split restore rejects transposed-V restore path.
    - If you must run without flash attention, avoid `--split-mode graph` for restore/import runs.
@@ -183,7 +183,8 @@ For deployment integration, submit `external_command` jobs that run your prefill
     --prompt-file /prompts/long_prompt.txt \
     --rtx-repo /path/to/RTX_ACCELERATED_MAC_PREFILL_LLAMA \
     --decode-host 10.40.0.20 \
-    --decode-port 19001" \
+    --decode-port 19001 \
+    --kv-streams 2" \
   --kv-transport auto
 ```
 
@@ -217,6 +218,7 @@ Submit one job:
   --decode-host 10.40.0.20 \
   --decode-port 19001 \
   --kv-transport auto \
+  --kv-streams 2 \
   --prefill-min-stream-batch-tokens -1 \
   --max-prefill-retries 1 \
   --max-handoff-retries 2

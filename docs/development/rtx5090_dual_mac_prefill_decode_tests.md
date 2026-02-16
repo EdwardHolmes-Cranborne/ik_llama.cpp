@@ -152,9 +152,9 @@ Pass criteria:
 
 ## 7. Restore compatibility guardrails
 
-1. Single-stream import constraint:
-   - run with `--kv-streams 1` on prefill sender
-   - verify no `N_STREAM_UNSUPPORTED` reject in receiver session summaries
+1. Multi-stream import support:
+   - run with `--kv-streams 1` and `--kv-streams 2` on prefill sender
+   - verify both complete without `N_STREAM_UNSUPPORTED` reject in receiver session summaries
 2. Graph split + flash-attn constraint:
    - for `--split-mode graph`, run decode with `--flash-attn`
    - if testing decode without flash-attn, switch away from graph split for import/restore runs
@@ -207,17 +207,7 @@ cd /path/to/ik_llama.cpp
 ./scripts/test_prefill_decode_job_queue.sh
 ```
 
-2. Guardrail check (must reject invalid stream count):
-
-```bash
-./scripts/prefill_decode_job_queue.py submit \
-  --mode external_command \
-  --command "/bin/echo --kv-streams 2"
-```
-
-Expected: submission fails with guardrail violation.
-
-3. Serialized worker check on real commands:
+2. Serialized worker check on real commands:
 
 - Start queue worker
 - Submit multiple jobs

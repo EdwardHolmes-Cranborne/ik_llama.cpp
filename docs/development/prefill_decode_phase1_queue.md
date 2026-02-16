@@ -2,7 +2,7 @@
 
 This queue provides a serialized prefill -> handoff -> decode workflow using external scripts only.
 
-It is intended to prevent multi-sequence handoff collisions while current bridge import is single-stream constrained.
+It is intended to prevent multi-sequence handoff collisions while keeping transport/import orchestration deterministic.
 
 For split prefill/handoff workers (prefill overlap with serialized handoff), see:
 `docs/development/prefill_decode_phase2_pipeline.md`.
@@ -116,7 +116,8 @@ Recommended real handoff wrapper:
     --prompt-file /prompts/long_prompt.txt \
     --rtx-repo /path/to/RTX_ACCELERATED_MAC_PREFILL_LLAMA \
     --decode-host 10.40.0.20 \
-    --decode-port 19001"
+    --decode-port 19001 \
+    --kv-streams 2"
 ```
 
 Built-in self-test:
@@ -133,6 +134,5 @@ Built-in self-test:
 - Worker launch exceptions are captured and persisted in `result.runner_exception`
   with `return_code=127`; jobs retry/fail cleanly instead of being left active.
 - External command mode guardrails (enabled by default):
-  - reject `--kv-streams` values other than `1`
   - reject `--split-mode graph` unless `--flash-attn` is present
   - reject `--split-mode graph` with `--no-flash-attn`

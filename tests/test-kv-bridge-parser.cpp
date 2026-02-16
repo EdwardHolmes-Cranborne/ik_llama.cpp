@@ -540,7 +540,7 @@ TEST(kvb_ut_016_rtx_multistream_single_active_supported) {
     tests_passed++;
 }
 
-TEST(kvb_ut_017_rtx_multistream_multiple_active_rejected) {
+TEST(kvb_ut_017_rtx_multistream_multiple_active_merged) {
     ik_kv_bridge_init();
 
     const std::vector<uint8_t> payload = build_rtx_payload_two_streams_two_active();
@@ -556,7 +556,7 @@ TEST(kvb_ut_017_rtx_multistream_multiple_active_rejected) {
     result = ik_kv_source_parse_prefill_seq_state(
         &header, artifact.data() + 48, payload.size(), &src, &reject);
     ASSERT_EQ(result, IK_KV_COMPAT_CONVERT_OK);
-    ASSERT_EQ(src.n_stream, 2);
+    ASSERT_EQ(src.n_stream, 1); // merged to single IK stream for planning
 
     ik_kv_dest_descriptor_t dst = {};
     dst.n_layers = src.n_layers;
@@ -569,8 +569,33 @@ TEST(kvb_ut_017_rtx_multistream_multiple_active_rejected) {
     ik_kv_compat_plan_t plan = {};
     result = ik_kv_compat_plan_build_strict_v1(&src, &dst, &plan);
     ASSERT_EQ(result, IK_KV_COMPAT_CONVERT_OK);
-    ASSERT_FALSE(plan.is_compatible);
-    ASSERT_EQ(plan.reject_reason, IK_KV_COMPAT_REJECT_N_STREAM_UNSUPPORTED);
+    ASSERT_TRUE(plan.is_compatible);
+
+    std::vector<uint8_t> out(payload.size(), 0);
+    ik_kv_convert_ctx_t cvt = {};
+    cvt.src = &src;
+    cvt.dst = &dst;
+    cvt.plan = &plan;
+    cvt.output_buf = out.data();
+    cvt.output_size = out.size();
+
+    result = ik_kv_convert_prefill_to_ik_seq_blob(&cvt);
+    ASSERT_EQ(result, IK_KV_COMPAT_CONVERT_OK);
+    ASSERT_EQ(cvt.bytes_written, (size_t) 60);
+    ASSERT_EQ(read_u32_le(out.data()), 2);      // merged cell_count
+    ASSERT_EQ(read_u32_le(out.data() + 8), 0);  // rewritten n_seq_id for cell 0
+    ASSERT_EQ(read_u32_le(out.data() + 16), 0); // rewritten n_seq_id for cell 1
+
+    // K payload is concatenated stream order: [11,22] + [11,22]
+    ASSERT_EQ(out[40], 0x11);
+    ASSERT_EQ(out[41], 0x22);
+    ASSERT_EQ(out[42], 0x11);
+    ASSERT_EQ(out[43], 0x22);
+    // V payload is concatenated stream order: [33,44] + [33,44]
+    ASSERT_EQ(out[56], 0x33);
+    ASSERT_EQ(out[57], 0x44);
+    ASSERT_EQ(out[58], 0x33);
+    ASSERT_EQ(out[59], 0x44);
 
     ik_kv_bridge_shutdown();
     tests_passed++;
@@ -1097,7 +1122,7 @@ int main(int argc, char ** argv) {
     test_kvb_ut_014_rtx_convert_to_ik_seq_blob_rewrites_meta();
     test_kvb_ut_015_rtx_vstate_unknown_does_not_force_vtrans();
     test_kvb_ut_016_rtx_multistream_single_active_supported();
-    test_kvb_ut_017_rtx_multistream_multiple_active_rejected();
+    test_kvb_ut_017_rtx_multistream_multiple_active_merged();
     test_kvb_ut_018_rtx_output_size_tracks_converted_payload();
     test_kvb_ut_019_ik_conversion_uses_plan_layer_mappings();
     test_kvb_ut_030_plan_key_deterministic();
