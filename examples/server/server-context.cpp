@@ -13,8 +13,33 @@
 #include "src/kv-bridge/ik-kv-compat.h"
 
 #include <fstream>
+#include <algorithm>
+#include <cctype>
 
 namespace {
+ik_kv_bridge_mode_t kv_bridge_mode_from_string(const std::string & mode) {
+    std::string v = mode;
+    std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) {
+        return (char) std::tolower(c);
+    });
+    if (v == "off") {
+        return IK_KV_BRIDGE_MODE_OFF;
+    }
+    if (v == "relaxed") {
+        return IK_KV_BRIDGE_MODE_RELAXED;
+    }
+    return IK_KV_BRIDGE_MODE_STRICT;
+}
+
+const char * kv_bridge_mode_name(ik_kv_bridge_mode_t mode) {
+    switch (mode) {
+        case IK_KV_BRIDGE_MODE_OFF: return "off";
+        case IK_KV_BRIDGE_MODE_RELAXED: return "relaxed";
+        case IK_KV_BRIDGE_MODE_STRICT:
+        default: return "strict";
+    }
+}
+
 bool read_file_bytes(const std::string & path, std::vector<uint8_t> & out, std::string & err) {
     std::ifstream ifs(path, std::ios::binary | std::ios::ate);
     if (!ifs.is_open()) {
@@ -82,6 +107,27 @@ server_context::~server_context() {
 
 bool server_context::load_model(const gpt_params& params_) {
     params_base = params_;
+
+    // Configure bridge policy before any import attempts.
+    ik_kv_bridge_config_t bridge_cfg = {};
+    bridge_cfg.mode = kv_bridge_mode_from_string(params_base.kv_bridge_mode);
+    bridge_cfg.plan_cache_dir = params_base.kv_bridge_plan_cache_dir.empty()
+        ? nullptr
+        : params_base.kv_bridge_plan_cache_dir.c_str();
+    bridge_cfg.allow_vtrans_convert = params_base.kv_bridge_allow_vtrans_convert;
+    bridge_cfg.dry_run = params_base.kv_bridge_dry_run;
+    bridge_cfg.no_fallback = params_base.kv_bridge_no_fallback;
+    ik_kv_bridge_init();
+    ik_kv_bridge_set_config(&bridge_cfg);
+    ik_kv_bridge_set_telemetry_enabled(params_base.kv_bridge_telemetry);
+    LOG_INFO("kv bridge policy", {
+        {"mode", kv_bridge_mode_name(bridge_cfg.mode)},
+        {"plan_cache_dir", bridge_cfg.plan_cache_dir ? bridge_cfg.plan_cache_dir : "<default>"},
+        {"allow_vtrans_convert", bridge_cfg.allow_vtrans_convert},
+        {"dry_run", bridge_cfg.dry_run},
+        {"no_fallback", bridge_cfg.no_fallback},
+        {"telemetry", params_base.kv_bridge_telemetry},
+    });
 
     llama_init_result llama_init = llama_init_from_gpt_params(params_base);
 

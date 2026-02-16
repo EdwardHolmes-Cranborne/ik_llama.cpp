@@ -456,6 +456,14 @@ struct gpt_params {
   int32_t kv_receiver_socket_send_buf = 0;
   int32_t kv_receiver_socket_recv_buf = 0;
 
+  // KV bridge import policy (decode-side artifact compatibility conversion)
+  std::string kv_bridge_mode = "strict"; // off|strict|relaxed
+  std::string kv_bridge_plan_cache_dir = "";
+  bool kv_bridge_allow_vtrans_convert = false;
+  bool kv_bridge_dry_run = false;
+  bool kv_bridge_no_fallback = false;
+  bool kv_bridge_telemetry = true;
+
   // RTX Accelerated Prefill Streaming
   bool prefill_streaming = false; // enable 2-buffer streaming prefill
   bool prefill_telemetry = true;  // emit per-layer timing info

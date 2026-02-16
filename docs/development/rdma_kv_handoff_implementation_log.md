@@ -1,5 +1,50 @@
 # RDMA + KV Handoff Implementation Log
 
+## 2026-02-15
+
+### Scope completed this cycle
+
+1. Completed decode-side KV bridge policy wiring through CLI/env and runtime:
+   - Added flags:
+     - `--kv-bridge-mode off|strict|relaxed`
+     - `--kv-bridge-plan-cache-dir PATH`
+     - `--kv-bridge-allow-vtrans-convert`
+     - `--kv-bridge-dry-run`
+     - `--kv-bridge-no-fallback`
+     - `--no-kv-bridge-telemetry`
+   - Added env equivalents (`LLAMA_ARG_KV_BRIDGE_*`).
+2. Wired bridge configuration into server startup model lifecycle (`server-context`):
+   - Sets bridge mode, cache dir, relaxed-vtrans toggle, dry-run, fallback policy, telemetry toggle.
+3. Hardened bridge import runtime behavior:
+   - Added default plan-cache directory fallback (`~/.ik_llama_kv_plan_cache`).
+   - Added telemetry emission for every bridge attempt with status/result/reject/bytes/timing/cache-hit/fallback.
+   - Added explicit fallback payload import behavior controlled by `no_fallback`.
+   - Added dry-run behavior that validates/converts without final `llama_state_seq_set_data`.
+   - Added relaxed-mode v-trans mismatch plan rebuild path behind `allow_vtrans_convert`.
+4. Expanded KV bridge tests:
+   - Extended parser suite with `KVB-UT-070`, `KVB-UT-080`, `KVB-UT-090`.
+   - Added new CLI parser test binary `test-kv-bridge-cli`.
+5. Added operator utilities and docs:
+   - `scripts/run_kv_bridge_matrix.sh`
+   - `scripts/bench_kv_bridge.sh`
+   - `build_codex/bin/kv-bridge-cli` (`src/kv-bridge/ik-kv-compat-cli.cpp`)
+   - `docs/development/kv_bridge_compatibility_profile.md`
+   - `docs/benchmarks/kv_bridge_report_template.md`
+
+### Verification completed
+
+1. Build verification:
+   - `cmake --build build_codex --target llama-server test-kv-bridge-parser test-kv-bridge-cli -j8` passes.
+2. Unit tests:
+   - `build_codex/bin/test-kv-bridge-parser` passes (`Passed: 21`, `Failed: 0`).
+   - `build_codex/bin/test-kv-bridge-cli` passes.
+3. Matrix and queue checks:
+   - `scripts/run_kv_bridge_matrix.sh --build-dir build_codex --no-queue-tests` passes.
+   - `scripts/test_prefill_decode_job_queue.sh` passes.
+   - `scripts/test_prefill_decode_phase2_pipeline.sh` passes.
+4. Help/CLI verification:
+   - `llama-server --help` includes all new `--kv-bridge*` options.
+
 ## 2026-02-13
 
 ### Scope completed this cycle

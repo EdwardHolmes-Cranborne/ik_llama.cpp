@@ -1069,6 +1069,15 @@ static struct {
 
 namespace {
 
+static const char * bridge_mode_name(ik_kv_bridge_mode_t mode) {
+    switch (mode) {
+        case IK_KV_BRIDGE_MODE_OFF: return "off";
+        case IK_KV_BRIDGE_MODE_RELAXED: return "relaxed";
+        case IK_KV_BRIDGE_MODE_STRICT:
+        default: return "strict";
+    }
+}
+
 static std::string get_plan_cache_dir() {
     if (g_kv_bridge.config.plan_cache_dir && g_kv_bridge.config.plan_cache_dir[0] != '\0') {
         return std::string(g_kv_bridge.config.plan_cache_dir);
@@ -1077,7 +1086,15 @@ static std::string get_plan_cache_dir() {
     if (env_dir && env_dir[0] != '\0') {
         return std::string(env_dir);
     }
-    return std::string();
+#if defined(_WIN32)
+    const char * home = std::getenv("USERPROFILE");
+#else
+    const char * home = std::getenv("HOME");
+#endif
+    if (home && home[0] != '\0') {
+        return (fs::path(home) / ".ik_llama_kv_plan_cache").string();
+    }
+    return std::string(".ik_llama_kv_plan_cache");
 }
 
 static fs::path plan_cache_path_for_key(const ik_kv_compat_plan_key_t & key) {
@@ -1086,6 +1103,29 @@ static fs::path plan_cache_path_for_key(const ik_kv_compat_plan_key_t & key) {
         return fs::path();
     }
     return fs::path(cache_dir) / ("plan_" + key_to_hex(key) + ".ikvc");
+}
+
+static void bridge_log_metrics(
+        const ik_kv_bridge_metrics_t & metrics,
+        ik_kv_compat_convert_result_t rc,
+        ik_kv_compat_reject_reason_t reject,
+        bool fallback_used) {
+    if (!g_kv_bridge.telemetry_enabled) {
+        return;
+    }
+    fprintf(stderr,
+            "ik-kv-bridge: mode=%s rc=%s reject=%s status=%u cache_hit=%s "
+            "bytes_in=%llu bytes_out=%llu convert_us=%llu plan_key=%016llx fallback=%s\n",
+            bridge_mode_name((ik_kv_bridge_mode_t) metrics.mode),
+            ik_kv_compat_result_str(rc),
+            ik_kv_compat_reject_str(reject),
+            (unsigned) metrics.status,
+            metrics.plan_cache_hit ? "true" : "false",
+            (unsigned long long) metrics.bytes_in,
+            (unsigned long long) metrics.bytes_out,
+            (unsigned long long) metrics.convert_us,
+            (unsigned long long) metrics.plan_key,
+            fallback_used ? "true" : "false");
 }
 
 } // namespace
@@ -1931,6 +1971,7 @@ ik_kv_compat_convert_result_t ik_kv_import_into_context(
     metrics.mode = (uint8_t) g_kv_bridge.config.mode;
     metrics.status = 2;
     metrics.bytes_in = artifact_size;
+    bool fallback_used = false;
 
     auto finalize = [&](ik_kv_compat_convert_result_t rc,
                         ik_kv_compat_reject_reason_t reject) -> ik_kv_compat_convert_result_t {
@@ -1945,14 +1986,39 @@ ik_kv_compat_convert_result_t ik_kv_import_into_context(
             metrics.status = 2;
         }
         g_kv_bridge.last_metrics = metrics;
+        bridge_log_metrics(metrics, rc, reject, fallback_used);
         if (reject_reason) {
             *reject_reason = reject;
         }
         return rc;
     };
 
+    auto try_fallback_payload_import = [&](const uint8_t * payload, size_t payload_size) -> bool {
+        if (g_kv_bridge.config.no_fallback || !payload || payload_size == 0) {
+            return false;
+        }
+        fallback_used = true;
+        metrics.bytes_out = (uint64_t) payload_size;
+        if (g_kv_bridge.config.dry_run) {
+            return true;
+        }
+        const size_t n_read = llama_state_seq_set_data(ctx, payload, payload_size, dest_seq_id);
+        return n_read == payload_size;
+    };
+
     // Check bridge mode
     if (g_kv_bridge.config.mode == IK_KV_BRIDGE_MODE_OFF) {
+        kv_artifact_view_t off_view = {};
+        ik_kv_compat_reject_reason_t off_reject = IK_KV_COMPAT_REJECT_NONE;
+        if (!parse_artifact_view(artifact_data, artifact_size, &off_view, &off_reject)) {
+            return finalize(IK_KV_COMPAT_CONVERT_ERR_SRC_PARSE, off_reject);
+        }
+        if (!ik_kv_source_validate_payload(&off_view.header, off_view.payload, off_view.payload_size)) {
+            return finalize(IK_KV_COMPAT_CONVERT_ERR_CHECKSUM, IK_KV_COMPAT_REJECT_PAYLOAD_CRC_MISMATCH);
+        }
+        if (try_fallback_payload_import(off_view.payload, off_view.payload_size)) {
+            return finalize(IK_KV_COMPAT_CONVERT_OK, IK_KV_COMPAT_REJECT_NONE);
+        }
         return finalize(IK_KV_COMPAT_CONVERT_ERR_INVALID_ARG, IK_KV_COMPAT_REJECT_NONE);
     }
 
@@ -2012,16 +2078,38 @@ ik_kv_compat_convert_result_t ik_kv_import_into_context(
         if (result != IK_KV_COMPAT_CONVERT_OK) {
             return finalize(result, IK_KV_COMPAT_REJECT_NONE);
         }
+        if (!plan.is_compatible &&
+            g_kv_bridge.config.mode == IK_KV_BRIDGE_MODE_RELAXED &&
+            g_kv_bridge.config.allow_vtrans_convert &&
+            plan.reject_reason == IK_KV_COMPAT_REJECT_VTRANS_MISMATCH) {
+            ik_kv_source_descriptor_t src_relaxed = src_desc;
+            src_relaxed.v_trans = dst_desc.v_trans;
+            ik_kv_compat_plan_t relaxed_plan = {};
+            const ik_kv_compat_convert_result_t relaxed_rc =
+                ik_kv_compat_plan_build_strict_v1(&src_relaxed, &dst_desc, &relaxed_plan);
+            if (relaxed_rc == IK_KV_COMPAT_CONVERT_OK && relaxed_plan.is_compatible) {
+                plan = relaxed_plan;
+                for (uint32_t il = 0; il < std::min<uint32_t>(plan.n_layers, IK_KV_MAX_LAYERS); ++il) {
+                    plan.layer_mappings[il].needs_v_trans = 1;
+                }
+            }
+        }
         (void) ik_kv_plan_cache_store(&plan_key, &plan);
     }
 
     if (!plan.is_compatible) {
+        if (try_fallback_payload_import(src_desc.payload, (size_t) src_desc.payload_size)) {
+            return finalize(IK_KV_COMPAT_CONVERT_OK, IK_KV_COMPAT_REJECT_NONE);
+        }
         return finalize(IK_KV_COMPAT_CONVERT_ERR_DST_MISMATCH, plan.reject_reason);
     }
 
     // Convert source payload to destination sequence-state blob.
     const size_t converted_size = ik_kv_convert_get_output_size(&src_desc, &dst_desc);
     if (converted_size == 0) {
+        if (try_fallback_payload_import(src_desc.payload, (size_t) src_desc.payload_size)) {
+            return finalize(IK_KV_COMPAT_CONVERT_OK, IK_KV_COMPAT_REJECT_NONE);
+        }
         return finalize(IK_KV_COMPAT_CONVERT_ERR_SIZE, IK_KV_COMPAT_REJECT_INCOMPATIBLE_PROFILE);
     }
     std::vector<uint8_t> converted(converted_size);
@@ -2034,13 +2122,23 @@ ik_kv_compat_convert_result_t ik_kv_import_into_context(
 
     result = ik_kv_convert_prefill_to_ik_seq_blob(&cvt);
     if (result != IK_KV_COMPAT_CONVERT_OK) {
+        if (try_fallback_payload_import(src_desc.payload, (size_t) src_desc.payload_size)) {
+            return finalize(IK_KV_COMPAT_CONVERT_OK, IK_KV_COMPAT_REJECT_NONE);
+        }
         return finalize(result, cvt.reject);
     }
     metrics.bytes_out = (uint64_t) cvt.bytes_written;
 
+    if (g_kv_bridge.config.dry_run) {
+        return finalize(IK_KV_COMPAT_CONVERT_OK, IK_KV_COMPAT_REJECT_NONE);
+    }
+
     // Import converted state into destination sequence.
     const size_t n_read = llama_state_seq_set_data(ctx, converted.data(), cvt.bytes_written, dest_seq_id);
     if (n_read != cvt.bytes_written) {
+        if (try_fallback_payload_import(src_desc.payload, (size_t) src_desc.payload_size)) {
+            return finalize(IK_KV_COMPAT_CONVERT_OK, IK_KV_COMPAT_REJECT_NONE);
+        }
         return finalize(IK_KV_COMPAT_CONVERT_ERR_CONVERT, IK_KV_COMPAT_REJECT_INCOMPATIBLE_PROFILE);
     }
 
@@ -2225,6 +2323,20 @@ ik_kv_compat_convert_result_t ik_kv_bridge_validate_only(
     if (result != IK_KV_COMPAT_CONVERT_OK) {
         if (reject_reason) *reject_reason = IK_KV_COMPAT_REJECT_NONE;
         return result;
+    }
+
+    if (!plan.is_compatible &&
+        g_kv_bridge.config.mode == IK_KV_BRIDGE_MODE_RELAXED &&
+        g_kv_bridge.config.allow_vtrans_convert &&
+        plan.reject_reason == IK_KV_COMPAT_REJECT_VTRANS_MISMATCH) {
+        ik_kv_source_descriptor_t src_relaxed = src_desc;
+        src_relaxed.v_trans = dst_desc.v_trans;
+        ik_kv_compat_plan_t relaxed_plan = {};
+        const ik_kv_compat_convert_result_t relaxed_rc =
+            ik_kv_compat_plan_build_strict_v1(&src_relaxed, &dst_desc, &relaxed_plan);
+        if (relaxed_rc == IK_KV_COMPAT_CONVERT_OK && relaxed_plan.is_compatible) {
+            plan = relaxed_plan;
+        }
     }
     
     if (!plan.is_compatible) {

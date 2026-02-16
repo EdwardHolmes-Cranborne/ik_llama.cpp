@@ -1005,6 +1005,79 @@ TEST(kvb_ut_052_plan_cache_rejects_corrupted_file) {
     tests_passed++;
 }
 
+TEST(kvb_ut_070_bridge_config_roundtrip) {
+    ik_kv_bridge_init();
+
+    ik_kv_bridge_config_t cfg = {};
+    cfg.mode = IK_KV_BRIDGE_MODE_RELAXED;
+    cfg.plan_cache_dir = "/tmp/ik_kv_bridge_cfg_roundtrip";
+    cfg.allow_vtrans_convert = true;
+    cfg.dry_run = true;
+    cfg.no_fallback = true;
+    ik_kv_bridge_set_config(&cfg);
+
+    ik_kv_bridge_config_t out = {};
+    ik_kv_bridge_get_config(&out);
+    ASSERT_EQ(out.mode, IK_KV_BRIDGE_MODE_RELAXED);
+    ASSERT_TRUE(out.plan_cache_dir != nullptr);
+    ASSERT_STR_EQ(out.plan_cache_dir, "/tmp/ik_kv_bridge_cfg_roundtrip");
+    ASSERT_TRUE(out.allow_vtrans_convert);
+    ASSERT_TRUE(out.dry_run);
+    ASSERT_TRUE(out.no_fallback);
+
+    ik_kv_bridge_shutdown();
+    tests_passed++;
+}
+
+TEST(kvb_ut_080_bridge_metrics_reset_zeroes_state) {
+    ik_kv_bridge_init();
+
+    ik_kv_bridge_reset_metrics();
+    ik_kv_bridge_metrics_t metrics = {};
+    ik_kv_bridge_get_last_metrics(&metrics);
+
+    ASSERT_EQ(metrics.plan_key, 0);
+    ASSERT_EQ(metrics.plan_cache_hit, false);
+    ASSERT_EQ(metrics.convert_us, 0);
+    ASSERT_EQ(metrics.bytes_in, 0);
+    ASSERT_EQ(metrics.bytes_out, 0);
+    ASSERT_EQ(metrics.mode, 0);
+    ASSERT_EQ(metrics.status, 0);
+    ASSERT_EQ(metrics.reject_reason, 0);
+
+    ik_kv_bridge_shutdown();
+    tests_passed++;
+}
+
+TEST(kvb_ut_090_relaxed_vtrans_plan_rebuild_accepts_profile) {
+    ik_kv_bridge_init();
+
+    ik_kv_source_descriptor_t src;
+    ik_kv_dest_descriptor_t dst;
+    build_compatible_src_dst(src, dst);
+
+    src.v_trans = 1;
+    dst.v_trans = 0;
+
+    ik_kv_compat_plan_t strict_plan = {};
+    ik_kv_compat_convert_result_t result =
+        ik_kv_compat_plan_build_strict_v1(&src, &dst, &strict_plan);
+    ASSERT_EQ(result, IK_KV_COMPAT_CONVERT_OK);
+    ASSERT_FALSE(strict_plan.is_compatible);
+    ASSERT_EQ(strict_plan.reject_reason, IK_KV_COMPAT_REJECT_VTRANS_MISMATCH);
+
+    ik_kv_source_descriptor_t src_relaxed = src;
+    src_relaxed.v_trans = dst.v_trans;
+    ik_kv_compat_plan_t relaxed_plan = {};
+    result = ik_kv_compat_plan_build_strict_v1(&src_relaxed, &dst, &relaxed_plan);
+    ASSERT_EQ(result, IK_KV_COMPAT_CONVERT_OK);
+    ASSERT_TRUE(relaxed_plan.is_compatible);
+    ASSERT_EQ(relaxed_plan.reject_reason, IK_KV_COMPAT_REJECT_NONE);
+
+    ik_kv_bridge_shutdown();
+    tests_passed++;
+}
+
 //
 // Main test runner
 //
@@ -1034,6 +1107,9 @@ int main(int argc, char ** argv) {
     test_kvb_ut_050_plan_cache_load_store_hit_path();
     test_kvb_ut_051_plan_cache_invalidate();
     test_kvb_ut_052_plan_cache_rejects_corrupted_file();
+    test_kvb_ut_070_bridge_config_roundtrip();
+    test_kvb_ut_080_bridge_metrics_reset_zeroes_state();
+    test_kvb_ut_090_relaxed_vtrans_plan_rebuild_accepts_profile();
     
     printf("\n=== Results ===\n");
     printf("Passed: %d\n", tests_passed);

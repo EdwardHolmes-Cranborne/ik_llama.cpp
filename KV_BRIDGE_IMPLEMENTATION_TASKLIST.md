@@ -38,7 +38,7 @@ Non-goal:
 
 ### KVB-001 (P0) Create KV bridge module skeleton
 
-- Status: `todo`
+- Status: `done`
 - Files:
   - `src/kv-bridge/ik-kv-compat.h`
   - `src/kv-bridge/ik-kv-compat.cpp`
@@ -62,7 +62,7 @@ Non-goal:
 
 ### KVB-002 (P0) Add KVA parser and source schema reader
 
-- Status: `todo`
+- Status: `done`
 - Files:
   - `src/kv-bridge/ik-kv-source-prefill.h`
   - `src/kv-bridge/ik-kv-source-prefill.cpp`
@@ -83,7 +83,7 @@ Non-goal:
 
 ### KVB-003 (P0) Add destination schema introspection for ik context
 
-- Status: `todo`
+- Status: `done`
 - Files:
   - `src/kv-bridge/ik-kv-dest-ik.h`
   - `src/kv-bridge/ik-kv-dest-ik.cpp`
@@ -104,7 +104,7 @@ Non-goal:
 
 ### KVB-004 (P0) Implement compatibility plan key + fingerprinting
 
-- Status: `todo`
+- Status: `done`
 - Files:
   - `src/kv-bridge/ik-kv-compat-plan.h`
   - `src/kv-bridge/ik-kv-compat-plan.cpp`
@@ -124,7 +124,7 @@ Non-goal:
 
 ### KVB-005 (P0) Implement strict v1 plan builder
 
-- Status: `todo`
+- Status: `done`
 - Files:
   - `src/kv-bridge/ik-kv-compat-plan.cpp`
 - Functions/interfaces:
@@ -147,7 +147,7 @@ Non-goal:
 
 ### KVB-006 (P1) Implement on-disk plan cache
 
-- Status: `todo`
+- Status: `done`
 - Files:
   - `src/kv-bridge/ik-kv-compat-plan-cache.h`
   - `src/kv-bridge/ik-kv-compat-plan-cache.cpp`
@@ -168,7 +168,7 @@ Non-goal:
 
 ### KVB-007 (P0) Implement converter runtime (copy/pack/scatter only)
 
-- Status: `todo`
+- Status: `done`
 - Files:
   - `src/kv-bridge/ik-kv-convert.h`
   - `src/kv-bridge/ik-kv-convert.cpp`
@@ -187,7 +187,7 @@ Non-goal:
 
 ### KVB-008 (P0) Wire decode import hook
 
-- Status: `todo`
+- Status: `done`
 - Files:
   - `src/llama.cpp` (or decode orchestration entrypoint used for remote handoff)
   - `src/kv-bridge/ik-kv-compat.cpp`
@@ -207,7 +207,7 @@ Non-goal:
 
 ### KVB-009 (P1) Add CLI/config controls
 
-- Status: `todo`
+- Status: `done`
 - Files:
   - `common/common.h`
   - `common/common.cpp`
@@ -230,7 +230,7 @@ Non-goal:
 
 ### KVB-010 (P1) Add telemetry and diagnostics
 
-- Status: `todo`
+- Status: `done`
 - Files:
   - `src/kv-bridge/ik-kv-telemetry.h`
   - `src/kv-bridge/ik-kv-telemetry.cpp`
@@ -257,7 +257,7 @@ Non-goal:
 
 ### KVB-011 (P2) Optional relaxed conversion: V-transpose conversion
 
-- Status: `todo`
+- Status: `in_progress`
 - Files:
   - `src/kv-bridge/ik-kv-convert.cpp`
   - `src/kv-bridge/ik-kv-compat-plan.cpp`
@@ -276,7 +276,7 @@ Non-goal:
 
 ### KVB-012 (P1) Add debug inspection utility
 
-- Status: `todo`
+- Status: `done`
 - Files:
   - `src/kv-bridge/ik-kv-compat-cli.cpp`
 - Commands:
@@ -296,7 +296,7 @@ Non-goal:
 
 ### KVB-013 (P0) Add unit tests and register in CMake
 
-- Status: `todo`
+- Status: `in_progress`
 - Files:
   - `tests/test-kv-bridge-parser.cpp`
   - `tests/test-kv-bridge-plan.cpp`
@@ -316,7 +316,7 @@ Non-goal:
 
 ### KVB-014 (P0) Add integration + parity test pipeline
 
-- Status: `todo`
+- Status: `in_progress`
 - Files:
   - `tests/test-kv-bridge-integration.cpp`
   - `scripts/run_kv_bridge_matrix.sh`
@@ -333,7 +333,7 @@ Non-goal:
 
 ### KVB-015 (P1) Add soak and performance characterization
 
-- Status: `todo`
+- Status: `in_progress`
 - Files:
   - `scripts/bench_kv_bridge.sh`
   - `docs/benchmarks/kv_bridge_report_template.md`
@@ -410,4 +410,3 @@ All of the following:
   - compatibility profile document
   - benchmark report (includes conversion overhead and parity results)
   - failure-mode table with reject reasons and operator guidance
-

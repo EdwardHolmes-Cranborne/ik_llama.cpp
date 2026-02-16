@@ -154,3 +154,15 @@ target_link_libraries(test-kv-bridge-parser PRIVATE llama)
 target_include_directories(test-kv-bridge-parser PRIVATE ${CMAKE_SOURCE_DIR}/src)
 add_test(NAME test-kv-bridge-parser COMMAND test-kv-bridge-parser)
 set_property(TEST test-kv-bridge-parser PROPERTY LABELS "kv-bridge")
+
+# kv-bridge-cli utility - artifact inspection/plan validation helper
+add_executable(kv-bridge-cli ${CMAKE_SOURCE_DIR}/src/kv-bridge/ik-kv-compat-cli.cpp)
+target_link_libraries(kv-bridge-cli PRIVATE llama)
+target_include_directories(kv-bridge-cli PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+# test-kv-bridge-cli - Tests KVB-UT-070 (bridge CLI/config parsing)
+add_executable(test-kv-bridge-cli test-kv-bridge-cli.cpp)
+target_link_libraries(test-kv-bridge-cli PRIVATE common llama)
+target_include_directories(test-kv-bridge-cli PRIVATE ${CMAKE_SOURCE_DIR}/common)
+add_test(NAME test-kv-bridge-cli COMMAND test-kv-bridge-cli)
+set_property(TEST test-kv-bridge-cli PROPERTY LABELS "kv-bridge")

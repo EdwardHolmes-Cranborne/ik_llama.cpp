@@ -522,6 +522,14 @@ void gpt_params_parse_from_env(gpt_params &params) {
           params.kv_receiver_socket_send_buf);
   get_env("LLAMA_ARG_KV_RECV_SOCKET_RECV_BUF",
           params.kv_receiver_socket_recv_buf);
+  get_env("LLAMA_ARG_KV_BRIDGE_MODE", params.kv_bridge_mode);
+  get_env("LLAMA_ARG_KV_BRIDGE_PLAN_CACHE_DIR",
+          params.kv_bridge_plan_cache_dir);
+  get_env("LLAMA_ARG_KV_BRIDGE_ALLOW_VTRANS_CONVERT",
+          params.kv_bridge_allow_vtrans_convert);
+  get_env("LLAMA_ARG_KV_BRIDGE_DRY_RUN", params.kv_bridge_dry_run);
+  get_env("LLAMA_ARG_KV_BRIDGE_NO_FALLBACK", params.kv_bridge_no_fallback);
+  get_env("LLAMA_ARG_KV_BRIDGE_TELEMETRY", params.kv_bridge_telemetry);
 }
 
 bool gpt_params_parse(int argc, char **argv, gpt_params &params) {
@@ -2029,6 +2037,36 @@ bool gpt_params_find_arg(int argc, char **argv, const std::string &arg,
     params.kv_receiver_socket_recv_buf = std::stoi(argv[i]);
     return true;
   }
+  if (arg == "--kv-bridge-mode") {
+    CHECK_ARG
+    params.kv_bridge_mode = string_lower(std::string(argv[i]));
+    if (params.kv_bridge_mode != "off" && params.kv_bridge_mode != "strict" &&
+        params.kv_bridge_mode != "relaxed") {
+      invalid_param = true;
+    }
+    return true;
+  }
+  if (arg == "--kv-bridge-plan-cache-dir") {
+    CHECK_ARG
+    params.kv_bridge_plan_cache_dir = argv[i];
+    return true;
+  }
+  if (arg == "--kv-bridge-allow-vtrans-convert") {
+    params.kv_bridge_allow_vtrans_convert = true;
+    return true;
+  }
+  if (arg == "--kv-bridge-dry-run") {
+    params.kv_bridge_dry_run = true;
+    return true;
+  }
+  if (arg == "--kv-bridge-no-fallback") {
+    params.kv_bridge_no_fallback = true;
+    return true;
+  }
+  if (arg == "--no-kv-bridge-telemetry") {
+    params.kv_bridge_telemetry = false;
+    return true;
+  }
   if (arg == "--reasoning-tokens") {
     CHECK_ARG
     params.think_tokens = thinking_tokens_from_string(std::string(argv[i]));
@@ -3155,6 +3193,26 @@ void gpt_params_print_usage(int /*argc*/, char **argv,
                      "socket SO_SNDBUF for KV receiver (0 = system default)"});
   options.push_back({"server", "       --kv-recv-socket-recv-buf N",
                      "socket SO_RCVBUF for KV receiver (0 = system default)"});
+  options.push_back({"server", "       --kv-bridge-mode MODE",
+                     "KV bridge policy mode for artifact import: "
+                     "off|strict|relaxed (default: strict)"});
+  options.push_back({"server", "       --kv-bridge-plan-cache-dir PATH",
+                     "KV bridge plan-cache directory "
+                     "(default: ~/.ik_llama_kv_plan_cache)"});
+  options.push_back(
+      {"server", "       --kv-bridge-allow-vtrans-convert",
+       "in relaxed mode, allow V-transpose conversion path (default: "
+       "disabled)"});
+  options.push_back(
+      {"server", "       --kv-bridge-dry-run",
+       "validate and convert KV artifacts but skip final context import "
+       "(default: disabled)"});
+  options.push_back({"server", "       --kv-bridge-no-fallback",
+                     "fail closed if bridge conversion/import fails "
+                     "(default: disabled)"});
+  options.push_back({"server", "       --no-kv-bridge-telemetry",
+                     "disable KV bridge telemetry logs/metrics updates "
+                     "(default: telemetry enabled)"});
   options.push_back({"server", "       --chat-template JINJA_TEMPLATE",
                      "set custom jinja chat template (default: template taken "
                      "from model's metadata)\n"
