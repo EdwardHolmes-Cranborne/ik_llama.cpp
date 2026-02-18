@@ -35,7 +35,8 @@
 
 namespace fs = std::filesystem;
 
-static constexpr size_t MAX_CHUNK_SIZE = 1024ull * 1024ull * 1024ull; // 1 GiB
+// Keep socket I/O chunk sizes moderate to avoid platform-specific large send/recv issues.
+static constexpr size_t MAX_CHUNK_SIZE = 64ull * 1024ull * 1024ull; // 64 MiB
 
 #define UNUSED GGML_UNUSED
 
@@ -420,8 +421,13 @@ static bool send_data(sockfd_t sockfd, const void* data, size_t size) {
         size_t size_to_send = std::min(size - bytes_sent, MAX_CHUNK_SIZE);
         ssize_t n = send(sockfd, (const char*)data + bytes_sent, size_to_send, 0);
         if (n < 0) {
-            fprintf(stderr,"send failed (bytes_sent=%zu, size_to_send=%zu)\n",
-                bytes_sent, size_to_send);
+            fprintf(stderr,
+                "send failed (bytes_sent=%zu, size_to_send=%zu, errno=%d %s)\n",
+                bytes_sent, size_to_send, errno, strerror(errno));
+            return false;
+        }
+        if (n == 0) {
+            fprintf(stderr, "send returned 0 (bytes_sent=%zu, size_to_send=%zu)\n", bytes_sent, size_to_send);
             return false;
         }
         bytes_sent += (size_t)n;
@@ -435,8 +441,9 @@ static bool recv_data(sockfd_t sockfd, void* data, size_t size) {
         size_t size_to_recv = std::min(size - bytes_recv, MAX_CHUNK_SIZE);
         ssize_t n = recv(sockfd, (char*)data + bytes_recv, size_to_recv, 0);
         if (n < 0) {
-            fprintf(stderr, "recv failed (bytes_recv=%zu, size_to_recv=%zu)\n",
-                bytes_recv, size_to_recv);
+            fprintf(stderr,
+                "recv failed (bytes_recv=%zu, size_to_recv=%zu, errno=%d %s)\n",
+                bytes_recv, size_to_recv, errno, strerror(errno));
             return false;
         }
         if (n == 0) {
@@ -445,6 +452,49 @@ static bool recv_data(sockfd_t sockfd, void* data, size_t size) {
         }
         bytes_recv += (size_t)n;
     }
+    return true;
+}
+
+static bool send_set_tensor_stream(
+        const std::shared_ptr<socket_t> & sock,
+        const rpc_tensor & tensor,
+        uint64_t offset,
+        const void * data,
+        size_t size) {
+    if (sock == nullptr) {
+        return false;
+    }
+
+    // Server-side expects: | cmd (1B) | msg_size (8B) | rpc_tensor | offset (8B) | data... |
+    // and then streams the data in chunks.
+    std::lock_guard<std::mutex> lock(sock->io_mutex);
+
+    const uint8_t cmd_byte = RPC_CMD_SET_TENSOR;
+    if (!send_data(sock->fd, &cmd_byte, sizeof(cmd_byte))) {
+        return false;
+    }
+
+    const uint64_t msg_size = (uint64_t) sizeof(rpc_tensor) + (uint64_t) sizeof(uint64_t) + (uint64_t) size;
+    if (!send_data(sock->fd, &msg_size, sizeof(msg_size))) {
+        return false;
+    }
+    if (!send_data(sock->fd, &tensor, sizeof(tensor))) {
+        return false;
+    }
+    if (!send_data(sock->fd, &offset, sizeof(offset))) {
+        return false;
+    }
+
+    static constexpr size_t k_data_chunk = 16 * 1024 * 1024; // 16 MiB
+    size_t bytes_sent = 0;
+    while (bytes_sent < size) {
+        const size_t chunk_size = std::min(k_data_chunk, size - bytes_sent);
+        if (!send_data(sock->fd, (const uint8_t *) data + bytes_sent, chunk_size)) {
+            return false;
+        }
+        bytes_sent += chunk_size;
+    }
+
     return true;
 }
 
@@ -700,13 +750,10 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
             return;
         }
     }
-    // input serialization format: | rpc_tensor | offset (8 bytes) | data (size bytes)
-    size_t input_size = sizeof(rpc_tensor) + sizeof(uint64_t) + size;
-    std::vector<uint8_t> input(input_size, 0);
-    memcpy(input.data(), &rpc_tensor, sizeof(rpc_tensor));
-    memcpy(input.data() + sizeof(rpc_tensor), &offset, sizeof(offset));
-    memcpy(input.data() + sizeof(rpc_tensor) + sizeof(offset), data, size);
-    bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR, input.data(), input.size());
+
+    // Stream large SET_TENSOR payloads directly to avoid allocating a single
+    // multi-GiB buffer on the client.
+    bool status = send_set_tensor_stream(ctx->sock, rpc_tensor, offset, data, size);
     RPC_STATUS_ASSERT(status);
 }
 
