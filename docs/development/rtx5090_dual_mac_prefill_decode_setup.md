@@ -96,7 +96,7 @@ mkdir -p /tmp/ik_slots /tmp/ik_kv_handoff
   -m /models/your-model.gguf \
   --host 0.0.0.0 --port 8080 \
   -c 32768 \
-  --flash-attn \
+  --flash-attn on \
   -ngl 999 \
   --split-mode graph \
   --max-gpu 2 \

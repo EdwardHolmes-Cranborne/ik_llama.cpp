@@ -179,7 +179,7 @@ Pass criteria:
    - run with `--kv-streams 1` and `--kv-streams 2` on prefill sender
    - verify both complete without `N_STREAM_UNSUPPORTED` reject in receiver session summaries
 2. Graph split + flash-attn constraint:
-   - for `--split-mode graph`, run decode with `--flash-attn`
+   - for `--split-mode graph`, run decode with `--flash-attn on` (or `-fa on`)
    - if testing decode without flash-attn, switch away from graph split for import/restore runs
    - verify decode logs do not contain `Transposed V cache is not sypported with split mode 'graph'`
 

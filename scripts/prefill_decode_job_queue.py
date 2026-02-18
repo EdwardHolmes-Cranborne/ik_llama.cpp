@@ -198,14 +198,27 @@ def has_flag(argv: List[str], flag: str) -> bool:
     return False
 
 
+def flash_attn_explicitly_disabled(argv: List[str]) -> bool:
+    if has_flag(argv, "--no-flash-attn") or has_flag(argv, "-no-fa"):
+        return True
+    for flag in ("--flash-attn", "-fa"):
+        value = parse_flag_value(argv, flag)
+        if value is None:
+            continue
+        v = value.strip().lower()
+        if v in ("0", "off", "false", "no"):
+            return True
+    return False
+
+
 def validate_external_command_guardrails(command_text: str) -> None:
     argv = shlex.split(command_text)
     split_mode = parse_flag_value(argv, "--split-mode")
     if split_mode == "graph":
-        if has_flag(argv, "--no-flash-attn"):
-            raise SystemExit("guardrail violation: --split-mode graph with --no-flash-attn is not supported for restore/import")
-        if not has_flag(argv, "--flash-attn"):
-            raise SystemExit("guardrail violation: --split-mode graph requires --flash-attn")
+        if flash_attn_explicitly_disabled(argv):
+            raise SystemExit(
+                "guardrail violation: --split-mode graph with flash attention disabled "
+                "is not supported for restore/import")
 
 
 def update_state(spool: Path, job: Dict[str, Any], state: str, message: str, patch: Optional[Dict[str, Any]] = None) -> None:

@@ -134,5 +134,5 @@ Built-in self-test:
 - Worker launch exceptions are captured and persisted in `result.runner_exception`
   with `return_code=127`; jobs retry/fail cleanly instead of being left active.
 - External command mode guardrails (enabled by default):
-  - reject `--split-mode graph` unless `--flash-attn` is present
-  - reject `--split-mode graph` with `--no-flash-attn`
+  - reject `--split-mode graph` when flash attention is explicitly disabled
+    (`--no-flash-attn`, `-no-fa`, `--flash-attn off`, `-fa 0`, etc.)
