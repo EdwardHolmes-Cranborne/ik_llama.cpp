@@ -24,6 +24,18 @@ GGML_API GGML_CALL void ggml_backend_rpc_get_device_memory(const char * endpoint
 
 GGML_API GGML_CALL void ggml_backend_rpc_start_server(const char * endpoint, const char* cache_dir, size_t device, ggml_backend_t * devices, size_t* free_mem, size_t* total_mem);
 
+// Extended server startup with socket tuning (pass NULL config for defaults).
+struct ggml_rpc_server_config {
+    int socket_send_buf;  // SO_SNDBUF in bytes, 0 = system default
+    int socket_recv_buf;  // SO_RCVBUF in bytes, 0 = system default
+};
+
+GGML_API GGML_CALL void ggml_backend_rpc_start_server_ex(
+    const char * endpoint, const char * cache_dir,
+    size_t n_devices, ggml_backend_t * devices,
+    size_t * free_mem, size_t * total_mem,
+    const struct ggml_rpc_server_config * config);
+
 #ifdef  __cplusplus
 }
 #endif

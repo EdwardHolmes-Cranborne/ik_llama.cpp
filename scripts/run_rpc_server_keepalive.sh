@@ -9,6 +9,10 @@ PORT=50052
 DEVICE=""
 RESTART_DELAY_SEC=2
 LOG_PATH="/tmp/ik_rpc_server_keepalive.log"
+RDMA=0
+BIND_ADDR=""
+SOCKET_SEND_BUF=""
+SOCKET_RECV_BUF=""
 
 usage() {
     cat <<'USAGE'
@@ -20,6 +24,10 @@ Optional:
   --device NAME             backend device id (default: rpc-server default backend)
   --restart-delay-sec N     delay before restart after exit (default: 2)
   --log PATH                log file path (default: /tmp/ik_rpc_server_keepalive.log)
+  --rdma                    auto-detect Thunderbolt interfaces (macOS)
+  --bind-addr ADDR          explicit bind address (overrides --host)
+  --socket-send-buf N       SO_SNDBUF in bytes (0 = system default)
+  --socket-recv-buf N       SO_RCVBUF in bytes (0 = system default)
   -h, --help
 USAGE
 }
@@ -31,6 +39,10 @@ while [[ $# -gt 0 ]]; do
         --device) DEVICE="$2"; shift 2 ;;
         --restart-delay-sec) RESTART_DELAY_SEC="$2"; shift 2 ;;
         --log) LOG_PATH="$2"; shift 2 ;;
+        --rdma) RDMA=1; shift 1 ;;
+        --bind-addr) BIND_ADDR="$2"; shift 2 ;;
+        --socket-send-buf) SOCKET_SEND_BUF="$2"; shift 2 ;;
+        --socket-recv-buf) SOCKET_RECV_BUF="$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *)
             echo "unknown argument: $1" >&2
@@ -63,17 +75,31 @@ if [[ -z "${RPC_BIN}" ]]; then
     exit 2
 fi
 
+# Build the argument list.
+RPC_ARGS=(--host "${HOST}" --port "${PORT}")
+if [[ -n "${DEVICE}" ]]; then
+    RPC_ARGS+=(--device "${DEVICE}")
+fi
+if [[ "${RDMA}" == "1" ]]; then
+    RPC_ARGS+=(--rdma)
+fi
+if [[ -n "${BIND_ADDR}" ]]; then
+    RPC_ARGS+=(--bind-addr "${BIND_ADDR}")
+fi
+if [[ -n "${SOCKET_SEND_BUF}" ]]; then
+    RPC_ARGS+=(--socket-send-buf "${SOCKET_SEND_BUF}")
+fi
+if [[ -n "${SOCKET_RECV_BUF}" ]]; then
+    RPC_ARGS+=(--socket-recv-buf "${SOCKET_RECV_BUF}")
+fi
+
 device_label="${DEVICE:-<default>}"
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] keepalive start host=${HOST} port=${PORT} device=${device_label}" | tee -a "${LOG_PATH}"
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] keepalive start host=${HOST} port=${PORT} device=${device_label} rdma=${RDMA}" | tee -a "${LOG_PATH}"
 
 while true; do
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] launching rpc-server" | tee -a "${LOG_PATH}"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] launching rpc-server ${RPC_ARGS[*]}" | tee -a "${LOG_PATH}"
     set +e
-    if [[ -n "${DEVICE}" ]]; then
-        "${RPC_BIN}" --host "${HOST}" --port "${PORT}" --device "${DEVICE}" >>"${LOG_PATH}" 2>&1
-    else
-        "${RPC_BIN}" --host "${HOST}" --port "${PORT}" >>"${LOG_PATH}" 2>&1
-    fi
+    "${RPC_BIN}" "${RPC_ARGS[@]}" >>"${LOG_PATH}" 2>&1
     rc=$?
     set -e
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] rpc-server exited rc=${rc}" | tee -a "${LOG_PATH}"

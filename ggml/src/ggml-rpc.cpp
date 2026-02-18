@@ -375,7 +375,7 @@ static std::shared_ptr<socket_t> socket_connect(const char * host, int port) {
     return sock_ptr;
 }
 
-static std::shared_ptr<socket_t> socket_accept(sockfd_t srv_sockfd) {
+static std::shared_ptr<socket_t> socket_accept(sockfd_t srv_sockfd, int send_buf = 0, int recv_buf = 0) {
     auto client_socket_fd = accept(srv_sockfd, NULL, NULL);
     auto client_socket = make_socket(client_socket_fd);
     if (client_socket == nullptr) {
@@ -389,10 +389,16 @@ static std::shared_ptr<socket_t> socket_accept(sockfd_t srv_sockfd) {
         fprintf(stderr, "Failed to set socket timeouts\n");
         return nullptr;
     }
+    if (send_buf > 0) {
+        (void) setsockopt(client_socket_fd, SOL_SOCKET, SO_SNDBUF, (const char *)&send_buf, sizeof(send_buf));
+    }
+    if (recv_buf > 0) {
+        (void) setsockopt(client_socket_fd, SOL_SOCKET, SO_RCVBUF, (const char *)&recv_buf, sizeof(recv_buf));
+    }
     return client_socket;
 }
 
-static std::shared_ptr<socket_t> create_server_socket(const char * host, int port) {
+static std::shared_ptr<socket_t> create_server_socket(const char * host, int port, int send_buf = 0, int recv_buf = 0) {
     auto sockfd = socket(AF_INET, SOCK_STREAM, 0);
     auto sock = make_socket(sockfd);
     if (sock == nullptr) {
@@ -401,6 +407,12 @@ static std::shared_ptr<socket_t> create_server_socket(const char * host, int por
     if (!set_reuse_addr(sockfd)) {
         fprintf(stderr, "Failed to set SO_REUSEADDR\n");
         return nullptr;
+    }
+    if (send_buf > 0) {
+        (void) setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, (const char *)&send_buf, sizeof(send_buf));
+    }
+    if (recv_buf > 0) {
+        (void) setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, (const char *)&recv_buf, sizeof(recv_buf));
     }
     if (inet_addr(host) == INADDR_NONE) {
         fprintf(stderr, "Invalid host address: %s\n", host);
@@ -2142,15 +2154,20 @@ static void rpc_serve_client(const std::vector<ggml_backend_t>& backends, const 
 }
 
 
-GGML_API GGML_CALL void ggml_backend_rpc_start_server(const char* endpoint,
+GGML_API GGML_CALL void ggml_backend_rpc_start_server_ex(const char* endpoint,
     const char* cache_dir,
     size_t n_devices, ggml_backend_t * devices,
-    size_t * free_mem, size_t * total_mem) {
+    size_t * free_mem, size_t * total_mem,
+    const struct ggml_rpc_server_config * config) {
 
     if (n_devices == 0 || devices == nullptr || free_mem == nullptr || total_mem == nullptr) {
         fprintf(stderr, "Invalid arguments to ggml_backend_rpc_start_server\n");
         return;
     }
+
+    const int send_buf = config ? config->socket_send_buf : 0;
+    const int recv_buf = config ? config->socket_recv_buf : 0;
+
     std::vector<ggml_backend_t> backends;
     std::vector<size_t> free_mem_vec(free_mem, free_mem + n_devices);
     std::vector<size_t> total_mem_vec(total_mem, total_mem + n_devices);
@@ -2159,6 +2176,9 @@ GGML_API GGML_CALL void ggml_backend_rpc_start_server(const char* endpoint,
         RPC_PROTO_MINOR_VERSION,
         RPC_PROTO_PATCH_VERSION);
     printf("  endpoint       : %s\n", endpoint);
+    if (send_buf > 0 || recv_buf > 0) {
+        printf("  socket buffers : send=%d recv=%d\n", send_buf, recv_buf);
+    }
     printf("  local cache    : %s\n", cache_dir ? cache_dir : "n/a");
     printf("Using devices:\n");
     for (size_t i = 0; i < n_devices; i++) {
@@ -2171,7 +2191,7 @@ GGML_API GGML_CALL void ggml_backend_rpc_start_server(const char* endpoint,
             ggml_backend_metal_set_n_cb(dev, 2);
         }
 #endif
-        printf("  %8s:  %10zu MiB total, %10zu MiB free\n", name, 
+        printf("  %8s:  %10zu MiB total, %10zu MiB free\n", name,
             total_mem_vec[i] / 1024 / 1024, free_mem_vec[i] / 1024 / 1024);
     }
     std::string host;
@@ -2189,13 +2209,13 @@ GGML_API GGML_CALL void ggml_backend_rpc_start_server(const char* endpoint,
         }
     }
 #endif
-    auto server_socket = create_server_socket(host.c_str(), port);
+    auto server_socket = create_server_socket(host.c_str(), port, send_buf, recv_buf);
     if (server_socket == nullptr) {
         fprintf(stderr, "Failed to create server socket\n");
         return;
     }
     while (true) {
-        auto client_socket = socket_accept(server_socket->fd);
+        auto client_socket = socket_accept(server_socket->fd, send_buf, recv_buf);
         if (client_socket == nullptr) {
             fprintf(stderr, "Failed to accept client connection\n");
             continue;
@@ -2215,6 +2235,13 @@ GGML_API GGML_CALL void ggml_backend_rpc_start_server(const char* endpoint,
     for (auto backend : backends) {
         ggml_backend_free(backend);
     }
+}
+
+GGML_API GGML_CALL void ggml_backend_rpc_start_server(const char* endpoint,
+    const char* cache_dir,
+    size_t n_devices, ggml_backend_t * devices,
+    size_t * free_mem, size_t * total_mem) {
+    ggml_backend_rpc_start_server_ex(endpoint, cache_dir, n_devices, devices, free_mem, total_mem, nullptr);
 }
 
 GGML_API GGML_CALL uint32_t ggml_backend_rpc_get_device_count(const char* endpoint) {

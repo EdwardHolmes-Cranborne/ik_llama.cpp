@@ -25,9 +25,16 @@
 #  include <unistd.h>
 #  include <sys/stat.h>
 #endif
+#ifdef __APPLE__
+#  include <ifaddrs.h>
+#  include <net/if.h>
+#  include <arpa/inet.h>
+#endif
 #include <string>
 #include <stdio.h>
 #include <algorithm>
+#include <array>
+#include <sstream>
 #include <thread>
 #include <fstream>
 #include <filesystem>
@@ -164,6 +171,171 @@ static std::string fs_get_cache_directory() {
     return ensure_trailing_slash(cache_directory);
 }
 
+// Thunderbolt/RDMA interface detection — adapted from src/llama-tb-transport.cpp
+// Self-contained: uses only POSIX APIs, no libllama dependency.
+#ifdef __APPLE__
+namespace rdma_detect {
+
+static std::string trim_copy(std::string s) {
+    auto not_space = [](unsigned char c) { return !std::isspace(c); };
+    s.erase(s.begin(), std::find_if(s.begin(), s.end(), not_space));
+    s.erase(std::find_if(s.rbegin(), s.rend(), not_space).base(), s.end());
+    return s;
+}
+
+static std::string lower_copy(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return (char) std::tolower(c); });
+    return s;
+}
+
+static void append_unique(std::vector<std::string> & out, const std::string & value) {
+    if (value.empty()) { return; }
+    if (std::find(out.begin(), out.end(), value) == out.end()) {
+        out.push_back(value);
+    }
+}
+
+static bool run_command_capture(const char * cmd, std::string & out) {
+    out.clear();
+    FILE * pipe = ::popen(cmd, "r");
+    if (!pipe) { return false; }
+    std::array<char, 512> buf = {};
+    while (std::fgets(buf.data(), (int) buf.size(), pipe) != nullptr) {
+        out.append(buf.data());
+    }
+    return ::pclose(pipe) == 0;
+}
+
+static std::vector<std::string> detect_macos_thunderbolt_devices() {
+    std::vector<std::string> devices;
+    std::string out;
+    if (!run_command_capture("networksetup -listallhardwareports", out)) {
+        return devices;
+    }
+    std::stringstream ss(out);
+    std::string line;
+    std::string current_port;
+    while (std::getline(ss, line)) {
+        const std::string trimmed = trim_copy(line);
+        if (trimmed.rfind("Hardware Port:", 0) == 0) {
+            current_port = trim_copy(trimmed.substr(strlen("Hardware Port:")));
+            continue;
+        }
+        if (trimmed.rfind("Device:", 0) == 0) {
+            const std::string dev = trim_copy(trimmed.substr(strlen("Device:")));
+            const std::string port = lower_copy(current_port);
+            if (!dev.empty() && port.find("thunderbolt") != std::string::npos &&
+                    port.find("bridge") == std::string::npos) {
+                append_unique(devices, dev);
+            }
+            current_port.clear();
+        }
+    }
+    return devices;
+}
+
+struct iface_ip {
+    std::string iface;
+    std::string ip;
+};
+
+static std::vector<iface_ip> collect_interface_ips(const std::vector<std::string> & ifnames) {
+    std::vector<iface_ip> out;
+    if (ifnames.empty()) { return out; }
+
+    struct ifaddrs * ifaddr = nullptr;
+    if (::getifaddrs(&ifaddr) != 0 || !ifaddr) { return out; }
+
+    // Collect IPv4 first (preferred — ggml-rpc only supports AF_INET), then IPv6.
+    for (int pass = 0; pass < 2; pass++) {
+        const sa_family_t want = (pass == 0) ? AF_INET : AF_INET6;
+        for (struct ifaddrs * cur = ifaddr; cur != nullptr; cur = cur->ifa_next) {
+            if (!cur->ifa_name || !cur->ifa_addr) { continue; }
+            if (!(cur->ifa_flags & IFF_UP)) { continue; }
+            if (cur->ifa_addr->sa_family != want) { continue; }
+            if (std::find(ifnames.begin(), ifnames.end(), cur->ifa_name) == ifnames.end()) { continue; }
+
+            char buf[INET6_ADDRSTRLEN] = {};
+            if (want == AF_INET) {
+                const struct sockaddr_in * sin = (const struct sockaddr_in *) cur->ifa_addr;
+                if (::inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf)) == nullptr) { continue; }
+            } else {
+                const struct sockaddr_in6 * sin6 = (const struct sockaddr_in6 *) cur->ifa_addr;
+                if (::inet_ntop(AF_INET6, &sin6->sin6_addr, buf, sizeof(buf)) == nullptr) { continue; }
+            }
+
+            const std::string ip(buf);
+            if (ip.empty() || ip == "127.0.0.1" || ip == "::1") { continue; }
+            // Deduplicate by IP
+            bool dup = false;
+            for (const auto & entry : out) { if (entry.ip == ip) { dup = true; break; } }
+            if (!dup) {
+                out.push_back({std::string(cur->ifa_name), ip});
+            }
+        }
+    }
+    ::freeifaddrs(ifaddr);
+    return out;
+}
+
+// Returns Thunderbolt/RDMA interface IPs with interface names for diagnostics.
+static std::vector<iface_ip> detect_rdma_interfaces() {
+    std::vector<std::string> ifnames;
+
+    // Prefer explicit rdma_* interfaces when available.
+    {
+        struct ifaddrs * ifaddr = nullptr;
+        if (::getifaddrs(&ifaddr) == 0 && ifaddr) {
+            for (struct ifaddrs * cur = ifaddr; cur != nullptr; cur = cur->ifa_next) {
+                if (!cur->ifa_name) { continue; }
+                const std::string name(cur->ifa_name);
+                if (name.rfind("rdma_", 0) == 0) {
+                    append_unique(ifnames, name);
+                }
+            }
+            ::freeifaddrs(ifaddr);
+        }
+    }
+
+    // Map Thunderbolt hardware ports to rdma_<enX> names.
+    const std::vector<std::string> tb_devices = detect_macos_thunderbolt_devices();
+    for (const std::string & dev : tb_devices) {
+        append_unique(ifnames, "rdma_" + dev);
+        append_unique(ifnames, dev);
+    }
+
+    // Also check bridge0 — Thunderbolt IP networking often appears here.
+    append_unique(ifnames, "bridge0");
+
+    return collect_interface_ips(ifnames);
+}
+
+// Collect all non-loopback IPv4 addresses for the diagnostic banner.
+static std::vector<iface_ip> collect_all_ipv4_interfaces() {
+    std::vector<iface_ip> out;
+    struct ifaddrs * ifaddr = nullptr;
+    if (::getifaddrs(&ifaddr) != 0 || !ifaddr) { return out; }
+
+    for (struct ifaddrs * cur = ifaddr; cur != nullptr; cur = cur->ifa_next) {
+        if (!cur->ifa_name || !cur->ifa_addr) { continue; }
+        if (!(cur->ifa_flags & IFF_UP)) { continue; }
+        if (cur->ifa_addr->sa_family != AF_INET) { continue; }
+
+        char buf[INET_ADDRSTRLEN] = {};
+        const struct sockaddr_in * sin = (const struct sockaddr_in *) cur->ifa_addr;
+        if (::inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf)) == nullptr) { continue; }
+
+        const std::string ip(buf);
+        if (ip == "127.0.0.1") { continue; }
+        out.push_back({std::string(cur->ifa_name), ip});
+    }
+    ::freeifaddrs(ifaddr);
+    return out;
+}
+
+} // namespace rdma_detect
+#endif // __APPLE__
+
 struct rpc_server_params {
     std::string              host = "127.0.0.1";
     int                      port = 50052;
@@ -171,6 +343,11 @@ struct rpc_server_params {
     bool                     use_cpu = false;
     int                      n_threads = std::max(1U, std::thread::hardware_concurrency() / 2);
     std::vector<std::string> devices;
+    // RDMA / Thunderbolt transport options
+    bool                     rdma = false;
+    std::string              bind_addr;
+    int                      socket_send_buf = 0;
+    int                      socket_recv_buf = 0;
 };
 
 static void print_usage(int /*argc*/, char** argv, rpc_server_params params) {
@@ -183,6 +360,13 @@ static void print_usage(int /*argc*/, char** argv, rpc_server_params params) {
     fprintf(stderr, "  -h, -H, --host, --Host HOST         host to bind to (default: %s)\n", params.host.c_str());
     fprintf(stderr, "  -p, -P, --port, --Port PORT         port to bind to (default: %d)\n", params.port);
     fprintf(stderr, "  -c, --cache                         enable local file cache\n");
+    fprintf(stderr, "\n");
+    fprintf(stderr, "RDMA / Thunderbolt transport:\n");
+    fprintf(stderr, "  --rdma                              auto-detect Thunderbolt interfaces (macOS); sets\n");
+    fprintf(stderr, "                                      host to 0.0.0.0 and enables large socket buffers\n");
+    fprintf(stderr, "  --bind-addr ADDR                    explicit bind address (overrides --host)\n");
+    fprintf(stderr, "  --socket-send-buf N                 SO_SNDBUF in bytes (0 = system default)\n");
+    fprintf(stderr, "  --socket-recv-buf N                 SO_RCVBUF in bytes (0 = system default)\n");
     fprintf(stderr, "\n");
 }
 
@@ -238,6 +422,21 @@ static bool rpc_server_params_parse(int argc, char** argv, rpc_server_params& pa
         }
         else if (arg == "-cpu") {
             params.use_cpu = true;
+        }
+        else if (arg == "--rdma") {
+            params.rdma = true;
+        }
+        else if (arg == "--bind-addr") {
+            if (++i >= argc) { return false; }
+            params.bind_addr = argv[i];
+        }
+        else if (arg == "--socket-send-buf") {
+            if (++i >= argc) { return false; }
+            params.socket_send_buf = std::stoi(argv[i]);
+        }
+        else if (arg == "--socket-recv-buf") {
+            if (++i >= argc) { return false; }
+            params.socket_recv_buf = std::stoi(argv[i]);
         }
         else if (arg == "-h" || arg == "--help") {
             print_usage(argc, argv, params);
@@ -405,6 +604,48 @@ int main(int argc, char * argv[]) {
         return 1;
     }
 
+    // ---- RDMA / Thunderbolt transport resolution ----
+    std::string rdma_ip;       // Thunderbolt IP for the diagnostic banner (empty if none)
+    std::string rdma_iface;    // interface name for the TB IP
+
+    if (!params.bind_addr.empty()) {
+        // Explicit bind address overrides everything.
+        params.host = params.bind_addr;
+        fprintf(stderr, "[rdma] bind-addr override: %s\n", params.host.c_str());
+    }
+    else if (params.rdma) {
+        // Auto-detect Thunderbolt interfaces; bind to 0.0.0.0 so both
+        // RDMA (Thunderbolt) and TCP (Ethernet/Wi-Fi) clients can connect.
+        params.host = "0.0.0.0";
+
+#ifdef __APPLE__
+        auto tb_ifaces = rdma_detect::detect_rdma_interfaces();
+        if (!tb_ifaces.empty()) {
+            rdma_ip    = tb_ifaces[0].ip;
+            rdma_iface = tb_ifaces[0].iface;
+            fprintf(stderr, "[rdma] auto-detected Thunderbolt interface: %s (%s)\n",
+                    rdma_ip.c_str(), rdma_iface.c_str());
+            for (size_t i = 1; i < tb_ifaces.size(); i++) {
+                fprintf(stderr, "[rdma]   other candidate: %s (%s)\n",
+                        tb_ifaces[i].ip.c_str(), tb_ifaces[i].iface.c_str());
+            }
+        } else {
+            fprintf(stderr, "[rdma] WARNING: --rdma specified but no Thunderbolt interface found\n");
+            fprintf(stderr, "[rdma]   checked: rdma_* interfaces, Thunderbolt hardware ports, bridge0\n");
+            fprintf(stderr, "[rdma]   falling back to 0.0.0.0 (plain TCP on all interfaces)\n");
+        }
+#else
+        fprintf(stderr, "[rdma] WARNING: --rdma is only supported on macOS, ignoring\n");
+#endif
+        // Default socket buffers for Thunderbolt: 4 MiB (benefits high-BW, low-latency links).
+        if (params.socket_send_buf == 0) {
+            params.socket_send_buf = 4 * 1024 * 1024;
+        }
+        if (params.socket_recv_buf == 0) {
+            params.socket_recv_buf = 4 * 1024 * 1024;
+        }
+    }
+
     if (params.host != "127.0.0.1") {
         fprintf(stderr, "\n");
         fprintf(stderr, "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
@@ -446,7 +687,33 @@ int main(int argc, char * argv[]) {
         }
         cache_dir = cache_dir_str.c_str();
     }
-    ggml_backend_rpc_start_server(endpoint.c_str(), cache_dir, devices.size(), devices.data(),
-        free_mem.data(), total_mem.data());
+
+    // Print RDMA diagnostic banner (printed after ggml_backend_rpc_start_server_ex
+    // prints its own "Starting RPC server" header, so we print ours first).
+    if (params.rdma) {
+        fprintf(stderr, "[rdma] transport      : rdma (with tcp fallback)\n");
+        if (!rdma_ip.empty()) {
+            fprintf(stderr, "[rdma] thunderbolt    : %s:%d (%s)\n",
+                    rdma_ip.c_str(), params.port, rdma_iface.c_str());
+        }
+#ifdef __APPLE__
+        auto all_ips = rdma_detect::collect_all_ipv4_interfaces();
+        for (const auto & entry : all_ips) {
+            if (entry.ip == rdma_ip) { continue; }
+            fprintf(stderr, "[rdma] tcp fallback   : %s:%d (%s)\n",
+                    entry.ip.c_str(), params.port, entry.iface.c_str());
+        }
+#endif
+        if (params.socket_send_buf > 0 || params.socket_recv_buf > 0) {
+            fprintf(stderr, "[rdma] socket buffers : send=%d recv=%d\n",
+                    params.socket_send_buf, params.socket_recv_buf);
+        }
+    }
+
+    ggml_rpc_server_config config = {};
+    config.socket_send_buf = params.socket_send_buf;
+    config.socket_recv_buf = params.socket_recv_buf;
+    ggml_backend_rpc_start_server_ex(endpoint.c_str(), cache_dir, devices.size(), devices.data(),
+        free_mem.data(), total_mem.data(), &config);
     return 0;
 }
