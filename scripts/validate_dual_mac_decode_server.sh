@@ -154,12 +154,12 @@ if [[ -n "${HARDWARE_PROFILE}" ]]; then
     case "${HARDWARE_PROFILE}" in
         m3_ultra512_to_m3_max128)
             profile_ngl=96
-            profile_tensor_split="0.18,0.82"
+            profile_tensor_split="0.82,0.18"
             profile_safe_ngl_cap=128
             ;;
         m3_max128_to_m3_ultra512)
             profile_ngl=96
-            profile_tensor_split="0.82,0.18"
+            profile_tensor_split="0.18,0.82"
             profile_safe_ngl_cap=128
             ;;
         *)

@@ -71,3 +71,6 @@ This file is the shared handoff + review ledger for both machines.
   - concurrency safety of threaded accept model in `ggml-rpc.cpp`
   - whether backend-global serialization should become per-device serialization
 - 2026-02-18: local build + `ctest` now passes 22/22 after tokenizer lowercasing fix and eval-callback test removal.
+- 2026-02-18: reviewed `937dfcf9` (`update layer split`) and corrected inverted hardware profile defaults in `scripts/validate_dual_mac_decode_server.sh`:
+  - `m3_ultra512_to_m3_max128` -> `0.82,0.18`
+  - `m3_max128_to_m3_ultra512` -> `0.18,0.82`
