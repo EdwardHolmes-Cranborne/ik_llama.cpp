@@ -12,7 +12,7 @@ HTTP_PORT=8080
 KV_RECV_HOST="0.0.0.0"
 KV_RECV_PORT=19001
 CTX_SIZE=32768
-N_GPU_LAYERS=999
+N_GPU_LAYERS=128
 SPLIT_MODE="graph"
 MAX_GPU=2
 TENSOR_SPLIT="0.70,0.30"
@@ -32,6 +32,8 @@ COMPLETION_N_PREDICT=16
 COMPLETION_PROMPT="Dual-mac validation completion smoke test."
 KEEP_SERVER=0
 OUTPUT_DIR="/tmp/ik_dual_mac_decode_validate_$(date +%Y%m%d_%H%M%S)"
+SAFE_NGL_CAP=192
+ALLOW_HIGH_NGL=0
 
 EXTRA_ARGS=()
 
@@ -53,7 +55,7 @@ Optional:
   --kv-recv-host HOST         kv-receiver bind host (default: 0.0.0.0)
   --kv-recv-port N            kv-receiver port (default: 19001)
   --ctx-size N                context size (default: 32768)
-  --ngl N                     number of layers to offload (default: 999)
+  --ngl N                     number of layers to offload (default: 128)
   --split-mode MODE           split mode (default: graph)
   --max-gpu N                 max gpus for split mode (default: 2)
   --tensor-split CSV          tensor split fractions (default: 0.70,0.30)
@@ -68,6 +70,8 @@ Optional:
   --completion-prompt TEXT    completion smoke prompt
   --completion-n-predict N    completion smoke output tokens (default: 16)
   --output-dir PATH           artifact directory
+  --safe-ngl-cap N            memory-safe ngl cap unless overridden (default: 192)
+  --allow-high-ngl            allow --ngl above safe cap
   --keep-server               do not stop server at script exit
   --extra-arg ARG             append raw extra llama-server arg (repeatable)
   -h, --help
@@ -108,6 +112,8 @@ while [[ $# -gt 0 ]]; do
         --completion-prompt) COMPLETION_PROMPT="$2"; shift 2 ;;
         --completion-n-predict) COMPLETION_N_PREDICT="$2"; shift 2 ;;
         --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
+        --safe-ngl-cap) SAFE_NGL_CAP="$2"; shift 2 ;;
+        --allow-high-ngl) ALLOW_HIGH_NGL=1; shift 1 ;;
         --keep-server) KEEP_SERVER=1; shift 1 ;;
         --extra-arg) EXTRA_ARGS+=("$2"); shift 2 ;;
         -h|--help) usage; exit 0 ;;
@@ -147,7 +153,8 @@ for tuple in \
     "--max-gpu ${MAX_GPU}" \
     "--startup-timeout-sec ${STARTUP_TIMEOUT_SEC}" \
     "--poll-interval-sec ${POLL_INTERVAL_SEC}" \
-    "--completion-n-predict ${COMPLETION_N_PREDICT}"; do
+    "--completion-n-predict ${COMPLETION_N_PREDICT}" \
+    "--safe-ngl-cap ${SAFE_NGL_CAP}"; do
     flag="${tuple%% *}"
     value="${tuple##* }"
     if ! [[ "${value}" =~ ^[0-9]+$ ]] || [[ "${value}" -lt 1 ]]; then
@@ -155,6 +162,10 @@ for tuple in \
         exit 2
     fi
 done
+if [[ "${ALLOW_HIGH_NGL}" != "1" ]] && [[ "${N_GPU_LAYERS}" -gt "${SAFE_NGL_CAP}" ]]; then
+    echo "refusing --ngl=${N_GPU_LAYERS}: exceeds safe cap ${SAFE_NGL_CAP}. Use --allow-high-ngl to override." >&2
+    exit 2
+fi
 
 command -v curl >/dev/null
 command -v python3 >/dev/null

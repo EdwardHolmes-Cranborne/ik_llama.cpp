@@ -55,6 +55,13 @@ cd /path/to/ik_llama.cpp
 ./build_codex/bin/rpc-server --host 0.0.0.0 --port 50052 --device METAL0
 ```
 
+For longer validation runs, use the keepalive wrapper to auto-restart `rpc-server` if it exits:
+
+```bash
+cd /path/to/ik_llama.cpp
+./scripts/run_rpc_server_keepalive.sh --host 0.0.0.0 --port 50052 --device METAL0
+```
+
 ## 4. Start decode coordinator (`llama-server`) on Mac Studio
 
 Create decode route cluster config (used for post-restore fanout to additional decode nodes):
@@ -97,7 +104,7 @@ mkdir -p /tmp/ik_slots /tmp/ik_kv_handoff
   --host 0.0.0.0 --port 8080 \
   -c 32768 \
   --flash-attn on \
-  -ngl 999 \
+  -ngl 128 \
   --split-mode graph \
   --max-gpu 2 \
   --tensor-split 0.70,0.30 \
@@ -195,6 +202,8 @@ Use the same deployment and change only these controls:
 2. For decode `--split-mode graph`, keep `--flash-attn` enabled:
    - Graph-split restore rejects transposed-V restore path.
    - If you must run without flash attention, avoid `--split-mode graph` for restore/import runs.
+3. Start with conservative GPU layer offload to avoid unified-memory pressure:
+   - use `-ngl 128` first, then scale upward only after stable runs.
 
 ## 8. Notes for first production run
 
