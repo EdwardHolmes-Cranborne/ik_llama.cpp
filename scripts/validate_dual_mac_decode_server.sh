@@ -34,7 +34,8 @@ COMPLETION_N_PREDICT=16
 COMPLETION_TIMEOUT_SEC=180
 COMPLETION_PROMPT="Dual-mac validation completion smoke test."
 KEEP_SERVER=0
-OUTPUT_DIR="/tmp/ik_dual_mac_decode_validate_$(date +%Y%m%d_%H%M%S)"
+# Include PID to avoid collisions when running multiple validators in parallel.
+OUTPUT_DIR="/tmp/ik_dual_mac_decode_validate_$(date +%Y%m%d_%H%M%S)_$$"
 DEFAULT_SAFE_NGL_CAP=192
 SAFE_NGL_CAP="${DEFAULT_SAFE_NGL_CAP}"
 ALLOW_HIGH_NGL=0
