@@ -738,7 +738,10 @@ static std::string create_rpc_name(std::string endpoint, uint32_t device) {
 
 static ggml_backend_buffer_t ggml_backend_rpc_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     ggml_backend_rpc_buffer_type_context* buft_ctx = (ggml_backend_rpc_buffer_type_context*)buft->context;
-    rpc_msg_alloc_buffer_req request = { buft_ctx->device, size };
+    // Some backends return nullptr for zero-byte allocations, but the graph allocator still
+    // expects a valid buffer handle even when a backend has no resident tensors.
+    const size_t alloc_size = size == 0 ? 1 : size;
+    rpc_msg_alloc_buffer_req request = { buft_ctx->device, alloc_size };
     rpc_msg_alloc_buffer_rsp response;
     auto sock = get_socket(buft_ctx->endpoint);
     std::string name = create_rpc_name(buft_ctx->endpoint, buft_ctx->device);//  "RPC[" + std::string(buft_ctx->endpoint) + "]";
@@ -1060,6 +1063,7 @@ public:
     bool free_buffer(const rpc_msg_free_buffer_req & request);
     bool buffer_clear(const rpc_msg_buffer_clear_req & request);
     bool set_tensor(const std::vector<uint8_t> & input);
+    bool set_tensor_stream(sockfd_t sockfd, const rpc_tensor & in_tensor, uint64_t offset, size_t size);
     bool set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response);
     bool get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
@@ -1305,6 +1309,48 @@ bool rpc_server::set_tensor(const std::vector<uint8_t>& input) {
         printf("[%s] saved to '%s'\n", __func__, cache_file.c_str());
     }
     ggml_backend_tensor_set(tensor, data, offset, size);
+    return true;
+}
+
+bool rpc_server::set_tensor_stream(sockfd_t sockfd, const rpc_tensor & in_tensor, uint64_t offset, size_t size) {
+    struct ggml_init_params params {
+        /*.mem_size   =*/ ggml_tensor_overhead(),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_ptr{ ggml_init(params) };
+    GGML_ASSERT(ctx_ptr != nullptr);
+    ggml_context * ctx = ctx_ptr.get();
+    ggml_tensor * tensor = deserialize_tensor(ctx, &in_tensor);
+    if (tensor == nullptr) {
+        GGML_ABORT("[%s] error deserializing tensor\n", __func__);
+        return false;
+    }
+
+    // sanitize tensor->data
+    {
+        const size_t p0 = (size_t) ggml_backend_buffer_get_base(tensor->buffer);
+        const size_t p1 = p0 + ggml_backend_buffer_get_size(tensor->buffer);
+
+        if (in_tensor.data + offset < p0 || in_tensor.data + offset >= p1 || size > (p1 - in_tensor.data - offset)) {
+            LOG_DBG("[%s] tensor data region (data=0x%" PRIx64 ", offset=%" PRIu64 ", size=%zu) out of buffer bounds [0x%zx, 0x%zx)\n",
+                    __func__, in_tensor.data, offset, size, p0, p1);
+            return false;
+        }
+    }
+
+    static constexpr size_t RPC_SET_TENSOR_STREAM_CHUNK = 16 * 1024 * 1024; // 16 MiB
+    std::vector<uint8_t> chunk(std::min(size, RPC_SET_TENSOR_STREAM_CHUNK));
+    size_t bytes_received = 0;
+    while (bytes_received < size) {
+        const size_t chunk_size = std::min(chunk.size(), size - bytes_received);
+        if (!recv_data(sockfd, chunk.data(), chunk_size)) {
+            return false;
+        }
+        ggml_backend_tensor_set(tensor, chunk.data(), offset + bytes_received, chunk_size);
+        bytes_received += chunk_size;
+    }
+
     return true;
 }
 
@@ -1760,11 +1806,26 @@ static void rpc_serve_client(const std::vector<ggml_backend_t>& backends, const 
             break;
         }
         case RPC_CMD_SET_TENSOR: {
-            std::vector<uint8_t> input;
-            if (!recv_msg(sockfd, input)) {
+            uint64_t size;
+            if (!recv_data(sockfd, &size, sizeof(size))) {
                 return;
             }
-            if (!server.set_tensor(input)) {
+
+            if (size < sizeof(rpc_tensor) + sizeof(uint64_t)) {
+                return;
+            }
+
+            rpc_tensor tensor;
+            uint64_t offset;
+            if (!recv_data(sockfd, &tensor, sizeof(tensor))) {
+                return;
+            }
+            if (!recv_data(sockfd, &offset, sizeof(offset))) {
+                return;
+            }
+
+            const size_t tensor_data_size = size - sizeof(rpc_tensor) - sizeof(offset);
+            if (!server.set_tensor_stream(sockfd, tensor, offset, tensor_data_size)) {
                 return;
             }
             break;

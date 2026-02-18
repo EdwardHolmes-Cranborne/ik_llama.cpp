@@ -769,7 +769,10 @@ bool ggml_gallocr_reserve_n(ggml_gallocr_t galloc, struct ggml_cgraph * graph, c
 #endif
 
             ggml_backend_buffer_free(galloc->buffers[i]);
-            galloc->buffers[i] = ggml_backend_buft_alloc_buffer(galloc->bufts[i], new_size);
+            // Some backend allocators reject zero-byte buffers, but we still need a valid
+            // handle here to initialize view tensors for this backend.
+            const size_t alloc_size = new_size == 0 ? 1 : new_size;
+            galloc->buffers[i] = ggml_backend_buft_alloc_buffer(galloc->bufts[i], alloc_size);
             if (galloc->buffers[i] == NULL) {
                 fprintf(stderr, "%s: failed to allocate %s buffer of size %zu\n", __func__, ggml_backend_buft_name(galloc->bufts[i]), new_size);
                 return false;
