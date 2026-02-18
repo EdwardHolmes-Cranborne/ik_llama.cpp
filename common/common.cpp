@@ -4489,24 +4489,23 @@ llama_context_params_from_gpt_params(const gpt_params &params) {
   cparams.grouped_expert_routing = params.grouped_expert_routing;
   cparams.fused_up_gate = params.fused_up_gate;
 
-  // Auto-disable fused ops when RPC backends are active.
-  // Metal has no FUSED_UP_GATE/MOE_FUSED_UP_GATE kernels, so the RPC backend
-  // denies them.  Without this, every FFN layer falls back to CPU with costly
-  // RPC<->CPU data transfers, causing near-zero decode speed.
-  if (!params.rpc_servers.empty()) {
-    if (cparams.fused_up_gate) {
-      fprintf(stderr,
-              "%s: auto-disabling fused_up_gate for RPC compatibility\n",
-              __func__);
-      cparams.fused_up_gate = false;
-    }
-    if (cparams.fused_moe_up_gate) {
-      fprintf(stderr,
-              "%s: auto-disabling fused_moe_up_gate for RPC compatibility\n",
-              __func__);
-      cparams.fused_moe_up_gate = false;
-    }
+  // Auto-disable fused ops on Metal builds.
+  // Metal has no FUSED_UP_GATE/MOE_FUSED_UP_GATE kernels — compute falls back
+  // to CPU which is ~3x slower than the decomposed GPU path (MUL_MAT+SILU+MUL).
+#if defined(GGML_USE_METAL)
+  if (cparams.fused_up_gate) {
+    fprintf(stderr,
+            "%s: auto-disabling fused_up_gate (not supported by Metal)\n",
+            __func__);
+    cparams.fused_up_gate = false;
   }
+  if (cparams.fused_moe_up_gate) {
+    fprintf(stderr,
+            "%s: auto-disabling fused_moe_up_gate (not supported by Metal)\n",
+            __func__);
+    cparams.fused_moe_up_gate = false;
+  }
+#endif
   cparams.fused_mmad = params.fused_mmad;
   cparams.rope_cache = params.rope_cache;
   cparams.graph_reuse = params.graph_reuse;
