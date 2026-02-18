@@ -330,6 +330,41 @@ static bool set_no_delay(sockfd_t sockfd) {
   return ret == 0;
 }
 
+// Apply platform-specific low-latency socket options.
+// On macOS over Thunderbolt TCP, these reduce ACK-related stalls:
+//   SO_NOSIGPIPE  – prevent SIGPIPE on peer disconnect
+//   TCP_NOPUSH=0  – ensure immediate TCP push (no corking)
+//   SO_TRAFFIC_CLASS – QoS hint for low-latency AV traffic class
+static void set_low_latency_opts(sockfd_t sockfd) {
+#ifdef __APPLE__
+  int one = 1;
+  // Prevent SIGPIPE on broken connections
+  (void)setsockopt(sockfd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+
+  // Explicitly clear TCP_NOPUSH to ensure immediate segment transmission.
+  // macOS delayed-ACK (~40ms) interacts badly with corked sockets on
+  // Thunderbolt links where we need sub-ms RPC round-trips.
+  int zero = 0;
+  (void)setsockopt(sockfd, IPPROTO_TCP, TCP_NOPUSH, &zero, sizeof(zero));
+
+  // Mark as audio/video traffic class — macOS network stack gives these
+  // sockets priority scheduling and shorter queue depths.
+#if defined(SO_TRAFFIC_CLASS) && defined(SO_TC_AV)
+  int tc = SO_TC_AV;
+  (void)setsockopt(sockfd, SOL_SOCKET, SO_TRAFFIC_CLASS, &tc, sizeof(tc));
+#endif
+#else
+  // Linux: TCP_QUICKACK forces immediate ACK (disables delayed-ACK).
+  // Must be re-set after each recv() as Linux resets it, but setting it
+  // on the socket at least primes the initial handshake.
+#ifdef TCP_QUICKACK
+  int one = 1;
+  (void)setsockopt(sockfd, IPPROTO_TCP, TCP_QUICKACK, &one, sizeof(one));
+#endif
+  UNUSED(sockfd);
+#endif
+}
+
 static bool set_reuse_addr(sockfd_t sockfd) {
   int flag = 1;
   int ret =
@@ -374,6 +409,7 @@ static std::shared_ptr<socket_t> socket_connect(const char *host, int port) {
     fprintf(stderr, "Failed to set TCP_NODELAY\n");
     return nullptr;
   }
+  set_low_latency_opts(sockfd);
   if (env_socket_buf > 0) {
     (void)setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF,
                      (const char *)&env_socket_buf, sizeof(env_socket_buf));
@@ -416,6 +452,7 @@ socket_accept(sockfd_t srv_sockfd, int send_buf = 0, int recv_buf = 0) {
     fprintf(stderr, "Failed to set TCP_NODELAY\n");
     return nullptr;
   }
+  set_low_latency_opts(client_socket_fd);
   if (!set_socket_timeout(client_socket_fd, 15000)) {
     fprintf(stderr, "Failed to set socket timeouts\n");
     return nullptr;
@@ -444,6 +481,7 @@ static std::shared_ptr<socket_t> create_server_socket(const char *host,
     fprintf(stderr, "Failed to set SO_REUSEADDR\n");
     return nullptr;
   }
+  set_low_latency_opts(sockfd);
   if (send_buf > 0) {
     (void)setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, (const char *)&send_buf,
                      sizeof(send_buf));
