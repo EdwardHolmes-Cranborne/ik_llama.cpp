@@ -44,6 +44,7 @@ This file is the shared handoff + review ledger for both machines.
 
 ### Review Notes
 
+- 2026-02-18: fetched `origin/feature/kv-bridge-gate2.5` before/after patch set; no unseen incoming commits at review time.
 - Pending review from other side for:
   - concurrency safety of threaded accept model in `ggml-rpc.cpp`
   - whether backend-global serialization should become per-device serialization
