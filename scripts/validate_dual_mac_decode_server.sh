@@ -222,8 +222,6 @@ if [[ -n "${RPC_ENDPOINTS}" ]]; then
 fi
 if [[ "${KV_TRANSPORT_FALLBACK}" == "1" ]]; then
     cmd+=(--kv-transport-fallback)
-else
-    cmd+=(--no-kv-transport-fallback)
 fi
 if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
     cmd+=("${EXTRA_ARGS[@]}")
