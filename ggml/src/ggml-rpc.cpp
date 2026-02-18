@@ -9,6 +9,7 @@
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
+#include <cerrno>
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
 #  ifndef NOMINMAX
@@ -53,6 +54,7 @@ typedef int sockfd_t;
 // cross-platform socket
 struct socket_t {
     sockfd_t fd;
+    std::mutex io_mutex;
     socket_t(sockfd_t fd) : fd(fd) {}
     ~socket_t() {
         LOG_DBG("[%s] closing socket %d\n", __func__, this->fd);
@@ -315,6 +317,21 @@ static bool set_reuse_addr(sockfd_t sockfd) {
     return ret == 0;
 }
 
+static bool set_socket_timeout(sockfd_t sockfd, int timeout_ms) {
+#ifdef _WIN32
+    DWORD timeout = (DWORD) timeout_ms;
+    int ret_recv = setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char *) &timeout, sizeof(timeout));
+    int ret_send = setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, (const char *) &timeout, sizeof(timeout));
+#else
+    struct timeval timeout;
+    timeout.tv_sec  = timeout_ms / 1000;
+    timeout.tv_usec = (timeout_ms % 1000) * 1000;
+    int ret_recv = setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    int ret_send = setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+#endif
+    return ret_recv == 0 && ret_send == 0;
+}
+
 static std::shared_ptr<socket_t> socket_connect(const char * host, int port) {
     struct sockaddr_in addr;
     auto sockfd = socket(AF_INET, SOCK_STREAM, 0);
@@ -326,6 +343,10 @@ static std::shared_ptr<socket_t> socket_connect(const char * host, int port) {
         fprintf(stderr, "Failed to set TCP_NODELAY\n");
         return nullptr;
     }
+    if (!set_socket_timeout(sockfd, 15000)) {
+        fprintf(stderr, "Failed to set socket timeouts\n");
+        return nullptr;
+    }
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
     struct hostent * server = gethostbyname(host);
@@ -335,6 +356,11 @@ static std::shared_ptr<socket_t> socket_connect(const char * host, int port) {
     }
     memcpy(&addr.sin_addr.s_addr, server->h_addr, server->h_length);
     if (connect(sock_ptr->fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+#ifdef _WIN32
+        fprintf(stderr, "connect failed to %s:%d (WSA error %d)\n", host, port, WSAGetLastError());
+#else
+        fprintf(stderr, "connect failed to %s:%d (%s)\n", host, port, strerror(errno));
+#endif
         return nullptr;
     }
     return sock_ptr;
@@ -348,6 +374,10 @@ static std::shared_ptr<socket_t> socket_accept(sockfd_t srv_sockfd) {
     }
     if (!set_no_delay(client_socket_fd)) {
         fprintf(stderr, "Failed to set TCP_NODELAY\n");
+        return nullptr;
+    }
+    if (!set_socket_timeout(client_socket_fd, 15000)) {
+        fprintf(stderr, "Failed to set socket timeouts\n");
         return nullptr;
     }
     return client_socket;
@@ -375,7 +405,7 @@ static std::shared_ptr<socket_t> create_server_socket(const char * host, int por
     if (bind(sockfd, (struct sockaddr *) &serv_addr, sizeof(serv_addr)) < 0) {
         return nullptr;
     }
-    if (listen(sockfd, 1) < 0) {
+    if (listen(sockfd, 128) < 0) {
         return nullptr;
     }
     return sock;
@@ -461,7 +491,7 @@ static bool parse_endpoint(const std::string & endpoint, std::string & host, int
 
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
 // No response
-static bool send_rpc_cmd(const std::shared_ptr<socket_t> & sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
+static bool send_rpc_cmd_unlocked(const std::shared_ptr<socket_t> & sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
     if (sock == nullptr) {
         return false;
     }
@@ -478,13 +508,22 @@ static bool send_rpc_cmd(const std::shared_ptr<socket_t> & sock, enum rpc_cmd cm
     return true;
 }
 
+static bool send_rpc_cmd(const std::shared_ptr<socket_t> & sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
+    if (sock == nullptr) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(sock->io_mutex);
+    return send_rpc_cmd_unlocked(sock, cmd, input, input_size);
+}
+
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
 // RPC response: | response_size (8 bytes) | response_data (response_size bytes) |
 static bool send_rpc_cmd(const std::shared_ptr<socket_t> & sock, enum rpc_cmd cmd, const void * input, size_t input_size, void * output, size_t output_size) {
     if (sock == nullptr) {
         return false;
     }
-    if (!send_rpc_cmd(sock, cmd, input, input_size)) {
+    std::lock_guard<std::mutex> lock(sock->io_mutex);
+    if (!send_rpc_cmd_unlocked(sock, cmd, input, input_size)) {
         return false;
     }
     // TODO: currently the output_size is always known, do we need support for commands with variable output size?
@@ -856,17 +895,49 @@ static void add_tensor(ggml_tensor * tensor, std::vector<rpc_tensor> & tensors, 
     tensors.push_back(serialize_tensor(tensor));
 }
 
+static uint32_t count_non_null_graph_nodes(const ggml_cgraph * cgraph) {
+    uint32_t count = 0;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        if (cgraph->nodes[i] != nullptr) {
+            ++count;
+        }
+    }
+    return count;
+}
+
 static void serialize_graph(uint32_t device, const ggml_cgraph* cgraph, std::vector<uint8_t>& output) {
-    uint32_t n_nodes = cgraph->n_nodes;
+    std::vector<uint64_t> node_ids;
+    node_ids.reserve(cgraph->n_nodes);
     std::vector<rpc_tensor> tensors;
+    size_t n_tensors_without_buffer = 0;
+    size_t n_non_none_without_buffer = 0;
     std::unordered_set<ggml_tensor*> visited;
-    for (uint32_t i = 0; i < n_nodes; i++) {
-        add_tensor(cgraph->nodes[i], tensors, visited);
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        ggml_tensor * node = cgraph->nodes[i];
+        if (node == nullptr) {
+            continue;
+        }
+        node_ids.push_back(reinterpret_cast<uint64_t>(node));
+        add_tensor(node, tensors, visited);
+    }
+    for (const rpc_tensor & t : tensors) {
+        if (t.buffer == 0) {
+            ++n_tensors_without_buffer;
+            if (t.op != GGML_OP_NONE) {
+                ++n_non_none_without_buffer;
+            }
+        }
+    }
+    uint32_t n_nodes = (uint32_t) node_ids.size();
+    if (n_non_none_without_buffer > 0) {
+        fprintf(stderr, "[%s] device=%u n_nodes=%u n_tensors=%zu tensors_without_buffer=%zu non_none_without_buffer=%zu\n",
+            __func__, device, n_nodes, tensors.size(), n_tensors_without_buffer, n_non_none_without_buffer);
+        fflush(stderr);
     }
     // serialization format:
     // | device (4 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
     uint32_t n_tensors = tensors.size();
-    int output_size = 2 * sizeof(uint32_t) + n_nodes * sizeof(uint64_t) + sizeof(uint32_t) + n_tensors * sizeof(rpc_tensor);
+    size_t output_size = 2 * sizeof(uint32_t) + n_nodes * sizeof(uint64_t) + sizeof(uint32_t) + n_tensors * sizeof(rpc_tensor);
     output.resize(output_size, 0);
     uint8_t* dest = output.data();
     memcpy(dest, &device, sizeof(device));
@@ -874,7 +945,7 @@ static void serialize_graph(uint32_t device, const ggml_cgraph* cgraph, std::vec
     memcpy(dest, &n_nodes, sizeof(n_nodes));
     dest += sizeof(n_nodes);
     for (uint32_t i = 0; i < n_nodes; i++) {
-        memcpy(dest + i * sizeof(uint64_t), &cgraph->nodes[i], sizeof(uint64_t));
+        memcpy(dest + i * sizeof(uint64_t), &node_ids[i], sizeof(uint64_t));
     }
     dest += n_nodes * sizeof(uint64_t);
     memcpy(dest, &n_tensors, sizeof(n_tensors));
@@ -887,6 +958,9 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
     ggml_backend_rpc_context* rpc_ctx = (ggml_backend_rpc_context*)backend->context;
 
     GGML_ASSERT(cgraph->n_nodes > 0);
+    if (count_non_null_graph_nodes(cgraph) == 0) {
+        return GGML_STATUS_SUCCESS;
+    }
     bool reuse = rpc_ctx->gc.is_cached(cgraph);
     if (reuse) {
         rpc_msg_graph_recompute_req request;
@@ -1222,6 +1296,10 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
         LOG_DBG("[%s] invalid tensor type received: %u\n", __func__, tensor->type);
         return nullptr;
     }
+    if (tensor->op >= GGML_OP_COUNT) {
+        LOG_DBG("[%s] invalid tensor op received: %u\n", __func__, tensor->op);
+        return nullptr;
+    }
 
     ggml_tensor * result = ggml_new_tensor_4d(ctx, (ggml_type) tensor->type,
         tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3]);
@@ -1548,6 +1626,10 @@ ggml_tensor* rpc_server::create_node(uint64_t id,
         // Check if the source ID is 0 before calling create_node recursively
         if (tensor->src[i] == 0) {
             result->src[i] = nullptr;
+        } else if (tensor->src[i] == id) {
+            LOG_DBG("[%s] self-referential src node %d (id=%" PRIu64 ")\n", __func__, i, id);
+            tensor_map.erase(id);
+            return nullptr;
         } else {
             result->src[i] = create_node(tensor->src[i], ctx, tensor_ptrs, tensor_map);
             // If the recursive call failed for a non-zero ID, propagate the error
@@ -1555,6 +1637,7 @@ ggml_tensor* rpc_server::create_node(uint64_t id,
                 LOG_DBG("[%s] failed to create source node %d (src_id=%" PRIu64 ") for node id %" PRIu64 "\n",
                                __func__, i, tensor->src[i], id);
                 // Must return nullptr to signal failure up the call stack
+                tensor_map.erase(id);
                 return nullptr;
             }
         }
@@ -1563,6 +1646,10 @@ ggml_tensor* rpc_server::create_node(uint64_t id,
     // Handle view_src similarly
     if (tensor->view_src == 0) {
         result->view_src = nullptr;
+    } else if (tensor->view_src == id) {
+        LOG_DBG("[%s] self-referential view_src node (id=%" PRIu64 ")\n", __func__, id);
+        tensor_map.erase(id);
+        return nullptr;
     } else {
         result->view_src = create_node(tensor->view_src, ctx, tensor_ptrs, tensor_map);
         // If the recursive call failed for a non-zero ID, propagate the error
@@ -1570,10 +1657,14 @@ ggml_tensor* rpc_server::create_node(uint64_t id,
             LOG_DBG("[%s] failed to create view_src node (view_src_id=%" PRIu64 ") for node id %" PRIu64 "\n",
                            __func__, tensor->view_src, id);
             // Must return nullptr to signal failure up the call stack
+            tensor_map.erase(id);
             return nullptr;
         }
     }
     result->view_offs = tensor->view_offs;
+    if (result->view_src != nullptr && result->view_src->data != nullptr) {
+        result->data = (char *) result->view_src->data + result->view_offs;
+    }
     return result;
 }
 
@@ -1590,13 +1681,17 @@ bool rpc_server::graph_compute(const std::vector<uint8_t>& input) {
     if (device >= backends.size()) {
         return false;
     }
+    if (backends[device] == nullptr) {
+        GGML_LOG_ERROR("[%s] backend %u is null\n", __func__, device);
+        return false;
+    }
     uint32_t n_nodes;
     memcpy(&n_nodes, src, sizeof(n_nodes));
     src += sizeof(n_nodes);
     if (input.size() < 2 * sizeof(uint32_t) + n_nodes * sizeof(uint64_t) + sizeof(uint32_t)) {
         return false;
     }
-    const uint64_t* nodes = (const uint64_t*)src;
+    const uint8_t * nodes_src = src;
     src += n_nodes * sizeof(uint64_t);
     uint32_t n_tensors;
     memcpy(&n_tensors, src, sizeof(n_tensors));
@@ -1625,20 +1720,40 @@ bool rpc_server::graph_compute(const std::vector<uint8_t>& input) {
     }
     std::unordered_map<uint64_t, ggml_tensor*> tensor_map;
     for (uint32_t i = 0; i < n_nodes; i++) {
-        int64_t id;
-        memcpy(&id, &nodes[i], sizeof(id));
+        uint64_t id;
+        memcpy(&id, nodes_src + i * sizeof(uint64_t), sizeof(id));
         graph->nodes[i] = create_node(id, ctx, tensor_ptrs, tensor_map);
-
-        // Check if create_node failed for a *non-zero* ID.
-        // If id was 0, create_node returning nullptr is expected.
-        // If id was non-zero and create_node returned nullptr, it indicates a deserialization error.
-        if (graph->nodes[i] == nullptr && id != 0) {
-            GGML_LOG_ERROR("[%s] failed to create graph node %d (id=%" PRId64 ")\n", __func__, i, id);
+        if (graph->nodes[i] == nullptr) {
+            GGML_LOG_ERROR("[%s] failed to create graph node %u (id=%" PRIu64 ")\n", __func__, i, id);
             return false;
         }
     }
-    ggml_status status = ggml_backend_graph_compute(backends[device], graph);
-    GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
+    size_t n_nodes_without_buffer = 0;
+    size_t n_non_none_without_buffer = 0;
+    for (uint32_t i = 0; i < n_nodes; ++i) {
+        ggml_tensor * node = graph->nodes[i];
+        if (node->buffer == nullptr) {
+            ++n_nodes_without_buffer;
+            if (node->op != GGML_OP_NONE) {
+                ++n_non_none_without_buffer;
+            }
+        }
+    }
+    if (n_non_none_without_buffer > 0) {
+        fprintf(stderr, "[%s] rejecting graph: device=%u n_nodes=%u nodes_without_buffer=%zu non_none_without_buffer=%zu\n",
+            __func__, device, n_nodes, n_nodes_without_buffer, n_non_none_without_buffer);
+        fflush(stderr);
+        return false;
+    }
+    ggml_backend_t backend = backends[device];
+    fprintf(stderr, "[%s] compute device=%u backend=%p backend_ctx=%p n_nodes=%u n_tensors=%u\n",
+        __func__, device, (void *) backend, backend ? backend->context : nullptr, n_nodes, n_tensors);
+    fflush(stderr);
+    ggml_status status = ggml_backend_graph_compute(backend, graph);
+    if (status != GGML_STATUS_SUCCESS) {
+        GGML_LOG_ERROR("[%s] graph compute failed on backend %u with status %d\n", __func__, device, status);
+        return false;
+    }
     stored_graphs[device].ctx_ptr.swap(ctx_ptr);
     stored_graphs[device].graph = graph;
     return true;
@@ -1650,13 +1765,19 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
     if (device >= backends.size()) {
         return false;
     }
+    if (backends[device] == nullptr) {
+        return false;
+    }
     if (stored_graphs[device].graph == nullptr) {
         return false;
     }
     ggml_cgraph * graph = stored_graphs[device].graph;
     LOG_DBG("[%s] device: %u\n", __func__, device);
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
-    GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
+    if (status != GGML_STATUS_SUCCESS) {
+        GGML_LOG_ERROR("[%s] graph recompute failed on backend %u with status %d\n", __func__, device, status);
+        return false;
+    }
     return true;
 }
 

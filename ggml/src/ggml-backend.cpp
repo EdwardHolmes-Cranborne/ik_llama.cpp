@@ -1990,6 +1990,30 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
             input_backend = split_backend;
         }
         struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+        if (!input_cpy) {
+            continue;
+        }
+
+        auto copy_input_to_split = [&](bool allow_async_host_set) {
+            if (input->buffer && input_cpy->buffer) {
+                ggml_backend_tensor_copy(input, input_cpy);
+                return true;
+            }
+            if (input->data && input_cpy->buffer) {
+                const size_t copy_size = ggml_nbytes(input);
+                if (allow_async_host_set) {
+                    ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, copy_size);
+                } else {
+                    ggml_backend_tensor_set(input_cpy, input->data, 0, copy_size);
+                }
+                return true;
+            }
+#ifndef NDEBUG
+            fprintf(stderr, "%s: skipping tensor copy for '%s' (src_buffer=%p dst_buffer=%p src_data=%p)\n",
+                __func__, input->name, (void *) input->buffer, (void *) input_cpy->buffer, input->data);
+#endif
+            return false;
+        };
 
         if (input->flags & GGML_TENSOR_FLAG_INPUT) {
             // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
@@ -2002,7 +2026,9 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
                 }
                 synced_on_input = true;
             }
-            ggml_backend_tensor_copy(input, input_cpy);
+            if (!copy_input_to_split(false)) {
+                continue;
+            }
         } else {
             // wait for the split backend to finish using the input before overwriting it
             if (needs_sync[split_backend_id]) {
@@ -2120,7 +2146,9 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
                         }
                         needs_sync[split_backend_id] = k_set_sync;
                     }
-                    ggml_backend_tensor_copy(input, input_cpy);
+                    if (!copy_input_to_split(true)) {
+                        continue;
+                    }
                 }
         }
     }
