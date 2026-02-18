@@ -6,7 +6,7 @@ IK_REPO="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 
 HOST="0.0.0.0"
 PORT=50052
-DEVICE="METAL0"
+DEVICE=""
 RESTART_DELAY_SEC=2
 LOG_PATH="/tmp/ik_rpc_server_keepalive.log"
 
@@ -17,7 +17,7 @@ Run rpc-server in a restart loop to keep the endpoint available.
 Optional:
   --host HOST               bind host (default: 0.0.0.0)
   --port N                  bind port (default: 50052)
-  --device NAME             backend device id (default: METAL0)
+  --device NAME             backend device id (default: rpc-server default backend)
   --restart-delay-sec N     delay before restart after exit (default: 2)
   --log PATH                log file path (default: /tmp/ik_rpc_server_keepalive.log)
   -h, --help
@@ -63,12 +63,17 @@ if [[ -z "${RPC_BIN}" ]]; then
     exit 2
 fi
 
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] keepalive start host=${HOST} port=${PORT} device=${DEVICE}" | tee -a "${LOG_PATH}"
+device_label="${DEVICE:-<default>}"
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] keepalive start host=${HOST} port=${PORT} device=${device_label}" | tee -a "${LOG_PATH}"
 
 while true; do
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] launching rpc-server" | tee -a "${LOG_PATH}"
     set +e
-    "${RPC_BIN}" --host "${HOST}" --port "${PORT}" --device "${DEVICE}" >>"${LOG_PATH}" 2>&1
+    if [[ -n "${DEVICE}" ]]; then
+        "${RPC_BIN}" --host "${HOST}" --port "${PORT}" --device "${DEVICE}" >>"${LOG_PATH}" 2>&1
+    else
+        "${RPC_BIN}" --host "${HOST}" --port "${PORT}" >>"${LOG_PATH}" 2>&1
+    fi
     rc=$?
     set -e
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] rpc-server exited rc=${rc}" | tee -a "${LOG_PATH}"

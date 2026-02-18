@@ -45,21 +45,21 @@ cmake --build build -j
 
 ```bash
 cd /path/to/ik_llama.cpp
-./build_codex/bin/rpc-server --host 0.0.0.0 --port 50052 --device METAL0
+./build_codex/bin/rpc-server --host 0.0.0.0 --port 50052
 ```
 
 ### 3.2 MacBook Pro RPC server
 
 ```bash
 cd /path/to/ik_llama.cpp
-./build_codex/bin/rpc-server --host 0.0.0.0 --port 50052 --device METAL0
+./build_codex/bin/rpc-server --host 0.0.0.0 --port 50052
 ```
 
 For longer validation runs, use the keepalive wrapper to auto-restart `rpc-server` if it exits:
 
 ```bash
 cd /path/to/ik_llama.cpp
-./scripts/run_rpc_server_keepalive.sh --host 0.0.0.0 --port 50052 --device METAL0
+./scripts/run_rpc_server_keepalive.sh --host 0.0.0.0 --port 50052
 ```
 
 ## 4. Start decode coordinator (`llama-server`) on Mac Studio
