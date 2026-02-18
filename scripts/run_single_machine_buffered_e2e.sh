@@ -13,6 +13,7 @@ OUTPUT_DIR="/tmp/ik_rtx_single_machine_buffered_e2e_$(date +%Y%m%d_%H%M%S)"
 IK_HTTP_PORT=8080
 IK_KV_PORT=19001
 BUFFER_PORT=29001
+IK_HEALTH_TIMEOUT=600
 CTX_SIZE=8192
 PREFILL_N_PREDICT=8
 DECODE_N_PREDICT=16
@@ -40,6 +41,7 @@ Optional:
   --ik-http-port N            ik llama-server HTTP port (default: 8080)
   --ik-kv-port N              ik kv receiver port (default: 19001)
   --buffer-port N             loopback disk-buffer port (default: 29001)
+  --ik-health-timeout N       seconds to wait for ik /health (default: 600)
   --ctx-size N                context size for both runs (default: 8192)
   --prefill-n-predict N       prefill CLI generation tokens (default: 8)
   --prefill-min-stream-batch-tokens N
@@ -76,6 +78,7 @@ while [[ $# -gt 0 ]]; do
         --ik-http-port) IK_HTTP_PORT="$2"; shift 2 ;;
         --ik-kv-port) IK_KV_PORT="$2"; shift 2 ;;
         --buffer-port) BUFFER_PORT="$2"; shift 2 ;;
+        --ik-health-timeout) IK_HEALTH_TIMEOUT="$2"; shift 2 ;;
         --ctx-size) CTX_SIZE="$2"; shift 2 ;;
         --prefill-n-predict) PREFILL_N_PREDICT="$2"; shift 2 ;;
         --prefill-min-stream-batch-tokens) PREFILL_MIN_STREAM_BATCH_TOKENS="$2"; shift 2 ;;
@@ -189,7 +192,12 @@ echo "[1/7] start ik llama-server with kv-receiver"
   >"${IK_LOG}" 2>&1 &
 IK_SERVER_PID=$!
 
-for _ in $(seq 1 60); do
+if ! [[ "${IK_HEALTH_TIMEOUT}" =~ ^[0-9]+$ ]] || [[ "${IK_HEALTH_TIMEOUT}" -lt 1 ]]; then
+    echo "invalid --ik-health-timeout: ${IK_HEALTH_TIMEOUT} (must be >=1)" >&2
+    exit 2
+fi
+
+for _ in $(seq 1 "${IK_HEALTH_TIMEOUT}"); do
     if curl -sf "http://127.0.0.1:${IK_HTTP_PORT}/health" >/dev/null; then
         break
     fi

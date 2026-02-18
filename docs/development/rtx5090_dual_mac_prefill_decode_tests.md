@@ -32,6 +32,28 @@ curl -s http://10.40.0.20:8080/health | jq
 curl -s http://10.40.0.20:8080/kv-receiver/status | jq
 ```
 
+### 1.3 Long-load API readiness probe (recommended for large models)
+
+For Kimi-class multi-shard models, startup can exceed short probe windows. Run this on the decode coordinator host to wait for `/health`, then validate `/kv-receiver/status` and `/completion` in one pass:
+
+```bash
+cd /path/to/ik_llama.cpp
+./scripts/validate_dual_mac_decode_server.sh \
+  --model /Volumes/D/big_models/unsloth/Kimi_25_Q3_K_XL/Kimi-K2.5-UD-Q3_K_XL-00001-of-00011.gguf \
+  --rpc 10.40.0.20:50052,10.40.0.21:50052 \
+  --bind-host 0.0.0.0 \
+  --http-host 127.0.0.1 \
+  --http-port 8080 \
+  --startup-timeout-sec 3600 \
+  --completion-n-predict 16
+```
+
+Pass criteria:
+
+- script exits `0`
+- `summary.json` reports `"ok": true`
+- no crash/segfault in `server.log`
+
 ## 2. Transport-only validation (no slot restore)
 
 Start decode coordinator with:
