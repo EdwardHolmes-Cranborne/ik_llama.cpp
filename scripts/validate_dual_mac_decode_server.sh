@@ -31,6 +31,7 @@ KV_RECV_CLEANUP_INTERVAL=10
 STARTUP_TIMEOUT_SEC=1800
 POLL_INTERVAL_SEC=2
 COMPLETION_N_PREDICT=16
+COMPLETION_TIMEOUT_SEC=120
 COMPLETION_PROMPT="Dual-mac validation completion smoke test."
 KEEP_SERVER=0
 OUTPUT_DIR="/tmp/ik_dual_mac_decode_validate_$(date +%Y%m%d_%H%M%S)"
@@ -76,6 +77,7 @@ Optional:
   --poll-interval-sec N       poll interval for /health (default: 2)
   --completion-prompt TEXT    completion smoke prompt
   --completion-n-predict N    completion smoke output tokens (default: 16)
+  --completion-timeout-sec N  completion smoke HTTP timeout (default: 120)
   --output-dir PATH           artifact directory
   --safe-ngl-cap N            memory-safe ngl cap unless overridden (default: 192)
   --allow-high-ngl            allow --ngl above safe cap
@@ -119,6 +121,7 @@ while [[ $# -gt 0 ]]; do
         --poll-interval-sec) POLL_INTERVAL_SEC="$2"; shift 2 ;;
         --completion-prompt) COMPLETION_PROMPT="$2"; shift 2 ;;
         --completion-n-predict) COMPLETION_N_PREDICT="$2"; shift 2 ;;
+        --completion-timeout-sec) COMPLETION_TIMEOUT_SEC="$2"; shift 2 ;;
         --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
         --safe-ngl-cap) SAFE_NGL_CAP="$2"; shift 2 ;;
         --allow-high-ngl) ALLOW_HIGH_NGL=1; shift 1 ;;
@@ -198,6 +201,7 @@ for tuple in \
     "--startup-timeout-sec ${STARTUP_TIMEOUT_SEC}" \
     "--poll-interval-sec ${POLL_INTERVAL_SEC}" \
     "--completion-n-predict ${COMPLETION_N_PREDICT}" \
+    "--completion-timeout-sec ${COMPLETION_TIMEOUT_SEC}" \
     "--safe-ngl-cap ${SAFE_NGL_CAP}"; do
     flag="${tuple%% *}"
     value="${tuple##* }"
@@ -363,8 +367,8 @@ PY
 echo "[3/4] probing kv-receiver status"
 curl -sf --max-time 5 "http://${HTTP_HOST}:${HTTP_PORT}/kv-receiver/status" > "${KV_STATUS_JSON}"
 
-echo "[4/4] completion smoke request"
-curl -sf --max-time 30 \
+echo "[4/4] completion smoke request (timeout=${COMPLETION_TIMEOUT_SEC}s)"
+curl -sf --max-time "${COMPLETION_TIMEOUT_SEC}" \
     -H "Content-Type: application/json" \
     -d @"${COMPLETION_REQ_JSON}" \
     "http://${HTTP_HOST}:${HTTP_PORT}/completion" \
