@@ -691,6 +691,38 @@ if (GGML_RPC)
     set(GGML_SOURCES_RPC ggml-rpc.cpp)
 endif()
 
+if (GGML_RDMA)
+    message(STATUS "RDMA transport enabled")
+
+    list(APPEND GGML_CDEF_PUBLIC GGML_USE_RDMA)
+
+    set(GGML_HEADERS_RDMA ../include/ggml-rdma.h)
+    set(GGML_SOURCES_RDMA ggml-rdma.cpp ggml-rdma-jaccl.cpp ggml-rdma-ibverbs.cpp)
+
+    # macOS: check for JACCL (infiniband/verbs.h in SDK 26.2+)
+    if (APPLE)
+        check_include_file_cxx("infiniband/verbs.h" HAVE_IBV_HEADER)
+        if (HAVE_IBV_HEADER)
+            message(STATUS "  JACCL backend: enabled (infiniband/verbs.h found)")
+            add_compile_definitions(GGML_RDMA_USE_JACCL)
+        else()
+            message(STATUS "  JACCL backend: disabled (requires macOS SDK 26.2+)")
+        endif()
+    endif()
+
+    # Linux: check for libibverbs (Soft-RoCE / Soft-iWARP)
+    if (UNIX AND NOT APPLE)
+        find_library(IBVERBS_LIB ibverbs)
+        if (IBVERBS_LIB)
+            message(STATUS "  ibverbs backend: enabled (${IBVERBS_LIB})")
+            add_compile_definitions(GGML_RDMA_USE_IBVERBS)
+            set(GGML_EXTRA_LIBS ${GGML_EXTRA_LIBS} ${IBVERBS_LIB})
+        else()
+            message(STATUS "  ibverbs backend: disabled (install libibverbs-dev)")
+        endif()
+    endif()
+endif()
+
 function(detect_host_compiler)
     if (CMAKE_HOST_SYSTEM_NAME STREQUAL "Windows")
         find_program(HOST_C_COMPILER NAMES cl gcc clang NO_CMAKE_FIND_ROOT_PATH)
@@ -1557,6 +1589,7 @@ add_library(ggml
             ${GGML_SOURCES_CUDA}      ${GGML_HEADERS_CUDA}
             ${GGML_SOURCES_METAL}     ${GGML_HEADERS_METAL}
             ${GGML_SOURCES_RPC}       ${GGML_HEADERS_RPC}
+            ${GGML_SOURCES_RDMA}      ${GGML_HEADERS_RDMA}
             ${GGML_SOURCES_EXTRA}     ${GGML_HEADERS_EXTRA}
             ${GGML_SOURCES_SYCL}      ${GGML_HEADERS_SYCL}
             ${GGML_SOURCES_KOMPUTE}   ${GGML_HEADERS_KOMPUTE}
