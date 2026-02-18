@@ -183,37 +183,42 @@ std::vector<std::string> collect_interface_ips(const std::vector<std::string> & 
         return out;
     }
 
-    for (struct ifaddrs * cur = ifaddr; cur != nullptr; cur = cur->ifa_next) {
-        if (!cur->ifa_name || !cur->ifa_addr) {
-            continue;
-        }
-        if (!(cur->ifa_flags & IFF_UP)) {
-            continue;
-        }
-        if (std::find(ifnames.begin(), ifnames.end(), cur->ifa_name) == ifnames.end()) {
-            continue;
-        }
-
-        char buf[INET6_ADDRSTRLEN] = {};
-        if (cur->ifa_addr->sa_family == AF_INET) {
-            const struct sockaddr_in * sin = (const struct sockaddr_in *) cur->ifa_addr;
-            if (::inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf)) == nullptr) {
+    // Collect IPv4 first (preferred — ggml-rpc only supports AF_INET), then IPv6.
+    for (int pass = 0; pass < 2; pass++) {
+        const sa_family_t want = (pass == 0) ? AF_INET : AF_INET6;
+        for (struct ifaddrs * cur = ifaddr; cur != nullptr; cur = cur->ifa_next) {
+            if (!cur->ifa_name || !cur->ifa_addr) {
                 continue;
             }
-        } else if (cur->ifa_addr->sa_family == AF_INET6) {
-            const struct sockaddr_in6 * sin6 = (const struct sockaddr_in6 *) cur->ifa_addr;
-            if (::inet_ntop(AF_INET6, &sin6->sin6_addr, buf, sizeof(buf)) == nullptr) {
+            if (!(cur->ifa_flags & IFF_UP)) {
                 continue;
             }
-        } else {
-            continue;
-        }
+            if (cur->ifa_addr->sa_family != want) {
+                continue;
+            }
+            if (std::find(ifnames.begin(), ifnames.end(), cur->ifa_name) == ifnames.end()) {
+                continue;
+            }
 
-        const std::string ip(buf);
-        if (ip.empty() || ip == "127.0.0.1" || ip == "::1") {
-            continue;
+            char buf[INET6_ADDRSTRLEN] = {};
+            if (want == AF_INET) {
+                const struct sockaddr_in * sin = (const struct sockaddr_in *) cur->ifa_addr;
+                if (::inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf)) == nullptr) {
+                    continue;
+                }
+            } else {
+                const struct sockaddr_in6 * sin6 = (const struct sockaddr_in6 *) cur->ifa_addr;
+                if (::inet_ntop(AF_INET6, &sin6->sin6_addr, buf, sizeof(buf)) == nullptr) {
+                    continue;
+                }
+            }
+
+            const std::string ip(buf);
+            if (ip.empty() || ip == "127.0.0.1" || ip == "::1") {
+                continue;
+            }
+            append_unique(out, ip);
         }
-        append_unique(out, ip);
     }
 
     ::freeifaddrs(ifaddr);
