@@ -1249,7 +1249,17 @@ GGML_CALL static bool ggml_backend_rpc_supports_op(ggml_backend_t backend,
 GGML_CALL static bool
 ggml_backend_rpc_supports_buft(ggml_backend_t backend,
                                ggml_backend_buffer_type_t buft) {
-  if (!buft || buft->iface.get_name != ggml_backend_rpc_buffer_type_name) {
+  if (!buft) {
+    return false;
+  }
+
+  // Accept Metal_RPC_Split buffers for graph split mode
+  const char *name = buft->iface.get_name(buft);
+  if (name && strcmp(name, "Metal_RPC_Split") == 0) {
+    return true;
+  }
+
+  if (buft->iface.get_name != ggml_backend_rpc_buffer_type_name) {
     return false;
   }
   ggml_backend_rpc_buffer_type_context *buft_ctx =

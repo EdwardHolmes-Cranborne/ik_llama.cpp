@@ -5890,7 +5890,17 @@ ggml_backend_metal_supports_op(ggml_backend_t backend,
 GGML_CALL static bool
 ggml_backend_metal_supports_buft(ggml_backend_t backend,
                                  ggml_backend_buffer_type_t buft) {
-  return buft->iface.get_name == ggml_backend_metal_buffer_type_get_name;
+  if (buft->iface.get_name == ggml_backend_metal_buffer_type_get_name) {
+    return true;
+  }
+
+  // Accept Metal_RPC_Split buffers for graph split mode
+  const char *name = buft->iface.get_name(buft);
+  if (name && strcmp(name, "Metal_RPC_Split") == 0) {
+    return true;
+  }
+
+  return false;
 
   UNUSED(backend);
 }
