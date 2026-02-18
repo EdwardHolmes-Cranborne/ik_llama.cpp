@@ -462,6 +462,9 @@ static bool parse_endpoint(const std::string & endpoint, std::string & host, int
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
 // No response
 static bool send_rpc_cmd(const std::shared_ptr<socket_t> & sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
+    if (sock == nullptr) {
+        return false;
+    }
     uint8_t cmd_byte = cmd;
     if (!send_data(sock->fd, &cmd_byte, sizeof(cmd_byte))) {
         return false;
@@ -478,6 +481,9 @@ static bool send_rpc_cmd(const std::shared_ptr<socket_t> & sock, enum rpc_cmd cm
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
 // RPC response: | response_size (8 bytes) | response_data (response_size bytes) |
 static bool send_rpc_cmd(const std::shared_ptr<socket_t> & sock, enum rpc_cmd cmd, const void * input, size_t input_size, void * output, size_t output_size) {
+    if (sock == nullptr) {
+        return false;
+    }
     if (!send_rpc_cmd(sock, cmd, input, input_size)) {
         return false;
     }
@@ -1934,8 +1940,15 @@ GGML_API GGML_CALL void ggml_backend_rpc_start_server(const char* endpoint,
 
 GGML_API GGML_CALL uint32_t ggml_backend_rpc_get_device_count(const char* endpoint) {
     auto sock = get_socket(endpoint);
+    if (sock == nullptr) {
+        fprintf(stderr, "Failed to connect to %s\n", endpoint ? endpoint : "<null-endpoint>");
+        return 0;
+    }
     rpc_msg_device_count_rsp response;
     bool status = send_rpc_cmd(sock, RPC_CMD_DEVICE_COUNT, nullptr, 0, &response, sizeof(response));
-    RPC_STATUS_ASSERT(status);
+    if (!status) {
+        fprintf(stderr, "Failed to query device count from %s\n", endpoint ? endpoint : "<null-endpoint>");
+        return 0;
+    }
     return response.device_count;
 }

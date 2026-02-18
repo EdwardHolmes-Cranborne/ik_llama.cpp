@@ -1565,7 +1565,11 @@ bool gpt_params_find_arg(int argc, char **argv, const std::string &arg,
     std::string servers(argv[i]);
     servers = add_rpc_devices(servers);
     if (servers.empty()) {
-      return false;
+      fprintf(stderr,
+              "error: unable to connect to any RPC server from --rpc '%s'\n",
+              argv[i]);
+      invalid_param = true;
+      return true;
     }
     params.rpc_servers = servers;
 #endif
