@@ -988,6 +988,7 @@ GGML_CALL static bool ggml_backend_rpc_supports_op(ggml_backend_t backend, const
     // RPC has no op-capability query yet. Returning true for everything can crash
     // remote Metal backends on fused up/gate expert ops they do not implement.
     switch (op->op) {
+        case GGML_OP_REDUCE:
         case GGML_OP_MOE_FUSED_UP_GATE:
         case GGML_OP_FUSED_UP_GATE:
             return false;
@@ -1758,6 +1759,24 @@ bool rpc_server::graph_compute(const std::vector<uint8_t>& input) {
     ggml_backend_t backend = backends[device];
     fprintf(stderr, "[%s] compute device=%u backend=%p backend_ctx=%p n_nodes=%u n_tensors=%u\n",
         __func__, device, (void *) backend, backend ? backend->context : nullptr, n_nodes, n_tensors);
+    fflush(stderr);
+    for (uint32_t i = 0; i < n_nodes; ++i) {
+        ggml_tensor * node = graph->nodes[i];
+        const bool supports = ggml_backend_supports_op(backend, node);
+        const char * src0_type = node->src[0] ? ggml_type_name(node->src[0]->type) : "-";
+        const char * src1_type = node->src[1] ? ggml_type_name(node->src[1]->type) : "-";
+        const char * src2_type = node->src[2] ? ggml_type_name(node->src[2]->type) : "-";
+        fprintf(stderr,
+            "[%s] node[%u] op=%s type=%s supports=%d ne=[%lld,%lld,%lld,%lld] src_types=[%s,%s,%s] buffer=%p data=%p\n",
+            __func__, i, ggml_op_name(node->op), ggml_type_name(node->type), supports ? 1 : 0,
+            (long long) node->ne[0], (long long) node->ne[1], (long long) node->ne[2], (long long) node->ne[3],
+            src0_type, src1_type, src2_type, (void *) node->buffer, node->data);
+        if (!supports) {
+            fprintf(stderr, "[%s] rejecting graph due to unsupported op at node[%u]\n", __func__, i);
+            fflush(stderr);
+            return false;
+        }
+    }
     fflush(stderr);
     ggml_status status = ggml_backend_graph_compute(backend, graph);
     if (status != GGML_STATUS_SUCCESS) {

@@ -1453,8 +1453,16 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct gg
             }
             if (src_id >= 0) {
                 int * this_node_backend_id = &tensor_backend_id(view_src);
-                *this_node_backend_id = tensor_backend_id(node->src[src_id]);
-                *node_backend_id = *this_node_backend_id;
+                const int preferred_backend_id = tensor_backend_id(node->src[src_id]);
+                if (preferred_backend_id >= 0 &&
+                    ggml_backend_supports_op(sched->backends[preferred_backend_id], node)) {
+                    *this_node_backend_id = preferred_backend_id;
+                    *node_backend_id = preferred_backend_id;
+                } else {
+                    // Leave REDUCE unassigned so later passes can place it on a backend that supports it (typically CPU).
+                    *this_node_backend_id = -1;
+                    *node_backend_id = -1;
+                }
             }
         }
         else if (node->op == GGML_OP_MUL && node->src[0]->op == GGML_OP_NORM) {
@@ -1805,10 +1813,7 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct gg
                 if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
                     // create a copy of the input in the split's backend
                     if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
-                        if (node->op == GGML_OP_REDUCE) {
-                            //printf("setting tensor_id_copy(reduce, %zu, %d, %s) to %s\n", src_id, cur_backend_id, node->name, src->name);
-                            tensor_id_copy(src_id, cur_backend_id, 0) = src;
-                        } else if (node->op == GGML_OP_FAKE_CPY && src->op == GGML_OP_REDUCE) {
+                        if (node->op == GGML_OP_FAKE_CPY && src->op == GGML_OP_REDUCE) {
                             //printf("setting tensor_id_copy(fake_cpy, %zu, %d, %s) to %s\n", src_id, cur_backend_id, node->name, src->src[j]->name);
                             tensor_id_copy(src_id, cur_backend_id, 0) = src->src[j];
                         } else {
@@ -1828,7 +1833,18 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct gg
                         split->inputs[n_inputs] = src;
                         }
                     }
-                    node->src[j] = tensor_id_copy(src_id, cur_backend_id, sched->cur_copy);
+                    struct ggml_tensor * src_copy = tensor_id_copy(src_id, cur_backend_id, sched->cur_copy);
+                    GGML_ASSERT(src_copy != NULL);
+
+                    // Keep view tensors coherent when an input is remapped across backends.
+                    // REDUCE outputs are views of one source tensor, so updating src[] without
+                    // updating view_src can leave dst->data pointing at an inaccessible buffer.
+                    if (node->view_src == src) {
+                        node->view_src = src_copy;
+                        node->data = src_copy->data ? (char *) src_copy->data + node->view_offs : NULL;
+                    }
+
+                    node->src[j] = src_copy;
                 }
             }
         }

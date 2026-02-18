@@ -22907,6 +22907,73 @@ static void ggml_compute_forward_cross_entropy_loss_back(
 
 /////////////////////////////////
 
+static void ggml_compute_forward_reduce_f32(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->nb[0] == sizeof(float));
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int nr = ggml_nrows(dst);
+    const int dr = (nr + nth - 1) / nth;
+    const int ir0 = dr * ith;
+    const int ir1 = MIN(ir0 + dr, nr);
+
+    const int n_src = dst->op_params[1];
+    GGML_ASSERT(n_src > 1 && n_src <= GGML_MAX_SRC);
+
+    const int64_t ne0 = dst->ne[0];
+    const int64_t ne1 = dst->ne[1];
+    const int64_t ne2 = dst->ne[2];
+
+    for (int ir = ir0; ir < ir1; ++ir) {
+        const int64_t i3 = ir / (ne2 * ne1);
+        const int64_t i2 = (ir - i3 * ne2 * ne1) / ne1;
+        const int64_t i1 = ir - i3 * ne2 * ne1 - i2 * ne1;
+
+        float * dst_ptr = (float *) ((char *) dst->data + i3 * dst->nb[3] + i2 * dst->nb[2] + i1 * dst->nb[1]);
+
+        bool initialized = false;
+        for (int j = 0; j < n_src; ++j) {
+            const struct ggml_tensor * src = dst->src[j];
+            if (src == NULL) {
+                continue;
+            }
+
+            GGML_ASSERT(src->type == GGML_TYPE_F32);
+            GGML_ASSERT(ggml_are_same_shape(src, dst));
+            GGML_ASSERT(src->nb[0] == sizeof(float));
+
+            const float * src_ptr = (const float *) ((const char *) src->data + i3 * src->nb[3] + i2 * src->nb[2] + i1 * src->nb[1]);
+            if (!initialized) {
+                memcpy(dst_ptr, src_ptr, ne0 * sizeof(float));
+                initialized = true;
+            } else {
+                ggml_vec_add_f32((int) ne0, dst_ptr, dst_ptr, src_ptr);
+            }
+        }
+
+        GGML_ASSERT(initialized);
+    }
+}
+
+static void ggml_compute_forward_reduce(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    switch (dst->type) {
+        case GGML_TYPE_F32:
+            ggml_compute_forward_reduce_f32(params, dst);
+            break;
+        default:
+            GGML_ABORT("REDUCE not implemented for type %s", ggml_type_name(dst->type));
+    }
+}
+
+/////////////////////////////////
+
 static int ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor,
         const struct ggml_cgraph * cgraph, int i) {
 
@@ -22923,8 +22990,9 @@ static int ggml_compute_forward(struct ggml_compute_params * params, struct ggml
     switch (tensor->op) {
         case GGML_OP_REDUCE:
             {
-                GGML_ABORT("REDUCE not implemented");
+                ggml_compute_forward_reduce(params, tensor);
             }
+            break;
         case GGML_OP_FAKE_CPY:
             {
                 GGML_ABORT("FAKE_CPY not implemented");
@@ -25082,6 +25150,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_ARGSORT:
         case GGML_OP_ARGSORT_THRESH:
         case GGML_OP_GROUPED_TOPK:
+        case GGML_OP_REDUCE:
         case GGML_OP_FLASH_ATTN_EXT:
         case GGML_OP_FLASH_ATTN_BACK:
         case GGML_OP_SSM_CONV:
