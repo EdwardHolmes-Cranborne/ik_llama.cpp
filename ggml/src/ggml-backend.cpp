@@ -1873,6 +1873,9 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct gg
             assert(graph_copy->size > (graph_copy->n_nodes + 1));
 
             struct ggml_tensor * input = split->inputs[j];
+            if (!input) {
+                continue;
+            }
             const size_t input_id = hash_id(input);
             struct ggml_tensor * input_cpy = tensor_id_copy(input_id, split->backend_id, sched->cur_copy);
 
@@ -1912,6 +1915,9 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct gg
             int backend_id = split->backend_id;
             for (int j = 0; j < split->n_inputs; j++) {
                 struct ggml_tensor * input = split->inputs[j];
+                if (!input) {
+                    continue;
+                }
                 size_t id = hash_id(input);
                 for (int c = 0; c < sched->n_copies; c++) {
                     struct ggml_tensor * input_cpy = tensor_id_copy(id, backend_id, c);
@@ -1975,8 +1981,14 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
     ggml_backend_t last_input_backend = nullptr;
     bool synced_on_input = false;
     for (int j = 0; j < split->n_inputs; j++) {
-        ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[j]);
         struct ggml_tensor * input = split->inputs[j];
+        if (!input) {
+            continue;
+        }
+        ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, input);
+        if (!input_backend) {
+            input_backend = split_backend;
+        }
         struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
         if (input->flags & GGML_TENSOR_FLAG_INPUT) {
@@ -2004,6 +2016,7 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
 
             ggml_tensor * node = split->graph.nodes[0];
             if (sched->only_active_experts && split->graph.n_nodes > 0 &&
+                    input->buffer &&
                     ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
                     ggml_backend_buffer_is_host(input->buffer) &&
                     (node->op == GGML_OP_MUL_MAT_ID || node->op == GGML_OP_MOE_FUSED_UP_GATE)) {
@@ -2019,9 +2032,16 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
                 // if the ids tensor is also an input of the split, it may not have been copied yet to the split backend
                 // in that case, we use the original ids tensor
                 for (int jj = j + 1; jj < split->n_inputs; ++jj) {
-                    if (ids_tensor == tensor_copy(split->inputs[jj], split_backend_id, sched->cur_copy)) {
-                        ids_tensor = split->inputs[jj];
-                        ids_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[jj]);
+                    auto candidate = split->inputs[jj];
+                    if (!candidate) {
+                        continue;
+                    }
+                    if (ids_tensor == tensor_copy(candidate, split_backend_id, sched->cur_copy)) {
+                        ids_tensor = candidate;
+                        ids_backend = ggml_backend_sched_get_tensor_backend(sched, candidate);
+                        if (!ids_backend) {
+                            ids_backend = split_backend;
+                        }
                         break;
                     }
                 }
@@ -2237,7 +2257,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         sched->needs_sync[split_backend_id] = true;
                     } else {
                         for (int j = 0; j < split->n_inputs; ++j) {
-                            if (ggml_backend_buffer_is_host(split->inputs[j]->buffer)) {
+                            auto input = split->inputs[j];
+                            if (input && input->buffer && ggml_backend_buffer_is_host(input->buffer)) {
                                 sched->needs_sync[split_backend_id] = true;
                             }
                         }
@@ -2311,7 +2332,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         sched->needs_sync[split_backend_id] = true;
                     } else {
                         for (int j = 0; j < split->n_inputs; ++j) {
-                            if (ggml_backend_buffer_is_host(split->inputs[j]->buffer)) {
+                            auto input = split->inputs[j];
+                            if (input && input->buffer && ggml_backend_buffer_is_host(input->buffer)) {
                                 sched->needs_sync[split_backend_id] = true;
                             }
                         }
@@ -2377,7 +2399,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             sched->needs_sync[split_backend_id] = true;
         } else {
             for (int j = 0; j < split->n_inputs; ++j) {
-                if (ggml_backend_buffer_is_host(split->inputs[j]->buffer)) {
+                auto input = split->inputs[j];
+                if (input && input->buffer && ggml_backend_buffer_is_host(input->buffer)) {
                     sched->needs_sync[split_backend_id] = true;
                 }
             }
@@ -2543,8 +2566,12 @@ static void ggml_sched_prepare_graph(ggml_backend_sched_t sched) {
                 if (split->n_inputs < 1) continue;
                 size_t this_size = 0;
                 for (int j = 0; j < split->n_inputs; ++j) {
-                    if (!ggml_backend_buffer_is_host(split->inputs[j]->buffer)) {
-                        this_size += tensor_size(split->inputs[j]);
+                    auto input = split->inputs[j];
+                    if (!input) {
+                        continue;
+                    }
+                    if (input->buffer && !ggml_backend_buffer_is_host(input->buffer)) {
+                        this_size += tensor_size(input);
                     }
                 }
                 if (input_size + this_size > sched->max_extra_alloc) {
@@ -2573,8 +2600,12 @@ static void ggml_sched_prepare_graph(ggml_backend_sched_t sched) {
                 auto split = sched->backend_splits[backend_id][i];
                 size_t this_size = 0;
                 for (int j = 0; j < split->n_inputs; ++j) {
-                    if (!ggml_backend_buffer_is_host(split->inputs[j]->buffer)) {
-                        this_size += tensor_size(split->inputs[j]);
+                    auto input = split->inputs[j];
+                    if (!input) {
+                        continue;
+                    }
+                    if (input->buffer && !ggml_backend_buffer_is_host(input->buffer)) {
+                        this_size += tensor_size(input);
                     }
                 }
                 if (input_size + this_size > max_input_size) {
@@ -2582,8 +2613,11 @@ static void ggml_sched_prepare_graph(ggml_backend_sched_t sched) {
                     input_size = 0;
                 }
                 for (int j = 0; j < split->n_inputs; ++j) {
-                    if (ggml_backend_buffer_is_host(split->inputs[j]->buffer)) continue;
-                    auto input_cpy = tensor_copy(split->inputs[j], backend_id, sched->cur_copy);
+                    auto input = split->inputs[j];
+                    if (!input || !input->buffer || ggml_backend_buffer_is_host(input->buffer)) {
+                        continue;
+                    }
+                    auto input_cpy = tensor_copy(input, backend_id, sched->cur_copy);
                     for (int k = 0; k < split->graph.n_nodes; ++k) {
                         auto node = split->graph.nodes[k];
                         for (int l = 0; l < GGML_MAX_SRC; ++l) {
@@ -2591,7 +2625,7 @@ static void ggml_sched_prepare_graph(ggml_backend_sched_t sched) {
                         }
                     }
                     input_cpy->data = ptr;
-                    ptr += tensor_size(split->inputs[j]);
+                    ptr += tensor_size(input);
                 }
                 input_size += this_size;
             }

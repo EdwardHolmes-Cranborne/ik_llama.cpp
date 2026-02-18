@@ -6074,6 +6074,10 @@ struct ggml_tensor * ggml_reduce(
         if (a[j]) { ++nhave; last = a[j]; }
     }
     GGML_ASSERT(last);
+    if (nhave == 1) {
+        // Reduction over a single active input is a no-op pass-through.
+        return ggml_view_tensor(ctx, last);
+    }
     GGML_ASSERT(nhave > 1);
     struct ggml_tensor * result = ggml_view_tensor(ctx, last);
     for (int j = 0; j < n; ++j) {
