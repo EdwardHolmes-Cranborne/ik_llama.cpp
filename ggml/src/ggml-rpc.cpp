@@ -10,6 +10,7 @@
 #include <vector>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <cerrno>
@@ -36,6 +37,10 @@
 namespace fs = std::filesystem;
 
 static constexpr size_t MAX_CHUNK_SIZE = 1024ull * 1024ull * 1024ull; // 1 GiB
+
+// Serialize backend operations across client connections. The RPC server can
+// accept multiple clients concurrently, but backends are not re-entrant.
+static std::mutex g_rpc_backend_exec_mutex;
 
 #define UNUSED GGML_UNUSED
 
@@ -1845,6 +1850,13 @@ static void rpc_serve_client(const std::vector<ggml_backend_t>& backends, const 
             fprintf(stderr, "Unknown command: %d\n", cmd);
             break;
         }
+
+        // Allow lightweight metadata commands without backend serialization.
+        std::unique_lock<std::mutex> backend_lock;
+        if (cmd != RPC_CMD_HELLO && cmd != RPC_CMD_DEVICE_COUNT) {
+            backend_lock = std::unique_lock<std::mutex>(g_rpc_backend_exec_mutex);
+        }
+
         switch (cmd) {
         case RPC_CMD_HELLO: {
             // HELLO command is handled above
@@ -2139,13 +2151,16 @@ GGML_API GGML_CALL void ggml_backend_rpc_start_server(const char* endpoint,
         auto client_socket = socket_accept(server_socket->fd);
         if (client_socket == nullptr) {
             fprintf(stderr, "Failed to accept client connection\n");
-            return;
+            continue;
         }
-        printf("Accepted client connection\n");
-        fflush(stdout);
-        rpc_serve_client(backends, cache_dir, client_socket->fd, free_mem_vec, total_mem_vec);
-        printf("Client connection closed\n");
-        fflush(stdout);
+
+        std::thread([client_socket, &backends, cache_dir, &free_mem_vec, &total_mem_vec]() {
+            printf("Accepted client connection\n");
+            fflush(stdout);
+            rpc_serve_client(backends, cache_dir, client_socket->fd, free_mem_vec, total_mem_vec);
+            printf("Client connection closed\n");
+            fflush(stdout);
+        }).detach();
     }
 #ifdef _WIN32
     WSACleanup();
