@@ -177,6 +177,7 @@ mkdir -p "${OUTPUT_DIR}" "${SLOT_SAVE_PATH}" "${KV_RECV_OUTPUT_DIR}"
 SERVER_LOG="${OUTPUT_DIR}/server.log"
 CMD_FILE="${OUTPUT_DIR}/server_command.txt"
 HEALTH_JSON="${OUTPUT_DIR}/health.json"
+HEALTH_LAST_JSON="${OUTPUT_DIR}/health_last.json"
 KV_STATUS_JSON="${OUTPUT_DIR}/kv_receiver_status.json"
 COMPLETION_REQ_JSON="${OUTPUT_DIR}/completion_request.json"
 COMPLETION_RESP_JSON="${OUTPUT_DIR}/completion_response.json"
@@ -234,8 +235,9 @@ next_progress=$((start_epoch + 30))
 ready=0
 while true; do
     now=$(date +%s)
-    if curl -sf --max-time 2 "http://${HTTP_HOST}:${HTTP_PORT}/health" > "${HEALTH_JSON}.tmp"; then
-        mv "${HEALTH_JSON}.tmp" "${HEALTH_JSON}"
+    health_code="$(curl -sS --max-time 2 -o "${HEALTH_LAST_JSON}.tmp" -w '%{http_code}' "http://${HTTP_HOST}:${HTTP_PORT}/health" || true)"
+    if [[ "${health_code}" == "200" ]]; then
+        mv "${HEALTH_LAST_JSON}.tmp" "${HEALTH_JSON}"
         ready=1
         break
     fi
@@ -249,10 +251,27 @@ while true; do
         exit 1
     fi
 
+    if [[ "${health_code}" == "500" ]] && grep -qi "model failed to load" "${HEALTH_LAST_JSON}.tmp"; then
+        mv "${HEALTH_LAST_JSON}.tmp" "${HEALTH_LAST_JSON}"
+        echo "health endpoint reported model load failure" >&2
+        echo "--- health body ---" >&2
+        cat "${HEALTH_LAST_JSON}" >&2 || true
+        echo >&2
+        echo "--- server log tail ---" >&2
+        tail -n 120 "${SERVER_LOG}" >&2 || true
+        exit 1
+    fi
+
     if (( now >= deadline )); then
         echo "timed out waiting for /health after ${STARTUP_TIMEOUT_SEC}s" >&2
         echo "--- listener check ---" >&2
         lsof -nP -iTCP:"${HTTP_PORT}" -sTCP:LISTEN >&2 || true
+        if [[ -s "${HEALTH_LAST_JSON}.tmp" ]]; then
+            mv "${HEALTH_LAST_JSON}.tmp" "${HEALTH_LAST_JSON}"
+            echo "--- last /health body ---" >&2
+            cat "${HEALTH_LAST_JSON}" >&2 || true
+            echo >&2
+        fi
         echo "--- server log tail ---" >&2
         tail -n 120 "${SERVER_LOG}" >&2 || true
         exit 1
@@ -260,7 +279,12 @@ while true; do
 
     if (( now >= next_progress )); then
         elapsed=$((now - start_epoch))
-        echo "[wait] /health not ready yet (elapsed=${elapsed}s)"
+        if [[ "${health_code}" != "000" && "${health_code}" != "0" ]]; then
+            health_preview="$(tr '\n' ' ' < "${HEALTH_LAST_JSON}.tmp" | cut -c1-180)"
+            echo "[wait] /health code=${health_code} elapsed=${elapsed}s body='${health_preview}'"
+        else
+            echo "[wait] /health not reachable yet (elapsed=${elapsed}s)"
+        fi
         next_progress=$((now + 30))
     fi
 
