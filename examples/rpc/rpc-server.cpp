@@ -598,6 +598,8 @@ static size_t get_gpu_backend_count(const rpc_server_params &params) {
   size_t count = 0;
 #if defined(GGML_USE_CUDA)
   count = ggml_backend_cuda_get_device_count();
+#elif defined(GGML_USE_METAL)
+  count = 1; // Metal always has exactly one device
 #elif defined(GGML_USE_SYCL)
   count = ggml_backend_sycl_get_device_count();
 #elif defined(GGML_USE_VULKAN)
