@@ -5990,9 +5990,18 @@ llama_new_context_with_model(struct llama_model *model,
                .empty() // Metal+RPC split always needs graph scheduling
 #endif
        )) {
-    ggml_backend_sched_set_split_mode_graph(ctx->sched, true,
-                                            cparams.scheduler_async);
+    bool use_async = cparams.scheduler_async;
+#if defined(GGML_USE_METAL) && defined(GGML_USE_RPC)
+    if (!model->rpc_servers.empty()) {
+      use_async = true; // Metal+RPC must use async for parallel split execution
+      LLAMA_LOG_INFO("%s: Metal+RPC graph split: forcing async scheduler\n",
+                     __func__);
+    }
+#endif
+    ggml_backend_sched_set_split_mode_graph(ctx->sched, true, use_async);
     ggml_backend_sched_set_max_extra_alloc(ctx->sched, params.max_extra_alloc);
+    LLAMA_LOG_INFO("%s: graph scheduling ENABLED (async=%d)\n", __func__,
+                   use_async);
     if (model->has_tensor_overrides() && cparams.split_mode_graph_scheduling) {
       LLAMA_LOG_INFO("XXXXXXXX Split Mode Graph Scheduling is FORCED despite "
                      "tensor overrides due to user choice.\n");
