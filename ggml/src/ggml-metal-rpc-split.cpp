@@ -62,12 +62,38 @@ ggml_backend_split_buffer_get_base(ggml_backend_buffer_t buffer) {
 GGML_CALL static void
 ggml_backend_split_buffer_init_tensor(ggml_backend_buffer_t buffer,
                                       ggml_tensor *tensor) {
-  if (!tensor->extra)
-    return;
-
-  auto *extra = (ggml_split_tensor_t *)tensor->extra;
   auto *buf_ctx = (ggml_backend_split_buffer_context *)buffer->context;
   auto *type_ctx = buf_ctx->type_ctx;
+
+  if (!tensor->extra) {
+    // Tensor is NOT split — allocate on device 0 (local Metal)
+    auto size = ggml_nbytes(tensor);
+    auto *dev_buffer =
+        ggml_backend_buft_alloc_buffer(type_ctx->device_bufts[0], size);
+
+    if (!dev_buffer) {
+      fprintf(stderr,
+              "%s: failed to allocate %zu bytes on device 0 for non-split "
+              "tensor %s\n",
+              __func__, size, tensor->name);
+      GGML_ABORT("split buffer allocation failed");
+    }
+
+    ggml_backend_buffer_set_usage(dev_buffer,
+                                  GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    tensor->buffer = dev_buffer;
+    tensor->data = ggml_backend_buffer_get_base(dev_buffer);
+
+    if (dev_buffer->iface.init_tensor) {
+      dev_buffer->iface.init_tensor(dev_buffer, tensor);
+    }
+
+    buf_ctx->sub_buffers.push_back(dev_buffer);
+    return;
+  }
+
+  auto *extra = (ggml_split_tensor_t *)tensor->extra;
 
   GGML_ASSERT(extra->n_device <= type_ctx->n_device);
 
@@ -109,8 +135,14 @@ ggml_backend_split_buffer_set_tensor(ggml_backend_buffer_t buffer,
                                      ggml_tensor *tensor, const void *data,
                                      size_t offset, size_t size) {
   GGML_UNUSED(buffer);
-  if (!tensor->extra)
+  if (!tensor->extra) {
+    // Non-split tensor: forward to its device buffer
+    if (tensor->buffer && tensor->buffer->iface.set_tensor) {
+      tensor->buffer->iface.set_tensor(tensor->buffer, tensor, data, offset,
+                                       size);
+    }
     return;
+  }
 
   // Split tensors must always be set in their entirety
   GGML_ASSERT(offset == 0);
@@ -214,9 +246,14 @@ ggml_backend_split_buffer_get_tensor(ggml_backend_buffer_t buffer,
                                      const ggml_tensor *tensor, void *data,
                                      size_t offset, size_t size) {
   GGML_UNUSED(buffer);
-  if (!tensor->extra)
+  if (!tensor->extra) {
+    // Non-split tensor: forward to its device buffer
+    if (tensor->buffer && tensor->buffer->iface.get_tensor) {
+      tensor->buffer->iface.get_tensor(tensor->buffer, tensor, data, offset,
+                                       size);
+    }
     return;
-
+  }
   auto *extra = (ggml_split_tensor_t *)tensor->extra;
   for (int i = 0; i < extra->n_device; ++i) {
     if (extra->splits[i] && extra->splits[i]->buffer) {
