@@ -5984,7 +5984,12 @@ llama_new_context_with_model(struct llama_model *model,
     ggml_backend_sched_set_only_active_experts(ctx->sched, true);
   }
   if (model->split_mode == LLAMA_SPLIT_MODE_GRAPH &&
-      (!model->has_tensor_overrides() || cparams.split_mode_graph_scheduling)) {
+      (!model->has_tensor_overrides() || cparams.split_mode_graph_scheduling
+#if defined(GGML_USE_METAL) && defined(GGML_USE_RPC)
+       || !model->rpc_servers
+               .empty() // Metal+RPC split always needs graph scheduling
+#endif
+       )) {
     ggml_backend_sched_set_split_mode_graph(ctx->sched, true,
                                             cparams.scheduler_async);
     ggml_backend_sched_set_max_extra_alloc(ctx->sched, params.max_extra_alloc);
