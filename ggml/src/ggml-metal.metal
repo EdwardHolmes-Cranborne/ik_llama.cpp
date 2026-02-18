@@ -517,6 +517,76 @@ kernel void kernel_multi_add(
     dst_ptr[0] = sum;
 }
 
+kernel void kernel_mul_multi_add_4(
+        device const float4 * src0,
+        device const float  * src1,
+        device       float4 * dst,
+        constant int64_t    & ne0,
+        constant int64_t    & ne1,
+        constant int64_t    & ne01,
+        constant int64_t    & nb1,
+        constant int64_t    & nb01,
+        constant int64_t    & nb02,
+        constant int64_t    & nb11,
+        constant int64_t    & nb12,
+        uint tpig[[thread_position_in_grid]]) {
+
+    int64_t i0 = tpig % (ne0/4);
+    int64_t i1 = tpig / (ne0/4);
+    if (i1 >= ne1) {
+        return;
+    }
+
+    device const char * src0_row = (device const char *) src0 + i1 * nb02;
+    device const char * src1_row = (device const char *) src1 + i1 * nb12;
+    device       char * dst_row  = (device       char *) dst  + i1 * nb1;
+
+    float4 sum = float4(0.0f);
+    for (int64_t j = 0; j < ne01; ++j) {
+        const device float4 * x0_ptr = (const device float4 *) (src0_row + j * nb01 + i0 * sizeof(float4));
+        const device float  * x1_ptr = (const device float  *) (src1_row + j * nb11);
+        sum += x0_ptr[0] * x1_ptr[0];
+    }
+
+    device float4 * dst_ptr = (device float4 *) (dst_row + i0 * sizeof(float4));
+    dst_ptr[0] = sum;
+}
+
+kernel void kernel_mul_multi_add(
+        device const float  * src0,
+        device const float  * src1,
+        device       float  * dst,
+        constant int64_t    & ne0,
+        constant int64_t    & ne1,
+        constant int64_t    & ne01,
+        constant int64_t    & nb1,
+        constant int64_t    & nb01,
+        constant int64_t    & nb02,
+        constant int64_t    & nb11,
+        constant int64_t    & nb12,
+        uint tpig[[thread_position_in_grid]]) {
+
+    int64_t i0 = tpig % ne0;
+    int64_t i1 = tpig / ne0;
+    if (i1 >= ne1) {
+        return;
+    }
+
+    device const char * src0_row = (device const char *) src0 + i1 * nb02;
+    device const char * src1_row = (device const char *) src1 + i1 * nb12;
+    device       char * dst_row  = (device       char *) dst  + i1 * nb1;
+
+    float sum = 0.0f;
+    for (int64_t j = 0; j < ne01; ++j) {
+        const device float * x0_ptr = (const device float *) (src0_row + j * nb01 + i0 * sizeof(float));
+        const device float * x1_ptr = (const device float *) (src1_row + j * nb11);
+        sum += x0_ptr[0] * x1_ptr[0];
+    }
+
+    device float * dst_ptr = (device float *) (dst_row + i0 * sizeof(float));
+    dst_ptr[0] = sum;
+}
+
 kernel void kernel_sum_rows(
         device const float * src0,
         device       float * dst,

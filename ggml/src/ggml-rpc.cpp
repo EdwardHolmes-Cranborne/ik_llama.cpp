@@ -2,6 +2,9 @@
 #include "ggml.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cpp.h"
+#ifdef GGML_USE_METAL
+#include "ggml-metal.h"
+#endif
 #include <cinttypes>
 #include <string>
 #include <vector>
@@ -907,9 +910,16 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
 
 GGML_CALL static bool ggml_backend_rpc_supports_op(ggml_backend_t backend, const ggml_tensor * op) {
     UNUSED(backend);
-    UNUSED(op);
-    //TODO: call the remote backend and cache the results
-    return true;
+
+    // RPC has no op-capability query yet. Returning true for everything can crash
+    // remote Metal backends on fused up/gate expert ops they do not implement.
+    switch (op->op) {
+        case GGML_OP_MOE_FUSED_UP_GATE:
+        case GGML_OP_FUSED_UP_GATE:
+            return false;
+        default:
+            return true;
+    }
 }
 
 GGML_CALL static bool ggml_backend_rpc_supports_buft(ggml_backend_t backend, ggml_backend_buffer_type_t buft) {
@@ -1956,6 +1966,12 @@ GGML_API GGML_CALL void ggml_backend_rpc_start_server(const char* endpoint,
         auto dev = devices[i];
         backends.push_back(dev);
         const char* name = ggml_backend_name(devices[i]);
+#ifdef GGML_USE_METAL
+        if (strcmp(name, "Metal") == 0) {
+            // Metal RPC workers are more stable with a small number of command buffers.
+            ggml_backend_metal_set_n_cb(dev, 2);
+        }
+#endif
         printf("  %8s:  %10zu MiB total, %10zu MiB free\n", name, 
             total_mem_vec[i] / 1024 / 1024, free_mem_vec[i] / 1024 / 1024);
     }
