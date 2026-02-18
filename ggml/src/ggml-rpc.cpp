@@ -2,6 +2,9 @@
 #include "ggml-backend-impl.h"
 #include "ggml-cpp.h"
 #include "ggml.h"
+#ifdef GGML_USE_RDMA
+#include "ggml-rdma.h"
+#endif
 #ifdef GGML_USE_METAL
 #include "ggml-metal.h"
 #endif
@@ -2390,6 +2393,22 @@ ggml_backend_rpc_start_server_ex(const char *endpoint, const char *cache_dir,
   if (send_buf > 0 || recv_buf > 0) {
     printf("  socket buffers : send=%d recv=%d\n", send_buf, recv_buf);
   }
+  const int rdma_be = config ? config->rdma_backend : 0;
+#ifdef GGML_USE_RDMA
+  if (rdma_be != 0) {
+    const char *rdma_name = "tcp";
+    if (rdma_be == -1) {
+      rdma_name = ggml_rdma_backend_name(ggml_rdma_best_available());
+    } else {
+      rdma_name = ggml_rdma_backend_name((enum ggml_rdma_backend)rdma_be);
+    }
+    printf("  rdma backend   : %s\n", rdma_name);
+  }
+#else
+  if (rdma_be != 0) {
+    printf("  rdma backend   : compiled without GGML_RDMA\n");
+  }
+#endif
   printf("  local cache    : %s\n", cache_dir ? cache_dir : "n/a");
   printf("Using devices:\n");
   for (size_t i = 0; i < n_devices; i++) {

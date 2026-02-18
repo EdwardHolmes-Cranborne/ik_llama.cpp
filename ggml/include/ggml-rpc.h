@@ -1,41 +1,51 @@
 #pragma once
 
-#include "ggml.h"
 #include "ggml-backend.h"
+#include "ggml.h"
 
-#ifdef  __cplusplus
+#ifdef __cplusplus
 extern "C" {
 #endif
 
-#define RPC_PROTO_MAJOR_VERSION    3
-#define RPC_PROTO_MINOR_VERSION    5
-#define RPC_PROTO_PATCH_VERSION    2
-#define GGML_RPC_MAX_SERVERS       16
+#define RPC_PROTO_MAJOR_VERSION 3
+#define RPC_PROTO_MINOR_VERSION 5
+#define RPC_PROTO_PATCH_VERSION 2
+#define GGML_RPC_MAX_SERVERS 16
 
 // backend API
-GGML_API GGML_CALL ggml_backend_t ggml_backend_rpc_init(const char * endpoint, uint32_t device);
+GGML_API GGML_CALL ggml_backend_t ggml_backend_rpc_init(const char *endpoint,
+                                                        uint32_t device);
 GGML_API GGML_CALL bool ggml_backend_is_rpc(ggml_backend_t backend);
 
-GGML_API GGML_CALL ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const char * endpoint, uint32_t device);
+GGML_API GGML_CALL ggml_backend_buffer_type_t
+ggml_backend_rpc_buffer_type(const char *endpoint, uint32_t device);
 
-GGML_API GGML_CALL uint32_t ggml_backend_rpc_get_device_count(const char* endpoint);
+GGML_API GGML_CALL uint32_t
+ggml_backend_rpc_get_device_count(const char *endpoint);
 
-GGML_API GGML_CALL void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device, size_t * free, size_t * total);
+GGML_API GGML_CALL void ggml_backend_rpc_get_device_memory(const char *endpoint,
+                                                           uint32_t device,
+                                                           size_t *free,
+                                                           size_t *total);
 
-GGML_API GGML_CALL void ggml_backend_rpc_start_server(const char * endpoint, const char* cache_dir, size_t device, ggml_backend_t * devices, size_t* free_mem, size_t* total_mem);
+GGML_API GGML_CALL void
+ggml_backend_rpc_start_server(const char *endpoint, const char *cache_dir,
+                              size_t device, ggml_backend_t *devices,
+                              size_t *free_mem, size_t *total_mem);
 
 // Extended server startup with socket tuning (pass NULL config for defaults).
 struct ggml_rpc_server_config {
-    int socket_send_buf;  // SO_SNDBUF in bytes, 0 = system default
-    int socket_recv_buf;  // SO_RCVBUF in bytes, 0 = system default
+  int socket_send_buf; // SO_SNDBUF in bytes, 0 = system default
+  int socket_recv_buf; // SO_RCVBUF in bytes, 0 = system default
+  int rdma_backend; // 0=tcp(default), 1=jaccl(macOS), 2=ibverbs(linux), -1=auto
 };
 
-GGML_API GGML_CALL void ggml_backend_rpc_start_server_ex(
-    const char * endpoint, const char * cache_dir,
-    size_t n_devices, ggml_backend_t * devices,
-    size_t * free_mem, size_t * total_mem,
-    const struct ggml_rpc_server_config * config);
+GGML_API GGML_CALL void
+ggml_backend_rpc_start_server_ex(const char *endpoint, const char *cache_dir,
+                                 size_t n_devices, ggml_backend_t *devices,
+                                 size_t *free_mem, size_t *total_mem,
+                                 const struct ggml_rpc_server_config *config);
 
-#ifdef  __cplusplus
+#ifdef __cplusplus
 }
 #endif

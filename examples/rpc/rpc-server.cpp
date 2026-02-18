@@ -13,6 +13,9 @@
 #endif
 
 #include "ggml-rpc.h"
+#ifdef GGML_USE_RDMA
+#include "ggml-rdma.h"
+#endif
 #ifdef _WIN32
 #define DIRECTORY_SEPARATOR '\\'
 #define NOMINMAX
@@ -394,6 +397,7 @@ struct rpc_server_params {
   std::vector<std::string> devices;
   // RDMA / Thunderbolt transport options
   bool rdma = false;
+  std::string rdma_backend_str = "auto"; // auto, jaccl, ibverbs, tcp
   std::string bind_addr;
   int socket_send_buf = 0; // effective value (includes --rdma auto-defaults)
   int socket_recv_buf = 0; // effective value (includes --rdma auto-defaults)
@@ -432,6 +436,8 @@ static void print_usage(int /*argc*/, char **argv, rpc_server_params params) {
   fprintf(stderr, "                                      buffers; RPC decode "
                   "uses system defaults for\n");
   fprintf(stderr, "                                      minimum latency\n");
+  fprintf(stderr, "  --rdma-backend BACKEND              RDMA backend: auto, "
+                  "jaccl, ibverbs, tcp (default: auto)\n");
   fprintf(stderr, "  --bind-addr ADDR                    explicit bind address "
                   "(overrides --host)\n");
   fprintf(stderr, "  --socket-send-buf N                 override SO_SNDBUF "
@@ -499,6 +505,12 @@ static bool rpc_server_params_parse(int argc, char **argv,
       params.use_cpu = true;
     } else if (arg == "--rdma") {
       params.rdma = true;
+    } else if (arg == "--rdma-backend") {
+      if (++i >= argc) {
+        return false;
+      }
+      params.rdma_backend_str = argv[i];
+      params.rdma = true; // --rdma-backend implies --rdma
     } else if (arg == "--bind-addr") {
       if (++i >= argc) {
         return false;
@@ -815,11 +827,67 @@ int main(int argc, char *argv[]) {
   // Large buffers inflate the TCP receive window, which interacts badly
   // with macOS delayed ACKs (~40ms) and causes bufferbloat on small
   // decode messages (graph_recompute = 13 bytes).
+  // ---- RDMA kernel transport init ----
+#ifdef GGML_USE_RDMA
+  if (params.rdma) {
+    // Parse --rdma-backend string to enum
+    int rdma_backend_val = -1; // auto
+    if (params.rdma_backend_str == "tcp") {
+      rdma_backend_val = GGML_RDMA_TCP;
+    } else if (params.rdma_backend_str == "jaccl") {
+      rdma_backend_val = GGML_RDMA_JACCL;
+    } else if (params.rdma_backend_str == "ibverbs") {
+      rdma_backend_val = GGML_RDMA_IBVERBS;
+    } else if (params.rdma_backend_str == "auto") {
+      rdma_backend_val = -1;
+    } else {
+      fprintf(stderr,
+              "[rdma] unknown backend: %s (use: auto, jaccl, ibverbs, tcp)\n",
+              params.rdma_backend_str.c_str());
+      return 1;
+    }
+
+    struct ggml_rdma_config rdma_cfg = {};
+    if (rdma_backend_val >= 0) {
+      rdma_cfg.backend = (enum ggml_rdma_backend)rdma_backend_val;
+    } else {
+      rdma_cfg.backend = ggml_rdma_best_available();
+    }
+
+    if (rdma_cfg.backend != GGML_RDMA_TCP) {
+      if (ggml_rdma_init(&rdma_cfg)) {
+        fprintf(stderr, "[rdma] kernel RDMA active: %s\n",
+                ggml_rdma_backend_name(rdma_cfg.backend));
+      } else {
+        fprintf(stderr, "[rdma] kernel RDMA init failed, using TCP fallback\n");
+      }
+    } else {
+      fprintf(stderr, "[rdma] no kernel RDMA backend available, using TCP\n");
+    }
+  }
+#endif
+
   ggml_rpc_server_config config = {};
   config.socket_send_buf = params.explicit_socket_send_buf;
   config.socket_recv_buf = params.explicit_socket_recv_buf;
+#ifdef GGML_USE_RDMA
+  if (params.rdma) {
+    // -1 = auto detect
+    if (params.rdma_backend_str == "auto") {
+      config.rdma_backend = -1;
+    } else if (params.rdma_backend_str == "jaccl") {
+      config.rdma_backend = GGML_RDMA_JACCL;
+    } else if (params.rdma_backend_str == "ibverbs") {
+      config.rdma_backend = GGML_RDMA_IBVERBS;
+    }
+  }
+#endif
   ggml_backend_rpc_start_server_ex(endpoint.c_str(), cache_dir, devices.size(),
                                    devices.data(), free_mem.data(),
                                    total_mem.data(), &config);
+
+#ifdef GGML_USE_RDMA
+  ggml_rdma_shutdown();
+#endif
   return 0;
 }
