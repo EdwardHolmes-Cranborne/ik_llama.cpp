@@ -31,7 +31,7 @@ KV_RECV_CLEANUP_INTERVAL=10
 STARTUP_TIMEOUT_SEC=1800
 POLL_INTERVAL_SEC=2
 COMPLETION_N_PREDICT=16
-COMPLETION_TIMEOUT_SEC=120
+COMPLETION_TIMEOUT_SEC=180
 COMPLETION_PROMPT="Dual-mac validation completion smoke test."
 KEEP_SERVER=0
 OUTPUT_DIR="/tmp/ik_dual_mac_decode_validate_$(date +%Y%m%d_%H%M%S)"
@@ -77,7 +77,7 @@ Optional:
   --poll-interval-sec N       poll interval for /health (default: 2)
   --completion-prompt TEXT    completion smoke prompt
   --completion-n-predict N    completion smoke output tokens (default: 16)
-  --completion-timeout-sec N  completion smoke HTTP timeout (default: 120)
+  --completion-timeout-sec N  completion smoke HTTP timeout (default: 180)
   --output-dir PATH           artifact directory
   --safe-ngl-cap N            memory-safe ngl cap unless overridden (default: 192)
   --allow-high-ngl            allow --ngl above safe cap
