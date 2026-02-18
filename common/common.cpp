@@ -528,7 +528,8 @@ void gpt_params_parse_from_env(gpt_params &params) {
   get_env("LLAMA_ARG_DECODE_GPU_LAYERS_HINT", params.decode_gpu_layers_hint);
   get_env("LLAMA_ARG_DECODE_REMOTE_LAYERS_HINT",
           params.decode_remote_layers_hint);
-  get_env("LLAMA_ARG_DECODE_REMOTE_NODES_HINT", params.decode_remote_nodes_hint);
+  get_env("LLAMA_ARG_DECODE_REMOTE_NODES_HINT",
+          params.decode_remote_nodes_hint);
   get_env("LLAMA_ARG_DECODE_REMOTE_RANGES", params.decode_remote_ranges);
   get_env("LLAMA_ARG_DECODE_REMOTE_FAILOVER_POLICY",
           params.decode_remote_failover_policy);
@@ -631,7 +632,8 @@ bool parse_buft_overrides(
   return true;
 }
 
-bool parse_prefill_decode_mode(const std::string & value, std::string & out_mode) {
+bool parse_prefill_decode_mode(const std::string &value,
+                               std::string &out_mode) {
   const std::string mode = string_lower(value);
   if (mode == "auto" || mode == "cpu_kv" || mode == "gpu_kv" ||
       mode == "hybrid" || mode == "split_thunderbolt") {
@@ -646,15 +648,16 @@ bool parse_prefill_decode_mode(const std::string & value, std::string & out_mode
     out_mode = "gpu_kv";
     return true;
   }
-  if (mode == "split" || mode == "split-tb" ||
-      mode == "split-thunderbolt" || mode == "tb") {
+  if (mode == "split" || mode == "split-tb" || mode == "split-thunderbolt" ||
+      mode == "tb") {
     out_mode = "split_thunderbolt";
     return true;
   }
   return false;
 }
 
-bool parse_prefill_transport_mode(const std::string & value, std::string & out_mode) {
+bool parse_prefill_transport_mode(const std::string &value,
+                                  std::string &out_mode) {
   const std::string mode = string_lower(value);
   if (mode == "disabled" || mode == "bulk" || mode == "progressive") {
     out_mode = mode;
@@ -671,7 +674,8 @@ bool parse_prefill_transport_mode(const std::string & value, std::string & out_m
   return false;
 }
 
-bool parse_prefill_execution_mode(const std::string & value, std::string & out_mode) {
+bool parse_prefill_execution_mode(const std::string &value,
+                                  std::string &out_mode) {
   const std::string mode = string_lower(value);
   if (mode == "coupled" || mode == "decoupled") {
     out_mode = mode;
@@ -680,7 +684,8 @@ bool parse_prefill_execution_mode(const std::string & value, std::string & out_m
   return false;
 }
 
-bool parse_decode_remote_failover_policy(const std::string & value, std::string & out_mode) {
+bool parse_decode_remote_failover_policy(const std::string &value,
+                                         std::string &out_mode) {
   const std::string mode = string_lower(value);
   if (mode == "reroute" || mode == "local" || mode == "fail") {
     out_mode = mode;
@@ -1745,7 +1750,8 @@ bool gpt_params_find_arg(int argc, char **argv, const std::string &arg,
     params.decode_remote_layers_hint = std::stoi(argv[i]);
     return true;
   }
-  if (arg == "--prefill-decode-remote-nodes" || arg == "--decode-remote-nodes") {
+  if (arg == "--prefill-decode-remote-nodes" ||
+      arg == "--decode-remote-nodes") {
     CHECK_ARG
     params.decode_remote_nodes_hint = std::stoi(argv[i]);
     return true;
@@ -1759,8 +1765,8 @@ bool gpt_params_find_arg(int argc, char **argv, const std::string &arg,
   if (arg == "--prefill-decode-remote-failover" ||
       arg == "--decode-remote-failover") {
     CHECK_ARG
-    if (!parse_decode_remote_failover_policy(argv[i],
-                                             params.decode_remote_failover_policy)) {
+    if (!parse_decode_remote_failover_policy(
+            argv[i], params.decode_remote_failover_policy)) {
       invalid_param = true;
     }
     return true;
@@ -3045,10 +3051,12 @@ void gpt_params_print_usage(int /*argc*/, char **argv,
   options.push_back({"prefill", "-ps,   --prefill-streaming",
                      "enable streaming prefill path (default: %s)",
                      params.prefill_streaming ? "enabled" : "disabled"});
-  options.push_back({"prefill", "       --no-prefill-telemetry",
-                     "disable prefill per-layer telemetry logs (default: enabled)"});
-  options.push_back({"prefill", "       --prefill-overlap",
-                     "enable overlap between upload and compute (default: disabled)"});
+  options.push_back(
+      {"prefill", "       --no-prefill-telemetry",
+       "disable prefill per-layer telemetry logs (default: enabled)"});
+  options.push_back(
+      {"prefill", "       --prefill-overlap",
+       "enable overlap between upload and compute (default: disabled)"});
   options.push_back({"prefill", "       --prefill-buffers N",
                      "number of prefill rotation buffers (default: %d)",
                      params.prefill_buffers});
@@ -3062,9 +3070,10 @@ void gpt_params_print_usage(int /*argc*/, char **argv,
                      "minimum prompt batch size for streaming prefill "
                      "(-1 = runtime crossover logic, default: %d)",
                      params.prefill_min_stream_batch_tokens});
-  options.push_back({"prefill", "       --prefill-decode-mode MODE",
-                     "decode handoff mode: auto|cpu_kv|gpu_kv|hybrid|split_thunderbolt "
-                     "(alias: --decode-mode)"});
+  options.push_back(
+      {"prefill", "       --prefill-decode-mode MODE",
+       "decode handoff mode: auto|cpu_kv|gpu_kv|hybrid|split_thunderbolt "
+       "(alias: --decode-mode)"});
   options.push_back({"prefill", "       --prefill-transport-mode MODE",
                      "prefill transport mode: disabled|bulk|progressive "
                      "(default: %s)",
@@ -3074,10 +3083,11 @@ void gpt_params_print_usage(int /*argc*/, char **argv,
                      params.prefill_execution_mode.c_str()});
   options.push_back({"prefill", "       --prefill-decode-transport-required",
                      "require network transport publish; fail if unavailable"});
-  options.push_back({"prefill", "       --prefill-transport-chunk-bytes N",
-                     "base transport chunk size used for bulk/progressive publish "
-                     "(default: %d)",
-                     params.prefill_transport_chunk_bytes});
+  options.push_back(
+      {"prefill", "       --prefill-transport-chunk-bytes N",
+       "base transport chunk size used for bulk/progressive publish "
+       "(default: %d)",
+       params.prefill_transport_chunk_bytes});
   options.push_back({"prefill", "       --prefill-transport-session-dir PATH",
                      "override transport session directory for split handoff"});
   options.push_back({"prefill", "       --prefill-decode-gpu-layers N",
@@ -3089,17 +3099,19 @@ void gpt_params_print_usage(int /*argc*/, char **argv,
   options.push_back({"prefill", "       --prefill-decode-remote-nodes N",
                      "decode remote node hint for split mode (default: %d)",
                      params.decode_remote_nodes_hint});
-  options.push_back({"prefill", "       --prefill-decode-remote-ranges SPEC",
-                     "explicit remote layer map: node:start-end,node:start-end"});
-  options.push_back({"prefill", "       --prefill-decode-remote-failover POLICY",
+  options.push_back(
+      {"prefill", "       --prefill-decode-remote-ranges SPEC",
+       "explicit remote layer map: node:start-end,node:start-end"});
+  options.push_back({"prefill",
+                     "       --prefill-decode-remote-failover POLICY",
                      "remote failover policy: reroute|local|fail (default: %s)",
                      params.decode_remote_failover_policy.c_str()});
-  options.push_back({"prefill", "       --kv-host HOST",
-                     "sender transport host override"});
-  options.push_back({"prefill", "       --kv-port PORT",
-                     "sender transport port override"});
-  options.push_back({"prefill", "       --kv-streams N",
-                     "sender stream count override"});
+  options.push_back(
+      {"prefill", "       --kv-host HOST", "sender transport host override"});
+  options.push_back(
+      {"prefill", "       --kv-port PORT", "sender transport port override"});
+  options.push_back(
+      {"prefill", "       --kv-streams N", "sender stream count override"});
   options.push_back({"prefill", "       --kv-stream-chunk-bytes N",
                      "sender per-stream chunk bytes override"});
   options.push_back({"prefill", "       --kv-max-inflight-bytes N",
@@ -3561,24 +3573,28 @@ void gpt_params_print_usage(int /*argc*/, char **argv,
                      "enable route-driven artifact fanout dispatch to decode "
                      "workers (default: disabled / env "
                      "LLAMA_DECODE_ROUTE_DISPATCH_ENABLE)"});
-  options.push_back({"server", "       --decode-route-dispatch-max-hops N",
-                     "maximum dispatch fanout hops before stopping recursion "
-                     "(default: env LLAMA_DECODE_ROUTE_DISPATCH_MAX_HOPS or 1)"});
-  options.push_back({"server", "       --decode-route-dispatch-session-dir PATH",
+  options.push_back(
+      {"server", "       --decode-route-dispatch-max-hops N",
+       "maximum dispatch fanout hops before stopping recursion "
+       "(default: env LLAMA_DECODE_ROUTE_DISPATCH_MAX_HOPS or 1)"});
+  options.push_back({"server",
+                     "       --decode-route-dispatch-session-dir PATH",
                      "session directory for route-dispatch sender metadata "
                      "(default: env LLAMA_DECODE_ROUTE_DISPATCH_SESSION_DIR "
                      "or artifact directory)"});
-  options.push_back({"server", "       --decode-route-dispatch-streams N",
-                     "stream count for route-dispatch sender "
-                     "(default: env LLAMA_DECODE_ROUTE_DISPATCH_STREAMS or 1)"});
+  options.push_back(
+      {"server", "       --decode-route-dispatch-streams N",
+       "stream count for route-dispatch sender "
+       "(default: env LLAMA_DECODE_ROUTE_DISPATCH_STREAMS or 1)"});
   options.push_back({"server", "       --decode-route-dispatch-chunk-bytes N",
                      "chunk size bytes for route-dispatch sender "
                      "(default: env LLAMA_DECODE_ROUTE_DISPATCH_CHUNK_BYTES "
                      "or 4 MiB)"});
-  options.push_back({"server", "       --decode-route-dispatch-max-inflight-bytes N",
-                     "max in-flight bytes for route-dispatch sender "
-                     "(default: env "
-                     "LLAMA_DECODE_ROUTE_DISPATCH_MAX_INFLIGHT_BYTES or 256 MiB)"});
+  options.push_back(
+      {"server", "       --decode-route-dispatch-max-inflight-bytes N",
+       "max in-flight bytes for route-dispatch sender "
+       "(default: env "
+       "LLAMA_DECODE_ROUTE_DISPATCH_MAX_INFLIGHT_BYTES or 256 MiB)"});
   options.push_back({"server", "       --kv-bridge-mode MODE",
                      "KV bridge policy mode for artifact import: "
                      "off|strict|relaxed (default: strict)"});
@@ -4472,6 +4488,25 @@ llama_context_params_from_gpt_params(const gpt_params &params) {
   cparams.fused_moe_up_gate = params.fused_moe_up_gate;
   cparams.grouped_expert_routing = params.grouped_expert_routing;
   cparams.fused_up_gate = params.fused_up_gate;
+
+  // Auto-disable fused ops when RPC backends are active.
+  // Metal has no FUSED_UP_GATE/MOE_FUSED_UP_GATE kernels, so the RPC backend
+  // denies them.  Without this, every FFN layer falls back to CPU with costly
+  // RPC<->CPU data transfers, causing near-zero decode speed.
+  if (!params.rpc_servers.empty()) {
+    if (cparams.fused_up_gate) {
+      fprintf(stderr,
+              "%s: auto-disabling fused_up_gate for RPC compatibility\n",
+              __func__);
+      cparams.fused_up_gate = false;
+    }
+    if (cparams.fused_moe_up_gate) {
+      fprintf(stderr,
+              "%s: auto-disabling fused_moe_up_gate for RPC compatibility\n",
+              __func__);
+      cparams.fused_moe_up_gate = false;
+    }
+  }
   cparams.fused_mmad = params.fused_mmad;
   cparams.rope_cache = params.rope_cache;
   cparams.graph_reuse = params.graph_reuse;
@@ -4500,7 +4535,8 @@ llama_context_params_from_gpt_params(const gpt_params &params) {
   cparams.prefill_buffers = params.prefill_buffers;
   cparams.prefill_prefetch = params.prefill_prefetch;
   cparams.prefill_slab_bytes = params.prefill_slab_bytes;
-  cparams.prefill_min_stream_batch_tokens = params.prefill_min_stream_batch_tokens;
+  cparams.prefill_min_stream_batch_tokens =
+      params.prefill_min_stream_batch_tokens;
 
   const std::string decode_mode = string_lower(params.prefill_decode_mode);
   if (decode_mode == "cpu_kv" || decode_mode == "cpu") {
@@ -4516,7 +4552,8 @@ llama_context_params_from_gpt_params(const gpt_params &params) {
     cparams.prefill_decode_mode = LLAMA_PREFILL_DECODE_MODE_AUTO;
   }
 
-  const std::string transport_mode = string_lower(params.prefill_transport_mode);
+  const std::string transport_mode =
+      string_lower(params.prefill_transport_mode);
   if (transport_mode == "bulk") {
     cparams.prefill_transport_mode = LLAMA_PREFILL_TRANSPORT_MODE_BULK;
   } else if (transport_mode == "progressive" || transport_mode == "on") {
@@ -4525,7 +4562,8 @@ llama_context_params_from_gpt_params(const gpt_params &params) {
     cparams.prefill_transport_mode = LLAMA_PREFILL_TRANSPORT_MODE_DISABLED;
   }
 
-  const std::string execution_mode = string_lower(params.prefill_execution_mode);
+  const std::string execution_mode =
+      string_lower(params.prefill_execution_mode);
   cparams.prefill_execution_mode = execution_mode == "decoupled"
                                        ? LLAMA_PREFILL_EXECUTION_MODE_DECOUPLED
                                        : LLAMA_PREFILL_EXECUTION_MODE_COUPLED;

@@ -416,7 +416,7 @@ static std::shared_ptr<socket_t> socket_connect(const char *host, int port) {
     (void)setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF,
                      (const char *)&env_socket_buf, sizeof(env_socket_buf));
   }
-  if (!set_socket_timeout(sockfd, 15000)) {
+  if (!set_socket_timeout(sockfd, 120000)) {
     fprintf(stderr, "Failed to set socket timeouts\n");
     return nullptr;
   }
@@ -453,7 +453,7 @@ socket_accept(sockfd_t srv_sockfd, int send_buf = 0, int recv_buf = 0) {
     return nullptr;
   }
   set_low_latency_opts(client_socket_fd);
-  if (!set_socket_timeout(client_socket_fd, 15000)) {
+  if (!set_socket_timeout(client_socket_fd, 120000)) {
     fprintf(stderr, "Failed to set socket timeouts\n");
     return nullptr;
   }
