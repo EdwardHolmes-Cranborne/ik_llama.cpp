@@ -31,6 +31,12 @@ This file is the shared handoff + review ledger for both machines.
 - `scripts/validate_dual_mac_decode_server.sh`
   - Default `OUTPUT_DIR` includes PID suffix to avoid collisions in parallel runs.
 
+- `src/unicode.cpp`
+  - Fixed `unicode_tolower()` to use hash lookup on `unicode_map_lowercase` (unordered_map), restoring correct WPM/BERT lowercasing behavior.
+
+- `examples/eval-callback/CMakeLists.txt`
+  - Removed `test-eval-callback` tinyllamas download test target to keep active workflow fully local/no-HF.
+
 ### Validation Snapshots
 
 - PASS: `/tmp/ik_dual_mac_decode_validate_20260218_143141`
@@ -64,3 +70,4 @@ This file is the shared handoff + review ledger for both machines.
 - Pending review from other side for:
   - concurrency safety of threaded accept model in `ggml-rpc.cpp`
   - whether backend-global serialization should become per-device serialization
+- 2026-02-18: local build + `ctest` now passes 22/22 after tokenizer lowercasing fix and eval-callback test removal.

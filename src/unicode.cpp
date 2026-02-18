@@ -836,15 +836,20 @@ uint8_t unicode_utf8_to_byte(const std::string & utf8) {
 }
 
 uint32_t unicode_tolower(uint32_t cpt) {
-    // binary search
-    auto it = std::lower_bound(unicode_map_lowercase.begin(), unicode_map_lowercase.end(), cpt,
-        [](const std::pair<uint32_t, uint32_t> & pair, uint32_t value) {
-            return pair.first < value;
-        });
-    if (it != unicode_map_lowercase.end() && it->first == cpt) {
+    // unicode_map_lowercase is an unordered_map, so we must do a hash lookup.
+    // A previous binary-search implementation over the map iterators was incorrect
+    // and broke casing (e.g. for WPM/BERT tokenization).
+    if (const auto it = unicode_map_lowercase.find(cpt); it != unicode_map_lowercase.end()) {
         return it->second;
     }
-    return cpt;  // Return the original code point if no lowercase mapping is found
+
+    // Fast-path ASCII, also handles the case where the table is incomplete.
+    if (cpt >= 'A' && cpt <= 'Z') {
+        return cpt + ('a' - 'A');
+    }
+
+    // Return the original code point if no lowercase mapping is found.
+    return cpt;
 }
 
 bool unicode_cpt_is_han(uint32_t cpt) {
