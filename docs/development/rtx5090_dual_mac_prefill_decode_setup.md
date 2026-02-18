@@ -104,10 +104,10 @@ mkdir -p /tmp/ik_slots /tmp/ik_kv_handoff
   --host 0.0.0.0 --port 8080 \
   -c 32768 \
   --flash-attn on \
-  -ngl 128 \
+  -ngl 96 \
   --split-mode graph \
   --max-gpu 2 \
-  --tensor-split 0.70,0.30 \
+  --tensor-split 0.82,0.18 \
   --rpc 10.40.0.20:50052,10.40.0.21:50052 \
   --slot-save-path /tmp/ik_slots \
   --kv-recv-enable \
@@ -203,7 +203,8 @@ Use the same deployment and change only these controls:
    - Graph-split restore rejects transposed-V restore path.
    - If you must run without flash attention, avoid `--split-mode graph` for restore/import runs.
 3. Start with conservative GPU layer offload to avoid unified-memory pressure:
-   - use `-ngl 128` first, then scale upward only after stable runs.
+   - for `Mac Studio 512GB + MacBook Pro 128GB`, start with `-ngl 96 --tensor-split 0.82,0.18`.
+   - use higher `-ngl` only after stable runs.
 
 ## 8. Notes for first production run
 

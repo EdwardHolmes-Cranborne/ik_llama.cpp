@@ -41,8 +41,7 @@ cd /path/to/ik_llama.cpp
 ./scripts/validate_dual_mac_decode_server.sh \
   --model /Volumes/D/big_models/unsloth/Kimi_25_Q3_K_XL/Kimi-K2.5-UD-Q3_K_XL-00001-of-00011.gguf \
   --rpc 10.40.0.20:50052,10.40.0.21:50052 \
-  --ngl 128 \
-  --safe-ngl-cap 192 \
+  --hardware-profile m3_ultra512_to_m3_max128 \
   --bind-host 0.0.0.0 \
   --http-host 127.0.0.1 \
   --http-port 8080 \

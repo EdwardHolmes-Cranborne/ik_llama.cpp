@@ -12,10 +12,12 @@ HTTP_PORT=8080
 KV_RECV_HOST="0.0.0.0"
 KV_RECV_PORT=19001
 CTX_SIZE=32768
-N_GPU_LAYERS=128
+DEFAULT_N_GPU_LAYERS=128
+N_GPU_LAYERS="${DEFAULT_N_GPU_LAYERS}"
 SPLIT_MODE="graph"
 MAX_GPU=2
-TENSOR_SPLIT="0.70,0.30"
+DEFAULT_TENSOR_SPLIT="0.70,0.30"
+TENSOR_SPLIT="${DEFAULT_TENSOR_SPLIT}"
 FLASH_ATTN="on"
 KV_TRANSPORT="auto"
 KV_TRANSPORT_FALLBACK=1
@@ -32,8 +34,10 @@ COMPLETION_N_PREDICT=16
 COMPLETION_PROMPT="Dual-mac validation completion smoke test."
 KEEP_SERVER=0
 OUTPUT_DIR="/tmp/ik_dual_mac_decode_validate_$(date +%Y%m%d_%H%M%S)"
-SAFE_NGL_CAP=192
+DEFAULT_SAFE_NGL_CAP=192
+SAFE_NGL_CAP="${DEFAULT_SAFE_NGL_CAP}"
 ALLOW_HIGH_NGL=0
+HARDWARE_PROFILE=""
 
 EXTRA_ARGS=()
 
@@ -59,6 +63,9 @@ Optional:
   --split-mode MODE           split mode (default: graph)
   --max-gpu N                 max gpus for split mode (default: 2)
   --tensor-split CSV          tensor split fractions (default: 0.70,0.30)
+  --hardware-profile NAME     apply safe split defaults for known hardware pairs
+                              m3_ultra512_to_m3_max128  (Studio coordinator -> MacBook RPC)
+                              m3_max128_to_m3_ultra512  (MacBook coordinator -> Studio RPC)
   --flash-attn on|off         flash attention mode (default: on)
   --kv-transport MODE         auto|tcp|rdma|mixed|disabled (default: auto)
   --kv-transport-fallback
@@ -101,6 +108,7 @@ while [[ $# -gt 0 ]]; do
         --split-mode) SPLIT_MODE="$2"; shift 2 ;;
         --max-gpu) MAX_GPU="$2"; shift 2 ;;
         --tensor-split) TENSOR_SPLIT="$2"; shift 2 ;;
+        --hardware-profile) HARDWARE_PROFILE="$2"; shift 2 ;;
         --flash-attn) FLASH_ATTN="$2"; shift 2 ;;
         --kv-transport) KV_TRANSPORT="$2"; shift 2 ;;
         --kv-transport-fallback) KV_TRANSPORT_FALLBACK=1; shift 1 ;;
@@ -134,6 +142,42 @@ if [[ ! -f "${MODEL_PATH}" ]]; then
     echo "model not found: ${MODEL_PATH}" >&2
     exit 2
 fi
+
+if [[ -n "${HARDWARE_PROFILE}" ]]; then
+    profile_ngl=""
+    profile_tensor_split=""
+    profile_safe_ngl_cap=""
+    case "${HARDWARE_PROFILE}" in
+        m3_ultra512_to_m3_max128)
+            profile_ngl=96
+            profile_tensor_split="0.82,0.18"
+            profile_safe_ngl_cap=128
+            ;;
+        m3_max128_to_m3_ultra512)
+            profile_ngl=96
+            profile_tensor_split="0.18,0.82"
+            profile_safe_ngl_cap=128
+            ;;
+        *)
+            echo "invalid --hardware-profile: ${HARDWARE_PROFILE}" >&2
+            exit 2
+            ;;
+    esac
+
+    # Keep explicit CLI overrides: only replace still-default values.
+    if [[ "${N_GPU_LAYERS}" == "${DEFAULT_N_GPU_LAYERS}" ]]; then
+        N_GPU_LAYERS="${profile_ngl}"
+    fi
+    if [[ "${TENSOR_SPLIT}" == "${DEFAULT_TENSOR_SPLIT}" ]]; then
+        TENSOR_SPLIT="${profile_tensor_split}"
+    fi
+    if [[ "${SAFE_NGL_CAP}" == "${DEFAULT_SAFE_NGL_CAP}" ]]; then
+        SAFE_NGL_CAP="${profile_safe_ngl_cap}"
+    fi
+
+    echo "hardware profile applied: ${HARDWARE_PROFILE} (ngl=${N_GPU_LAYERS}, tensor-split=${TENSOR_SPLIT}, safe-ngl-cap=${SAFE_NGL_CAP})"
+fi
+
 case "${KV_TRANSPORT}" in
     auto|tcp|rdma|mixed|disabled) ;;
     *)
