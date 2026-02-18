@@ -166,3 +166,22 @@ target_link_libraries(test-kv-bridge-cli PRIVATE common llama)
 target_include_directories(test-kv-bridge-cli PRIVATE ${CMAKE_SOURCE_DIR}/common)
 add_test(NAME test-kv-bridge-cli COMMAND test-kv-bridge-cli)
 set_property(TEST test-kv-bridge-cli PROPERTY LABELS "kv-bridge")
+
+# handoff metadata upgrade/parser tests
+add_executable(test-handoff-metadata
+    test-handoff-metadata.cpp
+    ${CMAKE_SOURCE_DIR}/examples/server/server-handoff-metadata.cpp)
+target_link_libraries(test-handoff-metadata PRIVATE common)
+target_include_directories(test-handoff-metadata PRIVATE ${CMAKE_SOURCE_DIR}/examples/server)
+add_test(NAME test-handoff-metadata COMMAND test-handoff-metadata)
+set_property(TEST test-handoff-metadata PROPERTY LABELS "kv-bridge")
+
+# decode router planner tests
+add_executable(test-decode-router
+    test-decode-router.cpp
+    ${CMAKE_SOURCE_DIR}/examples/server/server-decode-router.cpp
+    ${CMAKE_SOURCE_DIR}/examples/server/server-handoff-metadata.cpp)
+target_link_libraries(test-decode-router PRIVATE common)
+target_include_directories(test-decode-router PRIVATE ${CMAKE_SOURCE_DIR}/examples/server)
+add_test(NAME test-decode-router COMMAND test-decode-router)
+set_property(TEST test-decode-router PROPERTY LABELS "kv-bridge")

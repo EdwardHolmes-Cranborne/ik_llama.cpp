@@ -57,6 +57,37 @@ cd /path/to/ik_llama.cpp
 
 ## 4. Start decode coordinator (`llama-server`) on Mac Studio
 
+Create decode route cluster config (used for post-restore fanout to additional decode nodes):
+
+```bash
+cat > /tmp/ik_decode_cluster.json <<'JSON'
+{
+  "nodes": [
+    {
+      "node_id": "mac_studio",
+      "kv_host": "10.40.0.20",
+      "kv_port": 19001,
+      "rpc_endpoint": "10.40.0.20:19001",
+      "role": "coordinator",
+      "weight": 2,
+      "healthy": true,
+      "promotable": false
+    },
+    {
+      "node_id": "mac_mbp",
+      "kv_host": "10.40.0.21",
+      "kv_port": 19001,
+      "rpc_endpoint": "10.40.0.21:19001",
+      "role": "worker",
+      "weight": 2,
+      "healthy": true,
+      "promotable": true
+    }
+  ]
+}
+JSON
+```
+
 ```bash
 cd /path/to/ik_llama.cpp
 mkdir -p /tmp/ik_slots /tmp/ik_kv_handoff
@@ -83,13 +114,21 @@ mkdir -p /tmp/ik_slots /tmp/ik_kv_handoff
   --kv-recv-idle-timeout 120 \
   --kv-recv-stale-finalize-timeout 180 \
   --kv-recv-session-retention 3600 \
-  --kv-recv-cleanup-interval 10
+  --kv-recv-cleanup-interval 10 \
+  --decode-node-id mac_studio \
+  --decode-cluster-file /tmp/ik_decode_cluster.json \
+  --decode-route-dispatch-enable \
+  --decode-route-dispatch-max-hops 1 \
+  --decode-route-dispatch-streams 2 \
+  --decode-route-dispatch-chunk-bytes 4194304 \
+  --decode-route-dispatch-max-inflight-bytes 268435456
 ```
 
 Verify receiver state:
 
 ```bash
 curl -s http://10.40.0.20:8080/kv-receiver/status | jq
+curl -s http://10.40.0.20:8080/props | jq '.decode_route'
 ```
 
 Receiver lifecycle notes:

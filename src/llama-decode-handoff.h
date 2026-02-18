@@ -71,6 +71,9 @@ struct llama_decode_handoff_plan {
     int32_t execution_mode  = LLAMA_PREFILL_EXECUTION_MODE_COUPLED;
     std::string remote_ranges;
     std::string remote_failover_policy = "reroute";
+    std::string topology_epoch = "epoch0";
+    uint32_t artifact_crc32 = 0;
+    std::string remote_node_descriptors_json;
     int32_t tb_chunk_bytes  = 4 * 1024 * 1024;
     std::string transport_session_dir;
     std::string kv_transport;

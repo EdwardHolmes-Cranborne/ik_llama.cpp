@@ -1,5 +1,6 @@
 #include "server-kv-receiver.h"
 
+#include "server-handoff-metadata.h"
 #include "server-task.h"
 #include "src/kv-bridge/ik-kv-compat.h"
 
@@ -101,6 +102,16 @@ struct session_state {
     std::string remote_ranges;
     std::string remote_failover_policy = "reroute";
     std::string layer_map;
+    std::string handoff_session_id;
+    std::string topology_epoch = "epoch0";
+    uint32_t artifact_crc32 = 0;
+    std::string transport_mode = "auto";
+    std::string remote_node_descriptors_json;
+    std::string prefill_handoff_v2_json;
+    server_handoff_metadata_v2 handoff_v2;
+    bool handoff_v2_valid = false;
+    std::string handoff_v2_error;
+    int32_t dispatch_hop = 0;
     uint64_t first_frame_unix_us = 0;
     uint64_t last_frame_unix_us = 0;
 
@@ -110,6 +121,118 @@ struct session_state {
     std::string validation_error;
     std::string last_error;
 };
+
+bool parse_u32_str(const std::string & value, uint32_t * out) {
+    if (!out) {
+        return false;
+    }
+    try {
+        const unsigned long long v = std::stoull(value);
+        if (v > 0xFFFFFFFFull) {
+            return false;
+        }
+        *out = (uint32_t) v;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+void refresh_handoff_v2_locked(session_state * session) {
+    if (!session) {
+        return;
+    }
+
+    std::string prefetched_v2_error;
+    if (!session->prefill_handoff_v2_json.empty()) {
+        nlohmann::json parsed = nlohmann::json::parse(session->prefill_handoff_v2_json, nullptr, false);
+        if (parsed.is_object()) {
+            server_handoff_metadata_v2 parsed_v2;
+            std::string parse_error;
+            if (server_handoff_metadata_v2_from_json(parsed, &parsed_v2, &parse_error)) {
+                session->handoff_v2 = std::move(parsed_v2);
+                session->handoff_v2_valid = true;
+                session->handoff_v2_error.clear();
+                return;
+            }
+            prefetched_v2_error = parse_error;
+        } else {
+            prefetched_v2_error = "prefill_handoff_v2 is not a JSON object";
+        }
+    }
+
+    server_handoff_legacy_fields legacy;
+    legacy.remote_nodes = session->remote_nodes;
+    legacy.expected_gpu_layers = session->expected_gpu_layers;
+    legacy.expected_remote_layers = session->expected_remote_layers;
+    legacy.execution_mode = session->execution_mode;
+    legacy.balance = session->balance;
+    legacy.remote_ranges = session->remote_ranges;
+    legacy.remote_failover_policy = session->remote_failover_policy;
+    legacy.layer_map = session->layer_map;
+    legacy.handoff_session_id = session->handoff_session_id.empty()
+        ? std::to_string(session->session_id)
+        : session->handoff_session_id;
+    legacy.topology_epoch = session->topology_epoch;
+    legacy.artifact_crc32 = session->artifact_crc32;
+    legacy.transport_mode = session->transport_mode;
+
+    server_handoff_metadata_v2 upgraded;
+    std::string upgrade_error;
+    if (!server_handoff_metadata_v2_from_legacy(legacy, &upgraded, &upgrade_error)) {
+        session->handoff_v2_valid = false;
+        if (prefetched_v2_error.empty()) {
+            session->handoff_v2_error = upgrade_error;
+        } else {
+            session->handoff_v2_error = prefetched_v2_error + "; legacy fallback failed: " + upgrade_error;
+        }
+        return;
+    }
+
+    if (!session->remote_node_descriptors_json.empty()) {
+        nlohmann::json descriptors = nlohmann::json::parse(
+            session->remote_node_descriptors_json, nullptr, false);
+        if (!descriptors.is_discarded()) {
+            nlohmann::json wrapped;
+            wrapped["schema"] = upgraded.schema;
+            wrapped["schema_version"] = upgraded.schema_version;
+            wrapped["handoff_session_id"] = upgraded.handoff_session_id;
+            wrapped["topology_epoch"] = upgraded.topology_epoch;
+            wrapped["remote_nodes"] = upgraded.remote_nodes;
+            wrapped["expected_gpu_layers"] = upgraded.expected_gpu_layers;
+            wrapped["expected_remote_layers"] = upgraded.expected_remote_layers;
+            wrapped["execution_mode"] = upgraded.execution_mode;
+            wrapped["transport_mode"] = upgraded.transport_mode;
+            wrapped["remote_failover_policy"] = upgraded.remote_failover_policy;
+            wrapped["balance"] = upgraded.balance;
+            wrapped["remote_ranges"] = upgraded.remote_ranges;
+            wrapped["artifact_crc32"] = upgraded.artifact_crc32;
+            wrapped["layer_map"] = server_handoff_metadata_v2_to_json(upgraded)["layer_map"];
+            wrapped["remote_node_descriptors"] = descriptors;
+            server_handoff_metadata_v2 merged;
+            std::string merge_error;
+            if (server_handoff_metadata_v2_from_json(wrapped, &merged, &merge_error)) {
+                upgraded = std::move(merged);
+            } else {
+                session->handoff_v2_valid = false;
+                if (prefetched_v2_error.empty()) {
+                    session->handoff_v2_error = merge_error;
+                } else {
+                    session->handoff_v2_error = prefetched_v2_error + "; descriptor merge failed: " + merge_error;
+                }
+                return;
+            }
+        }
+    }
+
+    session->handoff_v2 = std::move(upgraded);
+    session->handoff_v2_valid = true;
+    if (prefetched_v2_error.empty()) {
+        session->handoff_v2_error.clear();
+    } else {
+        session->handoff_v2_error = "prefill_handoff_v2 parse failed, used legacy fallback: " + prefetched_v2_error;
+    }
+}
 
 uint64_t unix_now_us() {
     using namespace std::chrono;
@@ -896,6 +1019,7 @@ struct kv_receiver_service::impl {
             const std::shared_ptr<session_state> & s = kv.second;
             kv_receiver_session_stats ss = {};
             std::lock_guard<std::mutex> s_lock(s->mutex);
+            refresh_handoff_v2_locked(s.get());
             ss.session_id = s->session_id;
             ss.bytes_received = s->bytes_received;
             ss.chunks_received = s->chunks_received;
@@ -911,6 +1035,12 @@ struct kv_receiver_service::impl {
             ss.remote_ranges = s->remote_ranges;
             ss.remote_failover_policy = s->remote_failover_policy;
             ss.layer_map = s->layer_map;
+            ss.prefill_handoff_v2_valid = s->handoff_v2_valid;
+            ss.prefill_handoff_v2_error = s->handoff_v2_error;
+            if (s->handoff_v2_valid) {
+                ss.prefill_handoff_v2_json = server_handoff_metadata_v2_to_json(s->handoff_v2).dump();
+            }
+            ss.dispatch_hop = s->dispatch_hop;
             ss.expected_streams = s->expected_streams;
             ss.seen_streams = (int32_t) s->seen_stream_ids.size();
             ss.done_streams = (int32_t) s->done_stream_ids.size();
@@ -1307,6 +1437,7 @@ struct kv_receiver_service::impl {
         kv_receiver_session_stats ss = {};
         {
             std::lock_guard<std::mutex> lock(session->mutex);
+            refresh_handoff_v2_locked(session.get());
             ss.session_id = session->session_id;
             ss.bytes_received = session->bytes_received;
             ss.chunks_received = session->chunks_received;
@@ -1322,6 +1453,12 @@ struct kv_receiver_service::impl {
             ss.remote_ranges = session->remote_ranges;
             ss.remote_failover_policy = session->remote_failover_policy;
             ss.layer_map = session->layer_map;
+            ss.prefill_handoff_v2_valid = session->handoff_v2_valid;
+            ss.prefill_handoff_v2_error = session->handoff_v2_error;
+            if (session->handoff_v2_valid) {
+                ss.prefill_handoff_v2_json = server_handoff_metadata_v2_to_json(session->handoff_v2).dump();
+            }
+            ss.dispatch_hop = session->dispatch_hop;
             ss.expected_streams = session->expected_streams;
             ss.seen_streams = (int32_t) session->seen_stream_ids.size();
             ss.done_streams = (int32_t) session->done_stream_ids.size();
@@ -1342,6 +1479,13 @@ struct kv_receiver_service::impl {
                     session->session_id, summary_path.c_str());
             return;
         }
+        json prefill_handoff_v2 = nullptr;
+        if (!ss.prefill_handoff_v2_json.empty()) {
+            prefill_handoff_v2 = json::parse(ss.prefill_handoff_v2_json, nullptr, false);
+            if (prefill_handoff_v2.is_discarded()) {
+                prefill_handoff_v2 = nullptr;
+            }
+        }
         const json out = {
             {"session_id", ss.session_id},
             {"bytes_received", ss.bytes_received},
@@ -1358,6 +1502,10 @@ struct kv_receiver_service::impl {
             {"remote_ranges", ss.remote_ranges},
             {"remote_failover_policy", ss.remote_failover_policy},
             {"layer_map", ss.layer_map},
+            {"prefill_handoff_v2_valid", ss.prefill_handoff_v2_valid},
+            {"prefill_handoff_v2_error", ss.prefill_handoff_v2_error},
+            {"prefill_handoff_v2", prefill_handoff_v2},
+            {"dispatch_hop", ss.dispatch_hop},
             {"expected_streams", ss.expected_streams},
             {"seen_streams", ss.seen_streams},
             {"done_streams", ss.done_streams},
@@ -1513,23 +1661,60 @@ struct kv_receiver_service::impl {
     }
 
     void enqueue_slot_restore(const std::shared_ptr<session_state> & session) {
+        fs::path artifact_path;
+        int32_t remote_nodes = 1;
+        int32_t expected_gpu_layers = 0;
+        int32_t expected_remote_layers = 0;
+        std::string execution_mode;
+        std::string balance;
+        std::string remote_ranges;
+        std::string remote_failover_policy;
+        std::string layer_map;
+        server_handoff_metadata_v2 handoff_v2;
+        bool handoff_v2_valid = false;
+        std::string handoff_v2_error;
+        int32_t dispatch_hop = 0;
+        {
+            std::lock_guard<std::mutex> lock(session->mutex);
+            refresh_handoff_v2_locked(session.get());
+            artifact_path = session->artifact_path;
+            remote_nodes = session->remote_nodes;
+            expected_gpu_layers = session->expected_gpu_layers;
+            expected_remote_layers = session->expected_remote_layers;
+            execution_mode = session->execution_mode;
+            balance = session->balance;
+            remote_ranges = session->remote_ranges;
+            remote_failover_policy = session->remote_failover_policy;
+            layer_map = session->layer_map;
+            handoff_v2 = session->handoff_v2;
+            handoff_v2_valid = session->handoff_v2_valid;
+            handoff_v2_error = session->handoff_v2_error;
+            dispatch_hop = session->dispatch_hop;
+        }
+
         server_task task;
         task.type = SERVER_TASK_TYPE_SLOT_RESTORE;
         task.data = {
             {"id_slot", config.slot_id},
-            {"filename", session->artifact_path.filename().string()},
-            {"filepath", session->artifact_path.string()},
+            {"filename", artifact_path.filename().string()},
+            {"filepath", artifact_path.string()},
             {"prefill_handoff", {
-                {"remote_nodes", session->remote_nodes},
-                {"expected_gpu_layers", session->expected_gpu_layers},
-                {"expected_remote_layers", session->expected_remote_layers},
-                {"execution_mode", session->execution_mode},
-                {"balance", session->balance},
-                {"remote_ranges", session->remote_ranges},
-                {"remote_failover_policy", session->remote_failover_policy},
-                {"layer_map", session->layer_map},
+                {"remote_nodes", remote_nodes},
+                {"expected_gpu_layers", expected_gpu_layers},
+                {"expected_remote_layers", expected_remote_layers},
+                {"execution_mode", execution_mode},
+                {"balance", balance},
+                {"remote_ranges", remote_ranges},
+                {"remote_failover_policy", remote_failover_policy},
+                {"layer_map", layer_map},
             }},
         };
+        if (handoff_v2_valid) {
+            task.data["prefill_handoff_v2"] = server_handoff_metadata_v2_to_json(handoff_v2);
+        } else if (!handoff_v2_error.empty()) {
+            task.data["prefill_handoff_v2_error"] = handoff_v2_error;
+        }
+        task.data["prefill_dispatch_hop"] = dispatch_hop;
 
         const int id_task = queue_tasks.post(std::move(task));
         stat_restore_tasks_enqueued.fetch_add(1);
@@ -1639,11 +1824,12 @@ struct kv_receiver_service::impl {
             case TBP_MSG_SESSION_START:
             {
                 const auto kv = parse_sc_kv(frame.payload);
+                std::lock_guard<std::mutex> lock(session->mutex);
+
                 auto it = kv.find("streams");
                 if (it != kv.end()) {
                     try {
                         const int streams = std::stoi(it->second);
-                        std::lock_guard<std::mutex> lock(session->mutex);
                         session->expected_streams = std::max(session->expected_streams, streams);
                     } catch (...) {
                     }
@@ -1653,7 +1839,6 @@ struct kv_receiver_service::impl {
                 if (bytes_it != kv.end()) {
                     try {
                         const uint64_t expected_bytes = (uint64_t) std::stoull(bytes_it->second);
-                        std::lock_guard<std::mutex> lock(session->mutex);
                         session->expected_payload_bytes = std::max(session->expected_payload_bytes, expected_bytes);
                     } catch (...) {
                     }
@@ -1661,7 +1846,6 @@ struct kv_receiver_service::impl {
 
                 auto ack_it = kv.find("ack_required");
                 if (ack_it != kv.end()) {
-                    std::lock_guard<std::mutex> lock(session->mutex);
                     session->ack_required = parse_boolish(ack_it->second, session->ack_required);
                 }
 
@@ -1669,7 +1853,6 @@ struct kv_receiver_service::impl {
                 if (remote_nodes_it != kv.end()) {
                     try {
                         const int32_t remote_nodes = std::max<int32_t>(1, std::stoi(remote_nodes_it->second));
-                        std::lock_guard<std::mutex> lock(session->mutex);
                         session->remote_nodes = std::max(session->remote_nodes, remote_nodes);
                     } catch (...) {
                     }
@@ -1679,7 +1862,6 @@ struct kv_receiver_service::impl {
                 if (expected_gpu_it != kv.end()) {
                     try {
                         const int32_t expected_gpu_layers = std::max<int32_t>(0, std::stoi(expected_gpu_it->second));
-                        std::lock_guard<std::mutex> lock(session->mutex);
                         session->expected_gpu_layers = std::max(session->expected_gpu_layers, expected_gpu_layers);
                     } catch (...) {
                     }
@@ -1689,7 +1871,6 @@ struct kv_receiver_service::impl {
                 if (expected_remote_it != kv.end()) {
                     try {
                         const int32_t expected_remote_layers = std::max<int32_t>(0, std::stoi(expected_remote_it->second));
-                        std::lock_guard<std::mutex> lock(session->mutex);
                         session->expected_remote_layers = std::max(session->expected_remote_layers, expected_remote_layers);
                     } catch (...) {
                     }
@@ -1697,33 +1878,79 @@ struct kv_receiver_service::impl {
 
                 auto execution_mode_it = kv.find("execution_mode");
                 if (execution_mode_it != kv.end()) {
-                    std::lock_guard<std::mutex> lock(session->mutex);
                     session->execution_mode = execution_mode_it->second;
                 }
 
                 auto balance_it = kv.find("balance");
                 if (balance_it != kv.end()) {
-                    std::lock_guard<std::mutex> lock(session->mutex);
                     session->balance = balance_it->second;
                 }
 
                 auto remote_ranges_it = kv.find("remote_ranges");
                 if (remote_ranges_it != kv.end()) {
-                    std::lock_guard<std::mutex> lock(session->mutex);
                     session->remote_ranges = remote_ranges_it->second;
                 }
 
                 auto remote_failover_it = kv.find("remote_failover");
                 if (remote_failover_it != kv.end()) {
-                    std::lock_guard<std::mutex> lock(session->mutex);
                     session->remote_failover_policy = remote_failover_it->second;
+                }
+                auto remote_failover_policy_it = kv.find("remote_failover_policy");
+                if (remote_failover_policy_it != kv.end()) {
+                    session->remote_failover_policy = remote_failover_policy_it->second;
                 }
 
                 auto layer_map_it = kv.find("layer_map");
                 if (layer_map_it != kv.end()) {
-                    std::lock_guard<std::mutex> lock(session->mutex);
                     session->layer_map = layer_map_it->second;
                 }
+
+                auto handoff_session_it = kv.find("handoff_session_id");
+                if (handoff_session_it != kv.end()) {
+                    session->handoff_session_id = handoff_session_it->second;
+                }
+
+                auto topology_epoch_it = kv.find("topology_epoch");
+                if (topology_epoch_it != kv.end()) {
+                    session->topology_epoch = topology_epoch_it->second;
+                }
+
+                auto artifact_crc_it = kv.find("artifact_crc32");
+                if (artifact_crc_it != kv.end()) {
+                    uint32_t artifact_crc32 = 0;
+                    if (parse_u32_str(artifact_crc_it->second, &artifact_crc32)) {
+                        session->artifact_crc32 = artifact_crc32;
+                    }
+                }
+
+                auto transport_mode_it = kv.find("transport_mode");
+                if (transport_mode_it != kv.end()) {
+                    session->transport_mode = transport_mode_it->second;
+                }
+
+                auto descriptor_json_it = kv.find("remote_node_descriptors");
+                if (descriptor_json_it != kv.end()) {
+                    session->remote_node_descriptors_json = descriptor_json_it->second;
+                }
+
+                auto handoff_v2_it = kv.find("prefill_handoff_v2");
+                if (handoff_v2_it != kv.end()) {
+                    session->prefill_handoff_v2_json = handoff_v2_it->second;
+                }
+                auto handoff_v2_json_it = kv.find("prefill_handoff_v2_json");
+                if (handoff_v2_json_it != kv.end()) {
+                    session->prefill_handoff_v2_json = handoff_v2_json_it->second;
+                }
+
+                auto dispatch_hop_it = kv.find("dispatch_hop");
+                if (dispatch_hop_it != kv.end()) {
+                    try {
+                        session->dispatch_hop = std::max<int32_t>(0, std::stoi(dispatch_hop_it->second));
+                    } catch (...) {
+                    }
+                }
+
+                refresh_handoff_v2_locked(session.get());
             } break;
             case TBP_MSG_KV_SEGMENT_BEGIN:
             {

@@ -551,6 +551,22 @@ void gpt_params_parse_from_env(gpt_params &params) {
   get_env("LLAMA_ARG_KV_PEER_ADDRS", params.kv_peer_addrs);
   get_env("LLAMA_ARG_KV_BALANCE", params.kv_balance);
   get_env("LLAMA_ARG_TB_DIRECT_ENDPOINT", params.tb_direct_endpoint);
+  get_env("LLAMA_ARG_DECODE_NODE_ID", params.decode_node_id);
+  get_env("LLAMA_ARG_DECODE_CLUSTER_FILE", params.decode_cluster_file);
+  get_env("LLAMA_ARG_DECODE_CLUSTER_NODES_JSON",
+          params.decode_cluster_nodes_json);
+  get_env("LLAMA_ARG_DECODE_ROUTE_DISPATCH_ENABLE",
+          params.decode_route_dispatch_enable);
+  get_env("LLAMA_ARG_DECODE_ROUTE_DISPATCH_MAX_HOPS",
+          params.decode_route_dispatch_max_hops);
+  get_env("LLAMA_ARG_DECODE_ROUTE_DISPATCH_SESSION_DIR",
+          params.decode_route_dispatch_session_dir);
+  get_env("LLAMA_ARG_DECODE_ROUTE_DISPATCH_STREAMS",
+          params.decode_route_dispatch_streams);
+  get_env("LLAMA_ARG_DECODE_ROUTE_DISPATCH_CHUNK_BYTES",
+          params.decode_route_dispatch_chunk_bytes);
+  get_env("LLAMA_ARG_DECODE_ROUTE_DISPATCH_MAX_INFLIGHT_BYTES",
+          params.decode_route_dispatch_max_inflight_bytes);
   get_env("LLAMA_ARG_KV_BRIDGE_MODE", params.kv_bridge_mode);
   get_env("LLAMA_ARG_KV_BRIDGE_PLAN_CACHE_DIR",
           params.kv_bridge_plan_cache_dir);
@@ -2252,6 +2268,51 @@ bool gpt_params_find_arg(int argc, char **argv, const std::string &arg,
     params.kv_receiver_socket_recv_buf = std::stoi(argv[i]);
     return true;
   }
+  if (arg == "--decode-node-id") {
+    CHECK_ARG
+    params.decode_node_id = argv[i];
+    return true;
+  }
+  if (arg == "--decode-cluster-file") {
+    CHECK_ARG
+    params.decode_cluster_file = argv[i];
+    return true;
+  }
+  if (arg == "--decode-cluster-nodes-json") {
+    CHECK_ARG
+    params.decode_cluster_nodes_json = argv[i];
+    return true;
+  }
+  if (arg == "--decode-route-dispatch-enable") {
+    params.decode_route_dispatch_enable = true;
+    return true;
+  }
+  if (arg == "--decode-route-dispatch-max-hops") {
+    CHECK_ARG
+    params.decode_route_dispatch_max_hops = std::stoi(argv[i]);
+    return true;
+  }
+  if (arg == "--decode-route-dispatch-session-dir") {
+    CHECK_ARG
+    params.decode_route_dispatch_session_dir = argv[i];
+    return true;
+  }
+  if (arg == "--decode-route-dispatch-streams") {
+    CHECK_ARG
+    params.decode_route_dispatch_streams = std::stoi(argv[i]);
+    return true;
+  }
+  if (arg == "--decode-route-dispatch-chunk-bytes") {
+    CHECK_ARG
+    params.decode_route_dispatch_chunk_bytes = std::stoi(argv[i]);
+    return true;
+  }
+  if (arg == "--decode-route-dispatch-max-inflight-bytes" ||
+      arg == "--decode-route-dispatch-max-inflight") {
+    CHECK_ARG
+    params.decode_route_dispatch_max_inflight_bytes = std::stoi(argv[i]);
+    return true;
+  }
   if (arg == "--kv-bridge-mode") {
     CHECK_ARG
     params.kv_bridge_mode = string_lower(std::string(argv[i]));
@@ -3483,6 +3544,37 @@ void gpt_params_print_usage(int /*argc*/, char **argv,
                      "socket SO_SNDBUF for KV receiver (0 = system default)"});
   options.push_back({"server", "       --kv-recv-socket-recv-buf N",
                      "socket SO_RCVBUF for KV receiver (0 = system default)"});
+  options.push_back({"server", "       --decode-node-id ID",
+                     "local decode node identifier used by route planner "
+                     "(default: empty / env LLAMA_DECODE_NODE_ID)"});
+  options.push_back({"server", "       --decode-cluster-file PATH",
+                     "path to decode cluster node json file (default: env "
+                     "LLAMA_DECODE_CLUSTER_FILE)"});
+  options.push_back({"server", "       --decode-cluster-nodes-json JSON",
+                     "inline decode cluster node json payload (default: env "
+                     "LLAMA_DECODE_CLUSTER_NODES_JSON)"});
+  options.push_back({"server", "       --decode-route-dispatch-enable",
+                     "enable route-driven artifact fanout dispatch to decode "
+                     "workers (default: disabled / env "
+                     "LLAMA_DECODE_ROUTE_DISPATCH_ENABLE)"});
+  options.push_back({"server", "       --decode-route-dispatch-max-hops N",
+                     "maximum dispatch fanout hops before stopping recursion "
+                     "(default: env LLAMA_DECODE_ROUTE_DISPATCH_MAX_HOPS or 1)"});
+  options.push_back({"server", "       --decode-route-dispatch-session-dir PATH",
+                     "session directory for route-dispatch sender metadata "
+                     "(default: env LLAMA_DECODE_ROUTE_DISPATCH_SESSION_DIR "
+                     "or artifact directory)"});
+  options.push_back({"server", "       --decode-route-dispatch-streams N",
+                     "stream count for route-dispatch sender "
+                     "(default: env LLAMA_DECODE_ROUTE_DISPATCH_STREAMS or 1)"});
+  options.push_back({"server", "       --decode-route-dispatch-chunk-bytes N",
+                     "chunk size bytes for route-dispatch sender "
+                     "(default: env LLAMA_DECODE_ROUTE_DISPATCH_CHUNK_BYTES "
+                     "or 4 MiB)"});
+  options.push_back({"server", "       --decode-route-dispatch-max-inflight-bytes N",
+                     "max in-flight bytes for route-dispatch sender "
+                     "(default: env "
+                     "LLAMA_DECODE_ROUTE_DISPATCH_MAX_INFLIGHT_BYTES or 256 MiB)"});
   options.push_back({"server", "       --kv-bridge-mode MODE",
                      "KV bridge policy mode for artifact import: "
                      "off|strict|relaxed (default: strict)"});

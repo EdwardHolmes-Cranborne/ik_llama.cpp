@@ -29,6 +29,12 @@ struct llama_tb_transfer_options {
     std::string layer_map;
     std::string remote_ranges;
     std::string remote_failover_policy;
+    std::string handoff_session_id;
+    std::string topology_epoch;
+    uint32_t    artifact_crc32 = 0;
+    std::string remote_node_descriptors_json;
+    std::string prefill_handoff_v2_json;
+    int32_t     dispatch_hop = 0;
 };
 
 struct llama_tb_transfer_result {

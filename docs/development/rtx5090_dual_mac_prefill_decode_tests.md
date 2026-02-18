@@ -92,6 +92,29 @@ Also verify decode server still responds:
 curl -s http://10.40.0.20:8080/health | jq
 ```
 
+## 3.1 Route-dispatch fanout validation (multi-node decode)
+
+Run decode coordinator with:
+
+- `--decode-node-id mac_studio`
+- `--decode-cluster-file /tmp/ik_decode_cluster.json`
+- `--decode-route-dispatch-enable`
+
+Then execute one full handoff run and inspect restore result payload plus receiver status:
+
+```bash
+curl -s http://10.40.0.20:8080/kv-receiver/status | jq '.sessions | sort_by(.session_id) | last'
+curl -s http://10.40.0.20:8080/props | jq '.decode_route'
+```
+
+Expected:
+
+- restore result contains `decode_route_plan` and `decode_dispatch`
+- `decode_dispatch.attempted == true`
+- `decode_dispatch.successful_targets >= 1` for non-local assignments
+- each `decode_dispatch.targets[]` has a target-scoped `layer_map`
+- receiver session summaries include `dispatch_hop` increments for forwarded artifacts
+
 ## 4. Transport switch matrix
 
 Run each row with same prompt/model and capture receiver counters plus wall times.

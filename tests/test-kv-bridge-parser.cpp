@@ -168,6 +168,34 @@ static std::vector<uint8_t> build_rtx_payload_two_streams_two_active(void) {
     return payload;
 }
 
+static std::vector<uint8_t> build_rtx_payload_single_stream_layers_zero_rows(uint32_t n_layer) {
+    std::vector<uint8_t> payload;
+
+    append_u32_le(payload, 1); // n_stream
+    append_u32_le(payload, 1); // cell_count
+
+    // one metadata cell: pos=0, n_seq_id=1, seq_id=0
+    append_u32_le(payload, 0);
+    append_u32_le(payload, 1);
+    append_u32_le(payload, 0);
+
+    // data header: v_state=0 (not transposed), caller-defined n_layer
+    append_u32_le(payload, 0);
+    append_u32_le(payload, n_layer);
+
+    // K/V headers only; row_size=0 keeps payload compact while exercising layer-count parsing.
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        append_u32_le(payload, 1); // GGML_TYPE_F16
+        append_u64_le(payload, 0);
+    }
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        append_u32_le(payload, 1); // GGML_TYPE_F16
+        append_u64_le(payload, 0);
+    }
+
+    return payload;
+}
+
 static std::vector<uint8_t> build_rtx_artifact(size_t header_size, const std::vector<uint8_t> & payload, uint32_t token_count) {
     std::vector<uint8_t> artifact(header_size + payload.size(), 0);
 
@@ -629,6 +657,56 @@ TEST(kvb_ut_018_rtx_output_size_tracks_converted_payload) {
 
     const size_t out_size = ik_kv_convert_get_output_size(&src, &dst);
     ASSERT_EQ((int) out_size, (int) (payload.size() - 8));
+
+    ik_kv_bridge_shutdown();
+    tests_passed++;
+}
+
+TEST(kvb_ut_020_rtx_rejects_layer_count_above_bridge_limit) {
+    ik_kv_bridge_init();
+
+    const uint32_t too_many_layers = IK_KV_MAX_LAYERS + 1;
+    const std::vector<uint8_t> payload =
+        build_rtx_payload_single_stream_layers_zero_rows(too_many_layers);
+    const std::vector<uint8_t> artifact =
+        build_rtx_artifact(48, payload, /*token_count=*/15);
+
+    ik_kva_header_t header = {};
+    ik_kv_compat_reject_reason_t reject = IK_KV_COMPAT_REJECT_UNKNOWN;
+    ik_kv_compat_convert_result_t result = ik_kv_source_parse_kva_header(
+        artifact.data(), artifact.size(), &header, &reject);
+    ASSERT_EQ(result, IK_KV_COMPAT_CONVERT_OK);
+
+    ik_kv_source_descriptor_t src = {};
+    result = ik_kv_source_parse_prefill_seq_state(
+        &header, artifact.data() + 48, payload.size(), &src, &reject);
+    ASSERT_EQ(result, IK_KV_COMPAT_CONVERT_OK);
+
+    ik_kv_dest_descriptor_t dst = {};
+    dst.n_layers = src.n_layers;
+    dst.n_ctx = src.n_ctx;
+    dst.type_k = src.type_k;
+    dst.type_v = src.type_v;
+    dst.v_trans = src.v_trans;
+    dst.n_stream = 1;
+
+    ik_kv_compat_plan_t plan = {};
+    plan.is_compatible = true;
+    plan.reject_reason = IK_KV_COMPAT_REJECT_NONE;
+    plan.n_layers = dst.n_layers;
+    plan.total_dst_size = (uint32_t) payload.size();
+
+    std::vector<uint8_t> out(payload.size(), 0);
+    ik_kv_convert_ctx_t cvt = {};
+    cvt.src = &src;
+    cvt.dst = &dst;
+    cvt.plan = &plan;
+    cvt.output_buf = out.data();
+    cvt.output_size = out.size();
+
+    result = ik_kv_convert_prefill_to_ik_seq_blob(&cvt);
+    ASSERT_EQ(result, IK_KV_COMPAT_CONVERT_ERR_SRC_PARSE);
+    ASSERT_EQ(cvt.reject, IK_KV_COMPAT_REJECT_HEADER_MALFORMED);
 
     ik_kv_bridge_shutdown();
     tests_passed++;
@@ -1124,6 +1202,7 @@ int main(int argc, char ** argv) {
     test_kvb_ut_016_rtx_multistream_single_active_supported();
     test_kvb_ut_017_rtx_multistream_multiple_active_merged();
     test_kvb_ut_018_rtx_output_size_tracks_converted_payload();
+    test_kvb_ut_020_rtx_rejects_layer_count_above_bridge_limit();
     test_kvb_ut_019_ik_conversion_uses_plan_layer_mappings();
     test_kvb_ut_030_plan_key_deterministic();
     test_kvb_ut_040_strict_profile_accepts_compatible();

@@ -3656,9 +3656,12 @@ static int llama_decode_publish_prefill_kv_handoff(llama_context * ctx,
                  (unsigned long long) artifact_summary.payload_bytes,
                  artifact_summary.payload_crc32);
 
+  llama_decode_handoff_plan publish_plan = plan;
+  publish_plan.artifact_crc32 = artifact_summary.payload_crc32;
+
   llama_decode_publish_diag publish_diag = {};
   std::string publish_status;
-  if (!executor->publish_kv_artifact(artifact_path_str, plan, publish_status,
+  if (!executor->publish_kv_artifact(artifact_path_str, publish_plan, publish_status,
                                      &publish_diag)) {
     return fail_or_warn(publish_status.empty() ? "publish_kv_artifact failed"
                                                : publish_status);

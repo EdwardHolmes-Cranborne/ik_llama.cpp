@@ -116,6 +116,33 @@ int main() {
         gpt_params params;
         const bool ok = parse_with_args({
             "llama-server",
+            "--decode-node-id", "mac_decode_a",
+            "--decode-cluster-file", "/tmp/ik_decode_cluster.json",
+            "--decode-cluster-nodes-json", "{\"nodes\":[{\"node_id\":\"tb_remote_2\",\"kv_host\":\"10.40.0.30\",\"kv_port\":19003}]}",
+            "--decode-route-dispatch-enable",
+            "--decode-route-dispatch-max-hops", "2",
+            "--decode-route-dispatch-session-dir", "/tmp/ik_decode_dispatch",
+            "--decode-route-dispatch-streams", "2",
+            "--decode-route-dispatch-chunk-bytes", "2097152",
+            "--decode-route-dispatch-max-inflight-bytes", "536870912",
+        }, params);
+
+        assert(ok);
+        assert(params.decode_node_id == "mac_decode_a");
+        assert(params.decode_cluster_file == "/tmp/ik_decode_cluster.json");
+        assert(params.decode_cluster_nodes_json == "{\"nodes\":[{\"node_id\":\"tb_remote_2\",\"kv_host\":\"10.40.0.30\",\"kv_port\":19003}]}");
+        assert(params.decode_route_dispatch_enable);
+        assert(params.decode_route_dispatch_max_hops == 2);
+        assert(params.decode_route_dispatch_session_dir == "/tmp/ik_decode_dispatch");
+        assert(params.decode_route_dispatch_streams == 2);
+        assert(params.decode_route_dispatch_chunk_bytes == 2097152);
+        assert(params.decode_route_dispatch_max_inflight_bytes == 536870912);
+    }
+
+    {
+        gpt_params params;
+        const bool ok = parse_with_args({
+            "llama-server",
             "--kv-bridge-mode", "invalid_mode",
         }, params);
         assert(!ok);

@@ -19,6 +19,10 @@ set(TARGET_SRCS
     server-queue.h
     server-common.cpp
     server-common.h
+    server-handoff-metadata.cpp
+    server-handoff-metadata.h
+    server-decode-router.cpp
+    server-decode-router.h
     server-context.cpp
     server-context.h
     server-kv-receiver.cpp

@@ -499,6 +499,17 @@ struct gpt_params {
   std::string kv_balance = "";
   std::string tb_direct_endpoint = "";
 
+  // Decode route planner/dispatch controls (server-side)
+  std::string decode_node_id = "";
+  std::string decode_cluster_file = "";
+  std::string decode_cluster_nodes_json = "";
+  bool decode_route_dispatch_enable = false;
+  int32_t decode_route_dispatch_max_hops = -1;
+  std::string decode_route_dispatch_session_dir = "";
+  int32_t decode_route_dispatch_streams = 0;
+  int32_t decode_route_dispatch_chunk_bytes = 0;
+  int32_t decode_route_dispatch_max_inflight_bytes = 0;
+
   float slot_prompt_similarity = 0.1f;
   int32_t cache_ram_mib = 8192; // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
   int32_t cache_ram_n_min =

@@ -778,6 +778,13 @@ int main(int argc, char ** argv) {
 
         json sessions = json::array();
         for (const auto & ss : s.sessions) {
+            json prefill_handoff_v2 = nullptr;
+            if (!ss.prefill_handoff_v2_json.empty()) {
+                prefill_handoff_v2 = json::parse(ss.prefill_handoff_v2_json, nullptr, false);
+                if (prefill_handoff_v2.is_discarded()) {
+                    prefill_handoff_v2 = nullptr;
+                }
+            }
             sessions.push_back({
                 {"session_id", ss.session_id},
                 {"bytes_received", ss.bytes_received},
@@ -794,6 +801,10 @@ int main(int argc, char ** argv) {
                 {"remote_ranges", ss.remote_ranges},
                 {"remote_failover_policy", ss.remote_failover_policy},
                 {"layer_map", ss.layer_map},
+                {"prefill_handoff_v2_valid", ss.prefill_handoff_v2_valid},
+                {"prefill_handoff_v2_error", ss.prefill_handoff_v2_error},
+                {"prefill_handoff_v2", prefill_handoff_v2},
+                {"dispatch_hop", ss.dispatch_hop},
                 {"expected_streams", ss.expected_streams},
                 {"seen_streams", ss.seen_streams},
                 {"done_streams", ss.done_streams},
@@ -1093,6 +1104,18 @@ int main(int argc, char ** argv) {
             } },
             { "n_ctx",                       ctx_server.n_ctx }
 
+        };
+
+        data["decode_route"] = {
+            { "decode_node_id", ctx_server.params_base.decode_node_id },
+            { "decode_cluster_file", ctx_server.params_base.decode_cluster_file },
+            { "decode_cluster_nodes_json", ctx_server.params_base.decode_cluster_nodes_json },
+            { "dispatch_enable", ctx_server.params_base.decode_route_dispatch_enable },
+            { "dispatch_max_hops", ctx_server.params_base.decode_route_dispatch_max_hops },
+            { "dispatch_session_dir", ctx_server.params_base.decode_route_dispatch_session_dir },
+            { "dispatch_streams", ctx_server.params_base.decode_route_dispatch_streams },
+            { "dispatch_chunk_bytes", ctx_server.params_base.decode_route_dispatch_chunk_bytes },
+            { "dispatch_max_inflight_bytes", ctx_server.params_base.decode_route_dispatch_max_inflight_bytes },
         };
 
         if (ctx_server.params_base.use_jinja) {

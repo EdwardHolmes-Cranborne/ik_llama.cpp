@@ -2,6 +2,8 @@
 #include "server-common.h"
 #include "server-task.h"
 #include "server-queue.h"
+#include "server-handoff-metadata.h"
+#include "server-decode-router.h"
 
 #include "common.h"
 #include "llama.h"
@@ -11,10 +13,17 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 #include "src/kv-bridge/ik-kv-compat.h"
+#include "src/llama-tb-transport.h"
+#include <nlohmann/json.hpp>
 
 #include <fstream>
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
+#include <filesystem>
+#include <sstream>
+#include <set>
+#include <unordered_map>
 
 namespace {
 ik_kv_bridge_mode_t kv_bridge_mode_from_string(const std::string & mode) {
@@ -60,6 +69,667 @@ bool read_file_bytes(const std::string & path, std::vector<uint8_t> & out, std::
             err = "failed to read file bytes";
             return false;
         }
+    }
+    return true;
+}
+
+std::string lower_copy(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return (char) std::tolower(c);
+    });
+    return value;
+}
+
+std::string trim_copy(std::string value) {
+    const auto not_space = [](unsigned char c) { return !std::isspace(c); };
+    value.erase(value.begin(), std::find_if(value.begin(), value.end(), not_space));
+    value.erase(std::find_if(value.rbegin(), value.rend(), not_space).base(), value.end());
+    return value;
+}
+
+bool env_truthy(const char * value) {
+    if (!value || value[0] == '\0') {
+        return false;
+    }
+    const std::string v = lower_copy(trim_copy(value));
+    return v == "1" || v == "true" || v == "yes" || v == "on";
+}
+
+int32_t env_i32(const char * name, int32_t fallback) {
+    const char * value = std::getenv(name);
+    if (!value || value[0] == '\0') {
+        return fallback;
+    }
+    try {
+        return std::stoi(value);
+    } catch (...) {
+        return fallback;
+    }
+}
+
+bool is_local_owner(const std::string & owner_raw) {
+    const std::string owner = lower_copy(trim_copy(owner_raw));
+    if (owner.empty()) {
+        return true;
+    }
+    if (owner == "local_cpu" || owner == "local_gpu") {
+        return true;
+    }
+    return owner.rfind("local_", 0) == 0;
+}
+
+bool is_local_owner_for_node(
+    const std::string & owner_raw,
+    const std::string & local_node_id_raw) {
+    const std::string owner = lower_copy(trim_copy(owner_raw));
+    if (is_local_owner(owner)) {
+        return true;
+    }
+    const std::string local_node_id = lower_copy(trim_copy(local_node_id_raw));
+    return !local_node_id.empty() && owner == local_node_id;
+}
+
+std::string sanitize_session_token(std::string value) {
+    for (char & c : value) {
+        const unsigned char uc = (unsigned char) c;
+        if (std::isalnum(uc) || c == '_' || c == '-' || c == '.') {
+            continue;
+        }
+        c = '_';
+    }
+    return value;
+}
+
+std::string normalize_node_id(std::string value) {
+    return lower_copy(trim_copy(std::move(value)));
+}
+
+void upsert_cluster_node(
+    std::unordered_map<std::string, server_decode_cluster_node> & by_id,
+    const server_decode_cluster_node & node) {
+    const std::string key = normalize_node_id(node.node_id);
+    if (key.empty()) {
+        return;
+    }
+    server_decode_cluster_node normalized = node;
+    normalized.node_id = key;
+    by_id[key] = std::move(normalized);
+}
+
+std::vector<server_decode_cluster_node> handoff_nodes_to_cluster(
+    const server_handoff_metadata_v2 & handoff) {
+    std::vector<server_decode_cluster_node> out;
+    out.reserve(handoff.remote_node_descriptors.size());
+    for (const auto & src : handoff.remote_node_descriptors) {
+        server_decode_cluster_node node;
+        node.node_id = normalize_node_id(src.node_id);
+        node.kv_host = src.kv_host;
+        node.kv_port = src.kv_port;
+        node.rpc_endpoint = src.rpc_endpoint;
+        node.role = src.role;
+        node.weight = std::max(1, src.weight);
+        node.healthy = src.healthy;
+        node.promotable = src.promotable;
+        if (!node.node_id.empty()) {
+            out.push_back(std::move(node));
+        }
+    }
+    return out;
+}
+
+server_handoff_remote_node cluster_to_handoff_node(
+    const server_decode_cluster_node & src) {
+    server_handoff_remote_node out;
+    out.node_id = normalize_node_id(src.node_id);
+    out.kv_host = src.kv_host;
+    out.kv_port = src.kv_port;
+    out.rpc_endpoint = src.rpc_endpoint;
+    out.role = src.role;
+    out.weight = std::max(1, src.weight);
+    out.healthy = src.healthy;
+    out.promotable = src.promotable;
+    return out;
+}
+
+std::vector<server_handoff_remote_node> merged_handoff_descriptors(
+    const server_handoff_metadata_v2 & handoff,
+    const std::vector<server_decode_cluster_node> & cluster_nodes) {
+    std::unordered_map<std::string, server_handoff_remote_node> merged;
+    for (const auto & node : handoff.remote_node_descriptors) {
+        const std::string key = normalize_node_id(node.node_id);
+        if (!key.empty()) {
+            server_handoff_remote_node normalized = node;
+            normalized.node_id = key;
+            merged[key] = std::move(normalized);
+        }
+    }
+    for (const auto & node : cluster_nodes) {
+        const std::string key = normalize_node_id(node.node_id);
+        if (!key.empty()) {
+            merged[key] = cluster_to_handoff_node(node);
+        }
+    }
+
+    std::vector<server_handoff_remote_node> out;
+    out.reserve(merged.size());
+    for (const auto & kv : merged) {
+        out.push_back(kv.second);
+    }
+    std::sort(out.begin(), out.end(), [](const auto & a, const auto & b) {
+        return a.node_id < b.node_id;
+    });
+    return out;
+}
+
+bool load_decode_cluster_nodes(
+    const gpt_params & params,
+    std::vector<server_decode_cluster_node> * out,
+    std::string * error) {
+    if (!out) {
+        if (error) {
+            *error = "null decode cluster output";
+        }
+        return false;
+    }
+
+    out->clear();
+    std::unordered_map<std::string, server_decode_cluster_node> merged;
+
+    const char * cluster_file_env = std::getenv("LLAMA_DECODE_CLUSTER_FILE");
+    const std::string cluster_file = !params.decode_cluster_file.empty()
+        ? params.decode_cluster_file
+        : ((cluster_file_env && cluster_file_env[0] != '\0')
+            ? std::string(cluster_file_env)
+            : std::string());
+    if (!cluster_file.empty()) {
+        std::vector<server_decode_cluster_node> from_file;
+        std::string file_error;
+        if (!server_decode_cluster_nodes_load_file(cluster_file, &from_file, &file_error)) {
+            if (error) {
+                *error = file_error;
+            }
+            return false;
+        }
+        for (const auto & node : from_file) {
+            upsert_cluster_node(merged, node);
+        }
+    }
+
+    const char * cluster_json_env = std::getenv("LLAMA_DECODE_CLUSTER_NODES_JSON");
+    const std::string cluster_json = !params.decode_cluster_nodes_json.empty()
+        ? params.decode_cluster_nodes_json
+        : ((cluster_json_env && cluster_json_env[0] != '\0')
+            ? std::string(cluster_json_env)
+            : std::string());
+    if (!cluster_json.empty()) {
+        nlohmann::json parsed = nlohmann::json::parse(cluster_json, nullptr, false);
+        if (parsed.is_discarded()) {
+            if (error) {
+                *error = "invalid LLAMA_DECODE_CLUSTER_NODES_JSON payload";
+            }
+            return false;
+        }
+        std::vector<server_decode_cluster_node> from_env;
+        std::string parse_error;
+        if (!server_decode_cluster_nodes_from_json(parsed, &from_env, &parse_error)) {
+            if (error) {
+                *error = parse_error;
+            }
+            return false;
+        }
+        for (const auto & node : from_env) {
+            upsert_cluster_node(merged, node);
+        }
+    }
+
+    out->reserve(merged.size());
+    for (const auto & kv : merged) {
+        out->push_back(kv.second);
+    }
+    std::sort(out->begin(), out->end(), [](const auto & a, const auto & b) {
+        return a.node_id < b.node_id;
+    });
+
+    return true;
+}
+
+server_decode_route_plan build_local_fallback_plan(
+    const server_handoff_metadata_v2 & handoff,
+    const std::string & reason) {
+    server_decode_route_plan plan;
+    plan.route_plan_id = handoff.handoff_session_id.empty()
+        ? ("route_" + handoff.topology_epoch)
+        : ("route_" + handoff.handoff_session_id);
+    plan.topology_epoch = handoff.topology_epoch.empty() ? "epoch0" : handoff.topology_epoch;
+    plan.failover_policy = handoff.remote_failover_policy.empty()
+        ? "reroute"
+        : lower_copy(handoff.remote_failover_policy);
+    plan.fallback_applied = true;
+    plan.fallback_reason = reason;
+    plan.required_nodes.clear();
+
+    for (const auto & span : handoff.layer_map) {
+        server_decode_route_assignment assignment;
+        assignment.layer_start = span.layer_start;
+        assignment.layer_end = span.layer_end;
+        const std::string owner = lower_copy(span.node);
+        if (owner == "local_gpu") {
+            assignment.owner = "local_gpu";
+        } else {
+            assignment.owner = "local_cpu";
+        }
+        plan.assignments.push_back(std::move(assignment));
+    }
+
+    return plan;
+}
+
+bool build_target_handoff_metadata(
+    const server_handoff_metadata_v2 & handoff,
+    const server_decode_route_plan & plan,
+    const std::string & target_node,
+    const std::string & local_node_id,
+    const std::vector<server_handoff_remote_node> & descriptor_pool,
+    server_handoff_metadata_v2 * out,
+    std::string * error) {
+    if (!out) {
+        if (error) {
+            *error = "null target handoff output";
+        }
+        return false;
+    }
+
+    server_handoff_metadata_v2 scoped = handoff;
+    scoped.layer_map.clear();
+    if (!descriptor_pool.empty()) {
+        scoped.remote_node_descriptors = descriptor_pool;
+    }
+
+    const std::string normalized_target_node = normalize_node_id(target_node);
+
+    int32_t expected_gpu_layers = 0;
+    int32_t expected_remote_layers = 0;
+    std::set<std::string> required_remote_nodes;
+    std::vector<server_handoff_layer_span> remote_ranges_spans;
+
+    for (const auto & assignment : plan.assignments) {
+        const std::string owner = normalize_node_id(assignment.owner);
+        const bool owner_is_local = is_local_owner_for_node(owner, local_node_id);
+        if (!normalized_target_node.empty() &&
+            owner != normalized_target_node &&
+            !owner_is_local) {
+            continue;
+        }
+
+        const int32_t span_layers =
+            std::max<int32_t>(0, assignment.layer_end - assignment.layer_start);
+        if (span_layers <= 0) {
+            continue;
+        }
+
+        std::string span_owner = owner;
+        if (span_owner.empty()) {
+            span_owner = "local_cpu";
+        } else if (owner_is_local && span_owner != "local_cpu" && span_owner != "local_gpu") {
+            // Normalize node-id-local ownership to local_gpu for scoped handoff payloads.
+            span_owner = "local_gpu";
+        }
+
+        server_handoff_layer_span span{
+            /*.node=*/span_owner,
+            /*.layer_start=*/assignment.layer_start,
+            /*.layer_end=*/assignment.layer_end,
+        };
+        scoped.layer_map.push_back(span);
+
+        if (span_owner == "local_gpu") {
+            expected_gpu_layers += span_layers;
+        } else if (!owner_is_local) {
+            expected_remote_layers += span_layers;
+            required_remote_nodes.insert(owner);
+            remote_ranges_spans.push_back(span);
+        }
+    }
+
+    if (scoped.layer_map.empty()) {
+        if (error) {
+            *error = "target handoff map is empty for node '" + target_node + "'";
+        }
+        return false;
+    }
+
+    scoped.expected_gpu_layers = std::max(0, expected_gpu_layers);
+    scoped.expected_remote_layers = std::max(0, expected_remote_layers);
+    scoped.remote_nodes = std::max<int32_t>(1, (int32_t) required_remote_nodes.size());
+    {
+        std::ostringstream ranges_ss;
+        for (size_t i = 0; i < remote_ranges_spans.size(); ++i) {
+            const auto & span = remote_ranges_spans[i];
+            if (i > 0) {
+                ranges_ss << ",";
+            }
+            ranges_ss << span.node << ":" << span.layer_start << "-" << span.layer_end;
+        }
+        scoped.remote_ranges = ranges_ss.str();
+    }
+
+    if (!scoped.remote_node_descriptors.empty()) {
+        std::vector<server_handoff_remote_node> filtered_descriptors;
+        filtered_descriptors.reserve(scoped.remote_node_descriptors.size());
+        for (const auto & descriptor : scoped.remote_node_descriptors) {
+            const std::string key = normalize_node_id(descriptor.node_id);
+            if (required_remote_nodes.find(key) != required_remote_nodes.end()) {
+                server_handoff_remote_node normalized = descriptor;
+                normalized.node_id = key;
+                filtered_descriptors.push_back(std::move(normalized));
+            }
+        }
+        scoped.remote_node_descriptors = std::move(filtered_descriptors);
+    }
+
+    std::string validation_error;
+    if (!server_handoff_metadata_v2_validate(scoped, &validation_error)) {
+        if (error) {
+            *error = "target handoff metadata invalid: " + validation_error;
+        }
+        return false;
+    }
+
+    *out = std::move(scoped);
+    return true;
+}
+
+json remote_node_descriptors_json(
+    const server_handoff_metadata_v2 & handoff) {
+    json out = json::array();
+    for (const auto & node : handoff.remote_node_descriptors) {
+        out.push_back({
+            {"node_id", node.node_id},
+            {"kv_host", node.kv_host},
+            {"kv_port", node.kv_port},
+            {"rpc_endpoint", node.rpc_endpoint},
+            {"role", node.role},
+            {"weight", node.weight},
+            {"healthy", node.healthy},
+            {"promotable", node.promotable},
+        });
+    }
+    return out;
+}
+
+bool dispatch_kv_artifact_to_decode_workers(
+    const std::string & artifact_path,
+    const server_handoff_metadata_v2 & handoff,
+    const server_decode_route_plan & route_plan,
+    const std::vector<server_decode_cluster_node> & cluster_nodes,
+    const gpt_params & params,
+    int32_t incoming_dispatch_hop,
+    json * dispatch_out,
+    std::string * error) {
+    json dispatch = {
+        {"enabled", false},
+        {"attempted", false},
+        {"incoming_dispatch_hop", std::max(0, incoming_dispatch_hop)},
+        {"targets", json::array()},
+    };
+
+    if (route_plan.required_nodes.empty()) {
+        dispatch["skipped"] = true;
+        dispatch["reason"] = "route plan has no required remote nodes";
+        if (dispatch_out) {
+            *dispatch_out = std::move(dispatch);
+        }
+        return true;
+    }
+
+    const bool enabled = params.decode_route_dispatch_enable ||
+        env_truthy(std::getenv("LLAMA_DECODE_ROUTE_DISPATCH_ENABLE"));
+    dispatch["enabled"] = enabled;
+    if (!enabled) {
+        const bool fail_closed = lower_copy(handoff.remote_failover_policy) == "fail";
+        dispatch["skipped"] = !fail_closed;
+        dispatch["reason"] = "decode route dispatch disabled (set LLAMA_DECODE_ROUTE_DISPATCH_ENABLE=1)";
+        if (dispatch_out) {
+            *dispatch_out = std::move(dispatch);
+        }
+        if (fail_closed) {
+            if (error) {
+                *error = "dispatch required by failover policy but disabled";
+            }
+            return false;
+        }
+        return true;
+    }
+
+    const int32_t max_hops = std::max(0,
+        params.decode_route_dispatch_max_hops >= 0
+            ? params.decode_route_dispatch_max_hops
+            : env_i32("LLAMA_DECODE_ROUTE_DISPATCH_MAX_HOPS", 1));
+    dispatch["max_dispatch_hops"] = max_hops;
+    if (incoming_dispatch_hop >= max_hops) {
+        dispatch["skipped"] = true;
+        dispatch["reason"] = "dispatch hop limit reached";
+        if (dispatch_out) {
+            *dispatch_out = std::move(dispatch);
+        }
+        return true;
+    }
+
+    if (!llama_tb_transport_enabled()) {
+        const std::string msg =
+            "thunderbolt transport disabled (set LLAMA_PREFILL_TB_ENABLE=1)";
+        dispatch["error"] = msg;
+        if (dispatch_out) {
+            *dispatch_out = std::move(dispatch);
+        }
+        if (error) {
+            *error = msg;
+        }
+        return false;
+    }
+
+    const char * local_node_env = std::getenv("LLAMA_DECODE_NODE_ID");
+    const std::string local_node_id = !params.decode_node_id.empty()
+        ? normalize_node_id(params.decode_node_id)
+        : ((local_node_env && local_node_env[0] != '\0')
+            ? normalize_node_id(local_node_env)
+            : std::string());
+    dispatch["local_node_id"] = local_node_id;
+    dispatch["attempted"] = true;
+
+    const std::vector<server_handoff_remote_node> descriptor_pool =
+        merged_handoff_descriptors(handoff, cluster_nodes);
+
+    std::unordered_map<std::string, server_handoff_remote_node> descriptors;
+    for (const auto & node : descriptor_pool) {
+        const std::string key = normalize_node_id(node.node_id);
+        if (!key.empty()) {
+            server_handoff_remote_node normalized = node;
+            normalized.node_id = key;
+            descriptors[key] = std::move(normalized);
+        }
+    }
+
+    const std::filesystem::path artifact_fs_path(artifact_path);
+    const std::string default_session_dir =
+        artifact_fs_path.has_parent_path()
+            ? artifact_fs_path.parent_path().string()
+            : std::string("/tmp/ik_kv_handoff");
+    const char * dispatch_session_dir_env = std::getenv("LLAMA_DECODE_ROUTE_DISPATCH_SESSION_DIR");
+    const std::string session_dir = !params.decode_route_dispatch_session_dir.empty()
+        ? params.decode_route_dispatch_session_dir
+        : ((dispatch_session_dir_env && dispatch_session_dir_env[0] != '\0')
+            ? std::string(dispatch_session_dir_env)
+            : default_session_dir);
+
+    int32_t attempted_targets = 0;
+    int32_t successful_targets = 0;
+    int32_t failed_targets = 0;
+    std::string first_error;
+
+    for (const auto & raw_node_id : route_plan.required_nodes) {
+        const std::string node_id = normalize_node_id(raw_node_id);
+        const std::string target_label = node_id.empty() ? raw_node_id : node_id;
+        json target = {
+            {"node_id", target_label},
+            {"sent", false},
+        };
+        if (raw_node_id != target_label) {
+            target["node_id_raw"] = raw_node_id;
+        }
+
+        if (node_id.empty()) {
+            failed_targets++;
+            target["error"] = "invalid empty required node id";
+            if (first_error.empty()) {
+                first_error = "invalid empty required node id in route plan";
+            }
+            dispatch["targets"].push_back(std::move(target));
+            continue;
+        }
+
+        if (!local_node_id.empty() && node_id == local_node_id) {
+            target["skipped"] = true;
+            target["reason"] = "target matches local node id";
+            dispatch["targets"].push_back(std::move(target));
+            continue;
+        }
+
+        const auto it = descriptors.find(node_id);
+        if (it == descriptors.end()) {
+            failed_targets++;
+            target["error"] = "missing remote_node_descriptor for required node";
+            if (first_error.empty()) {
+                first_error = "missing remote_node_descriptor for node '" + node_id + "'";
+            }
+            dispatch["targets"].push_back(std::move(target));
+            continue;
+        }
+
+        const server_handoff_remote_node & desc = it->second;
+        target["kv_host"] = desc.kv_host;
+        target["kv_port"] = desc.kv_port;
+        target["rpc_endpoint"] = desc.rpc_endpoint;
+
+        if (desc.kv_host.empty() && desc.rpc_endpoint.empty()) {
+            failed_targets++;
+            target["error"] = "descriptor has no kv_host/kv_port or rpc_endpoint";
+            if (first_error.empty()) {
+                first_error = "descriptor for node '" + node_id + "' has no reachable endpoint";
+            }
+            dispatch["targets"].push_back(std::move(target));
+            continue;
+        }
+
+        server_handoff_metadata_v2 target_handoff;
+        std::string target_handoff_error;
+        if (!build_target_handoff_metadata(
+                handoff, route_plan, node_id, local_node_id, descriptor_pool,
+                &target_handoff, &target_handoff_error)) {
+            failed_targets++;
+            target["error"] = target_handoff_error.empty()
+                ? "failed to build target handoff metadata"
+                : target_handoff_error;
+            if (first_error.empty()) {
+                first_error = "handoff metadata build failed for node '" + target_label +
+                    "': " + target["error"].get<std::string>();
+            }
+            dispatch["targets"].push_back(std::move(target));
+            continue;
+        }
+
+        const json descriptors_json = remote_node_descriptors_json(target_handoff);
+        const std::string handoff_v2_json =
+            server_handoff_metadata_v2_to_json(target_handoff).dump();
+
+        llama_tb_transfer_options opts;
+        opts.session_dir = session_dir;
+        const std::string sid_base = sanitize_session_token(
+            handoff.handoff_session_id.empty() ? route_plan.route_plan_id : handoff.handoff_session_id);
+        const std::string sid_target = sanitize_session_token(target_label);
+        opts.session_id = sid_base + "_fanout_" + sid_target +
+            "_hop" + std::to_string(std::max(0, incoming_dispatch_hop + 1));
+        opts.endpoint = desc.rpc_endpoint;
+        opts.transport_mode = handoff.transport_mode.empty() ? "auto" : handoff.transport_mode;
+        opts.kv_host = desc.kv_host;
+        opts.kv_port = desc.kv_port;
+        opts.execution_mode = handoff.execution_mode.empty() ? "decoupled" : handoff.execution_mode;
+        opts.progressive = false;
+        opts.remote_nodes = std::max(1, target_handoff.remote_nodes);
+        opts.expected_gpu_layers = std::max(0, target_handoff.expected_gpu_layers);
+        opts.expected_remote_layers = std::max(0, target_handoff.expected_remote_layers);
+        opts.layer_map = server_handoff_serialize_layer_map_legacy(target_handoff.layer_map);
+        opts.remote_ranges = target_handoff.remote_ranges;
+        opts.remote_failover_policy = target_handoff.remote_failover_policy;
+        opts.handoff_session_id = target_handoff.handoff_session_id;
+        opts.topology_epoch = target_handoff.topology_epoch;
+        opts.artifact_crc32 = target_handoff.artifact_crc32;
+        opts.remote_node_descriptors_json = descriptors_json.dump();
+        opts.prefill_handoff_v2_json = handoff_v2_json;
+        opts.dispatch_hop = std::max(0, incoming_dispatch_hop + 1);
+        opts.stream_count = std::max(1,
+            params.decode_route_dispatch_streams > 0
+                ? params.decode_route_dispatch_streams
+                : env_i32("LLAMA_DECODE_ROUTE_DISPATCH_STREAMS", 1));
+        opts.chunk_bytes = (size_t) std::max<int32_t>(1,
+            params.decode_route_dispatch_chunk_bytes > 0
+                ? params.decode_route_dispatch_chunk_bytes
+                : env_i32("LLAMA_DECODE_ROUTE_DISPATCH_CHUNK_BYTES", 4 * 1024 * 1024));
+        opts.max_inflight_bytes = (size_t) std::max<int32_t>(1,
+            params.decode_route_dispatch_max_inflight_bytes > 0
+                ? params.decode_route_dispatch_max_inflight_bytes
+                : env_i32("LLAMA_DECODE_ROUTE_DISPATCH_MAX_INFLIGHT_BYTES", 256 * 1024 * 1024));
+
+        llama_tb_transfer_result tr;
+        std::string send_error;
+        attempted_targets++;
+        if (!llama_tb_transport_send_artifact(artifact_path, opts, &tr, &send_error)) {
+            failed_targets++;
+            target["error"] = send_error.empty() ? "dispatch send failed" : send_error;
+            if (first_error.empty()) {
+                first_error = "dispatch send failed for node '" + target_label + "': " +
+                    (send_error.empty() ? "unknown error" : send_error);
+            }
+            dispatch["targets"].push_back(std::move(target));
+            continue;
+        }
+
+        successful_targets++;
+        target["sent"] = true;
+        target["layer_map"] = opts.layer_map;
+        target["prefill_handoff_v2_remote_nodes"] = target_handoff.remote_nodes;
+        target["prefill_handoff_v2_expected_gpu_layers"] = target_handoff.expected_gpu_layers;
+        target["prefill_handoff_v2_expected_remote_layers"] = target_handoff.expected_remote_layers;
+        target["transport_mode"] = tr.transport_mode;
+        target["transport_backend"] = tr.transport_backend;
+        target["bytes_sent"] = tr.bytes_sent;
+        target["chunks_sent"] = tr.chunks_sent;
+        target["stream_count"] = tr.stream_count;
+        target["throughput_gbps"] = tr.throughput_gbps;
+        target["transfer_ms"] = tr.transfer_ms;
+        target["retransmit_chunks"] = tr.retransmit_chunks;
+        target["session_path"] = tr.session_path;
+        dispatch["targets"].push_back(std::move(target));
+    }
+
+    dispatch["attempted_targets"] = attempted_targets;
+    dispatch["successful_targets"] = successful_targets;
+    dispatch["failed_targets"] = failed_targets;
+    dispatch["dispatch_hop"] = std::max(0, incoming_dispatch_hop + 1);
+
+    if (failed_targets > 0) {
+        dispatch["error"] = first_error;
+        if (dispatch_out) {
+            *dispatch_out = std::move(dispatch);
+        }
+        if (error) {
+            *error = first_error;
+        }
+        return false;
+    }
+
+    if (dispatch_out) {
+        *dispatch_out = std::move(dispatch);
     }
     return true;
 }
@@ -2109,6 +2779,117 @@ void server_context::process_single_task(server_task&& task) {
             slot->cache_tokens.resize(token_count);
         }
 
+        server_handoff_metadata_v2 handoff_v2;
+        bool handoff_available = false;
+        std::string handoff_error;
+
+        if (task.data.contains("prefill_handoff_v2")) {
+            if (server_handoff_metadata_v2_from_json(task.data.at("prefill_handoff_v2"), &handoff_v2, &handoff_error)) {
+                handoff_available = true;
+            }
+        }
+        if (!handoff_available && task.data.contains("prefill_handoff")) {
+            std::string legacy_error;
+            if (server_handoff_metadata_v2_from_legacy_json(task.data.at("prefill_handoff"), &handoff_v2, &legacy_error)) {
+                handoff_available = true;
+                handoff_error.clear();
+            } else if (handoff_error.empty()) {
+                handoff_error = legacy_error;
+            }
+        }
+
+        server_decode_route_plan decode_route_plan;
+        bool decode_route_available = false;
+        std::string decode_route_error;
+        std::string decode_cluster_error;
+        std::vector<server_decode_cluster_node> decode_dispatch_nodes;
+        const char * local_node_env = std::getenv("LLAMA_DECODE_NODE_ID");
+        const std::string local_node_id = !params_base.decode_node_id.empty()
+            ? params_base.decode_node_id
+            : ((local_node_env && local_node_env[0] != '\0')
+                ? std::string(local_node_env)
+                : std::string());
+        const int32_t incoming_dispatch_hop =
+            std::max<int32_t>(0, task.data.value("prefill_dispatch_hop", 0));
+        json decode_dispatch = json::object();
+        bool decode_dispatch_available = false;
+        std::string decode_dispatch_error;
+
+        if (handoff_available) {
+            const bool fail_closed = lower_copy(handoff_v2.remote_failover_policy) == "fail";
+            decode_dispatch_nodes = handoff_nodes_to_cluster(handoff_v2);
+            std::vector<server_decode_cluster_node> env_nodes;
+            if (!load_decode_cluster_nodes(params_base, &env_nodes, &decode_cluster_error)) {
+                decode_route_error = "decode cluster config error: " + decode_cluster_error;
+                if (fail_closed) {
+                    slot->cache_tokens.resize(0);
+                    send_error(task,
+                        "Unable to restore slot: " + decode_route_error + " (failover policy=fail)",
+                        ERROR_TYPE_INVALID_REQUEST);
+                    break;
+                }
+                decode_route_plan = build_local_fallback_plan(handoff_v2, decode_route_error);
+                decode_route_available = true;
+            } else {
+                std::unordered_map<std::string, server_decode_cluster_node> merged_nodes;
+                const auto handoff_nodes = handoff_nodes_to_cluster(handoff_v2);
+                for (const auto & node : handoff_nodes) {
+                    upsert_cluster_node(merged_nodes, node);
+                }
+                for (const auto & node : env_nodes) {
+                    upsert_cluster_node(merged_nodes, node);
+                }
+
+                std::vector<server_decode_cluster_node> route_nodes;
+                route_nodes.reserve(merged_nodes.size());
+                for (const auto & kv : merged_nodes) {
+                    route_nodes.push_back(kv.second);
+                }
+                std::sort(route_nodes.begin(), route_nodes.end(), [](const auto & a, const auto & b) {
+                    return a.node_id < b.node_id;
+                });
+                decode_dispatch_nodes = route_nodes;
+
+                if (!server_decode_router_build_plan(
+                        handoff_v2, route_nodes, local_node_id,
+                        &decode_route_plan, &decode_route_error)) {
+                    if (fail_closed) {
+                        slot->cache_tokens.resize(0);
+                        send_error(task,
+                            "Unable to restore slot: decode route planning failed (" + decode_route_error + ")",
+                            ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    decode_route_plan = build_local_fallback_plan(handoff_v2, decode_route_error);
+                }
+                decode_route_available = true;
+            }
+        }
+
+        if (handoff_available && decode_route_available) {
+            const bool fail_closed = lower_copy(handoff_v2.remote_failover_policy) == "fail";
+            if (!dispatch_kv_artifact_to_decode_workers(
+                    filepath, handoff_v2, decode_route_plan, decode_dispatch_nodes, params_base,
+                    incoming_dispatch_hop,
+                    &decode_dispatch, &decode_dispatch_error)) {
+                if (fail_closed) {
+                    slot->cache_tokens.resize(0);
+                    send_error(task,
+                        "Unable to restore slot: decode dispatch failed (" + decode_dispatch_error + ")",
+                        ERROR_TYPE_INVALID_REQUEST);
+                    break;
+                }
+                if (decode_route_error.empty()) {
+                    decode_route_error = decode_dispatch_error;
+                } else if (!decode_dispatch_error.empty()) {
+                    decode_route_error += "; " + decode_dispatch_error;
+                }
+                decode_route_plan = build_local_fallback_plan(handoff_v2, decode_route_error);
+                decode_route_available = true;
+            }
+            decode_dispatch_available = !decode_dispatch.empty();
+        }
+
         const int64_t t_end = ggml_time_us();
         const double t_restore_ms = (t_end - t_start) / 1000.0;
 
@@ -2121,10 +2902,31 @@ void server_context::process_single_task(server_task&& task) {
             { "filename",   filename },
             { "n_restored", token_count }, // tokens restored
             { "n_read",     nread },       // bytes read
+            { "prefill_dispatch_hop", incoming_dispatch_hop },
             { "timings", {
                 { "restore_ms", t_restore_ms }
             } }
         };
+        if (handoff_available) {
+            result.data["prefill_handoff_v2"] = server_handoff_metadata_v2_to_json(handoff_v2);
+        } else if (!handoff_error.empty()) {
+            result.data["prefill_handoff_error"] = handoff_error;
+        }
+        if (decode_route_available) {
+            result.data["decode_route_plan"] = server_decode_route_plan_to_json(decode_route_plan);
+        }
+        if (decode_dispatch_available) {
+            result.data["decode_dispatch"] = decode_dispatch;
+        }
+        if (!decode_route_error.empty()) {
+            result.data["decode_route_error"] = decode_route_error;
+        }
+        if (!decode_dispatch_error.empty()) {
+            result.data["decode_dispatch_error"] = decode_dispatch_error;
+        }
+        if (!decode_cluster_error.empty()) {
+            result.data["decode_cluster_error"] = decode_cluster_error;
+        }
         queue_results.send(result);
     } break;
     case SERVER_TASK_TYPE_SLOT_ERASE:

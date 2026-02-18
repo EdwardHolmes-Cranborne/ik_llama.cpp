@@ -776,6 +776,24 @@ bool send_artifact_over_tcp(const fs::path & src, const std::vector<std::string>
     if (!options.layer_map.empty()) {
         session_payload << ";layer_map=" << options.layer_map;
     }
+    if (!options.handoff_session_id.empty()) {
+        session_payload << ";handoff_session_id=" << options.handoff_session_id;
+    }
+    if (!options.topology_epoch.empty()) {
+        session_payload << ";topology_epoch=" << options.topology_epoch;
+    }
+    if (options.artifact_crc32 != 0) {
+        session_payload << ";artifact_crc32=" << options.artifact_crc32;
+    }
+    if (!options.remote_node_descriptors_json.empty()) {
+        session_payload << ";remote_node_descriptors=" << options.remote_node_descriptors_json;
+    }
+    if (!options.prefill_handoff_v2_json.empty()) {
+        session_payload << ";prefill_handoff_v2_json=" << options.prefill_handoff_v2_json;
+    }
+    if (options.dispatch_hop > 0) {
+        session_payload << ";dispatch_hop=" << options.dispatch_hop;
+    }
     for (auto & stream : streams) {
         if (!send_frame_str(stream, TBP_MSG_SESSION_START, 0, session_payload.str())) {
             close_all(streams);
@@ -1253,6 +1271,12 @@ bool llama_tb_transport_send_artifact(const std::string &          artifact_path
         meta << "remote_ranges=" << options.remote_ranges << "\n";
         meta << "remote_failover=" << options.remote_failover_policy << "\n";
         meta << "layer_map=" << options.layer_map << "\n";
+        meta << "handoff_session_id=" << options.handoff_session_id << "\n";
+        meta << "topology_epoch=" << options.topology_epoch << "\n";
+        meta << "artifact_crc32=" << options.artifact_crc32 << "\n";
+        meta << "remote_node_descriptors=" << options.remote_node_descriptors_json << "\n";
+        meta << "prefill_handoff_v2_json=" << options.prefill_handoff_v2_json << "\n";
+        meta << "dispatch_hop=" << options.dispatch_hop << "\n";
         meta << "transport_mode=" << resolved_transport_mode << "\n";
         meta << "transport_backend=" << backend_desc << "\n";
         meta << "endpoint=" << endpoint_desc << "\n";

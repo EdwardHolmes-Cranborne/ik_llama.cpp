@@ -60,6 +60,10 @@ struct kv_receiver_session_stats {
     std::string remote_ranges;
     std::string remote_failover_policy;
     std::string layer_map;
+    std::string prefill_handoff_v2_json;
+    bool prefill_handoff_v2_valid = false;
+    std::string prefill_handoff_v2_error;
+    int32_t dispatch_hop = 0;
     int32_t expected_streams = 0;
     int32_t seen_streams = 0;
     int32_t done_streams = 0;
