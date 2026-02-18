@@ -26,6 +26,10 @@ This file is the shared handoff + review ledger for both machines.
   - RPC server now accepts clients concurrently (thread-per-connection).
   - Backend command execution is serialized with a global mutex to avoid backend re-entrancy issues.
   - Accept-loop no longer exits the server on a transient accept failure.
+  - Pulled from the other side: reduce socket chunk sizes + stream `SET_TENSOR` payloads (avoid multi-GiB client allocs).
+
+- `scripts/validate_dual_mac_decode_server.sh`
+  - Default `OUTPUT_DIR` includes PID suffix to avoid collisions in parallel runs.
 
 ### Validation Snapshots
 
@@ -34,10 +38,22 @@ This file is the shared handoff + review ledger for both machines.
   - rpc: `127.0.0.1:50052`
   - completion smoke: default `n_predict=16`, default timeout (180s)
 
+- PASS (repeat): `/tmp/ik_dual_mac_decode_validate_20260218_144951`
+  - profile: `m3_max128_to_m3_ultra512`
+  - rpc: `127.0.0.1:50052`
+
 - PASS: `/tmp/ik_dual_mac_decode_validate_20260218_142916`
   - profile: `m3_max128_to_m3_ultra512`
   - rpc: `127.0.0.1:50052`
   - completion smoke: `n_predict=1`, timeout 180s
+
+- PASS (concurrent): `/tmp/ik_dual_mac_decode_validate_20260218_145521_9474`
+  - profile: custom (ctx=4096, ngl=1, http=8080, kv=19001)
+  - rpc: `127.0.0.1:50052`
+
+- PASS (concurrent): `/tmp/ik_dual_mac_decode_validate_20260218_145521_9475`
+  - profile: custom (ctx=4096, ngl=1, http=8081, kv=19002)
+  - rpc: `127.0.0.1:50052`
 
 - Earlier run reached startup but timed out on long completion:
   - `/tmp/ik_dual_mac_decode_validate_20260218_142508`
