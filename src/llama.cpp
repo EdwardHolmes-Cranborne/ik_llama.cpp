@@ -98,8 +98,8 @@
 #include <cstdarg>
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
@@ -2039,6 +2039,19 @@ static bool llm_load_tensors(llama_model_loader &ml, llama_model &model,
       LLAMA_LOG_WARN(
           "=======================================================\n\n");
       split_mode = LLAMA_SPLIT_MODE_LAYER;
+    } else if (!model.rpc_servers.empty()) {
+      // Metal/RPC has no split buffer type (unlike CUDA's
+      // ggml_backend_cuda_split_buffer_type). Without it, graph split falls
+      // back to offload(main_gpu) which puts ALL tensors on the RPC device,
+      // sending 2x the model data. Force layer split instead.
+      LLAMA_LOG_WARN(
+          "\n=======================================================\n");
+      LLAMA_LOG_WARN("Split mode 'graph' is not supported with RPC backends\n");
+      LLAMA_LOG_WARN("  (no split buffer implementation for Metal/RPC)\n");
+      LLAMA_LOG_WARN("  => changing split mode to 'layer'\n");
+      LLAMA_LOG_WARN(
+          "=======================================================\n\n");
+      split_mode = LLAMA_SPLIT_MODE_LAYER;
     } else {
       if (model.arch == LLM_ARCH_MIMO2 && model.devices.size() > 4 &&
           (max_gpu == 0 || max_gpu > 4)) {
@@ -3315,7 +3328,7 @@ static void llama_graph_compute(llama_context &lctx, ggml_cgraph *gf,
   // ggml_backend_sched_get_n_splits(lctx.sched));
 }
 
-static int32_t llama_tensor_layer_out_index(const ggml_tensor * t) {
+static int32_t llama_tensor_layer_out_index(const ggml_tensor *t) {
   if (t == nullptr || t->name[0] == '\0') {
     return -1;
   }
@@ -3337,10 +3350,10 @@ static int32_t llama_tensor_layer_out_index(const ggml_tensor * t) {
       value > std::numeric_limits<int32_t>::max()) {
     return -1;
   }
-  return (int32_t) value;
+  return (int32_t)value;
 }
 
-static void llama_layer_eval_start_layer(llama_context & lctx, int32_t il) {
+static void llama_layer_eval_start_layer(llama_context &lctx, int32_t il) {
   auto &state = lctx.layer_eval_callbacks;
   if (!state.active || il < 0 || il >= state.n_layers) {
     return;
@@ -3354,7 +3367,7 @@ static void llama_layer_eval_start_layer(llama_context & lctx, int32_t il) {
   }
 }
 
-static void llama_layer_eval_finish_layer(llama_context & lctx, int32_t il) {
+static void llama_layer_eval_finish_layer(llama_context &lctx, int32_t il) {
   auto &state = lctx.layer_eval_callbacks;
   if (!state.active || il < 0 || il >= state.n_layers) {
     return;
@@ -3369,10 +3382,10 @@ static void llama_layer_eval_finish_layer(llama_context & lctx, int32_t il) {
   }
 
   if (state.current_layer_start_us > 0 &&
-      il < (int32_t) lctx.last_layer_compute_times_ms.size()) {
+      il < (int32_t)lctx.last_layer_compute_times_ms.size()) {
     const int64_t now_us = ggml_time_us();
-    const float elapsed_ms = (float) (now_us - state.current_layer_start_us) /
-                             1000.0f;
+    const float elapsed_ms =
+        (float)(now_us - state.current_layer_start_us) / 1000.0f;
     lctx.last_layer_compute_times_ms[il] += elapsed_ms;
   }
 
@@ -3389,7 +3402,7 @@ static void llama_layer_eval_finish_layer(llama_context & lctx, int32_t il) {
   }
 }
 
-static void llama_layer_eval_begin_ubatch(llama_context & lctx) {
+static void llama_layer_eval_begin_ubatch(llama_context &lctx) {
   auto &state = lctx.layer_eval_callbacks;
   if (!state.active || state.n_layers <= 0) {
     return;
@@ -3401,8 +3414,8 @@ static void llama_layer_eval_begin_ubatch(llama_context & lctx) {
   llama_layer_eval_start_layer(lctx, 0);
 }
 
-static bool llama_decode_eval_callback(struct ggml_tensor * t, bool ask,
-                                       void * user_data) {
+static bool llama_decode_eval_callback(struct ggml_tensor *t, bool ask,
+                                       void *user_data) {
   auto *lctx = static_cast<llama_context *>(user_data);
   if (lctx == nullptr) {
     return true;
@@ -3443,12 +3456,12 @@ static bool llama_decode_eval_callback(struct ggml_tensor * t, bool ask,
   return true;
 }
 
-static void llama_decode_eval_prepare(llama_context & lctx) {
+static void llama_decode_eval_prepare(llama_context &lctx) {
   auto &state = lctx.layer_eval_callbacks;
   state.user_cb = lctx.cparams.cb_eval;
   state.user_cb_user_data = lctx.cparams.cb_eval_user_data;
-  state.active = (bool) lctx.pre_layer_cb || (bool) lctx.post_layer_cb;
-  state.n_layers = std::max<int32_t>(0, (int32_t) lctx.model.hparams.n_layer);
+  state.active = (bool)lctx.pre_layer_cb || (bool)lctx.post_layer_cb;
+  state.n_layers = std::max<int32_t>(0, (int32_t)lctx.model.hparams.n_layer);
   state.current_layer = -1;
   state.current_layer_start_us = 0;
   state.first_layer_started = false;
@@ -3461,7 +3474,7 @@ static void llama_decode_eval_prepare(llama_context & lctx) {
   }
 }
 
-static void llama_decode_eval_install(llama_context & lctx) {
+static void llama_decode_eval_install(llama_context &lctx) {
   const auto &state = lctx.layer_eval_callbacks;
   if (state.active || state.user_cb) {
     ggml_backend_sched_set_eval_callback(lctx.sched, llama_decode_eval_callback,
@@ -3471,13 +3484,13 @@ static void llama_decode_eval_install(llama_context & lctx) {
   }
 }
 
-static bool llama_decode_handoff_requested(const llama_context & ctx) {
+static bool llama_decode_handoff_requested(const llama_context &ctx) {
   return ctx.prefill_decode_mode != LLAMA_PREFILL_DECODE_MODE_AUTO ||
          ctx.prefill_transport_mode != LLAMA_PREFILL_TRANSPORT_MODE_DISABLED ||
          ctx.prefill_decode_transport_required;
 }
 
-static bool llama_decode_has_gpu_backend(const llama_context & ctx) {
+static bool llama_decode_has_gpu_backend(const llama_context &ctx) {
   for (ggml_backend_t backend : ctx.backends) {
     if (backend != nullptr && !ggml_backend_is_cpu(backend)) {
       return true;
@@ -3486,8 +3499,8 @@ static bool llama_decode_has_gpu_backend(const llama_context & ctx) {
   return false;
 }
 
-static llama_seq_id llama_batch_primary_seq_id(const llama_batch & batch,
-                                               bool * has_multiple) {
+static llama_seq_id llama_batch_primary_seq_id(const llama_batch &batch,
+                                               bool *has_multiple) {
   std::set<llama_seq_id> seq_ids;
   if (batch.seq_id != nullptr && batch.n_seq_id != nullptr) {
     for (int32_t i = 0; i < batch.n_tokens; ++i) {
@@ -3511,16 +3524,16 @@ static llama_seq_id llama_batch_primary_seq_id(const llama_batch & batch,
   return batch.all_seq_id;
 }
 
-static int llama_decode_publish_prefill_kv_handoff(llama_context * ctx,
-                                                   const llama_batch & batch,
-                                                   const char * caller) {
+static int llama_decode_publish_prefill_kv_handoff(llama_context *ctx,
+                                                   const llama_batch &batch,
+                                                   const char *caller) {
   if (ctx == nullptr || batch.n_tokens <= 1 ||
       !llama_decode_handoff_requested(*ctx)) {
     return 0;
   }
 
   llama_decode_handoff_runtime runtime;
-  runtime.n_layers = (int32_t) ctx->model.hparams.n_layer;
+  runtime.n_layers = (int32_t)ctx->model.hparams.n_layer;
   runtime.offload_kqv = ctx->cparams.offload_kqv;
   runtime.has_gpu_backend = llama_decode_has_gpu_backend(*ctx);
   runtime.model_gpu_layers = ctx->model.n_gpu_layers;
@@ -3549,10 +3562,11 @@ static int llama_decode_publish_prefill_kv_handoff(llama_context * ctx,
   runtime.kv_transport_fallback = ctx->kv_transport_fallback;
   runtime.transport_required = ctx->prefill_decode_transport_required;
 
-  const llama_decode_handoff_plan plan = llama_decode_handoff_build_plan(runtime);
+  const llama_decode_handoff_plan plan =
+      llama_decode_handoff_build_plan(runtime);
   const bool required = plan.transport_required;
 
-  auto fail_or_warn = [&](const std::string & reason) -> int {
+  auto fail_or_warn = [&](const std::string &reason) -> int {
     if (required) {
       LLAMA_LOG_ERROR("%s: prefill KV handoff failed: %s\n", caller,
                       reason.c_str());
@@ -3595,9 +3609,10 @@ static int llama_decode_publish_prefill_kv_handoff(llama_context * ctx,
   const llama_seq_id seq_id =
       llama_batch_primary_seq_id(batch, &has_multiple_seq);
   if (has_multiple_seq) {
-    LLAMA_LOG_WARN("%s: batch contains multiple sequence IDs; exporting seq_id=%d "
-                   "only\n",
-                   caller, (int) seq_id);
+    LLAMA_LOG_WARN(
+        "%s: batch contains multiple sequence IDs; exporting seq_id=%d "
+        "only\n",
+        caller, (int)seq_id);
   }
 
   const size_t payload_size = llama_state_seq_get_size(ctx, seq_id);
@@ -3606,8 +3621,8 @@ static int llama_decode_publish_prefill_kv_handoff(llama_context * ctx,
   }
 
   std::vector<uint8_t> payload(payload_size);
-  const size_t bytes_written = llama_state_seq_get_data(
-      ctx, payload.data(), payload.size(), seq_id);
+  const size_t bytes_written =
+      llama_state_seq_get_data(ctx, payload.data(), payload.size(), seq_id);
   if (bytes_written == 0) {
     return fail_or_warn("failed to serialize KV payload from context");
   }
@@ -3616,11 +3631,11 @@ static int llama_decode_publish_prefill_kv_handoff(llama_context * ctx,
   }
 
   llama_kv_artifact_metadata meta = {};
-  meta.n_layers = (uint32_t) ctx->model.hparams.n_layer;
-  meta.n_ctx = (uint32_t) ctx->cparams.n_ctx;
-  meta.token_count = (uint32_t) batch.n_tokens;
-  meta.type_k = (uint16_t) ctx->kv_self.type_k;
-  meta.type_v = (uint16_t) ctx->kv_self.type_v;
+  meta.n_layers = (uint32_t)ctx->model.hparams.n_layer;
+  meta.n_ctx = (uint32_t)ctx->cparams.n_ctx;
+  meta.token_count = (uint32_t)batch.n_tokens;
+  meta.type_k = (uint16_t)ctx->kv_self.type_k;
+  meta.type_v = (uint16_t)ctx->kv_self.type_v;
   if (plan.transport_mode == LLAMA_PREFILL_TRANSPORT_MODE_PROGRESSIVE) {
     meta.flags |= LLAMA_KV_ARTIFACT_FLAG_PROGRESSIVE;
   }
@@ -3637,8 +3652,8 @@ static int llama_decode_publish_prefill_kv_handoff(llama_context * ctx,
   }
 
   const std::string artifact_name =
-      "kv_artifact_seq" + std::to_string((int) seq_id) + "_" +
-      std::to_string((long long) ggml_time_us()) + ".bin";
+      "kv_artifact_seq" + std::to_string((int)seq_id) + "_" +
+      std::to_string((long long)ggml_time_us()) + ".bin";
   const std::filesystem::path artifact_path = artifact_dir / artifact_name;
   const std::string artifact_path_str = artifact_path.string();
 
@@ -3646,14 +3661,13 @@ static int llama_decode_publish_prefill_kv_handoff(llama_context * ctx,
   std::string artifact_error;
   if (!llama_kv_artifact_write(artifact_path_str, payload, meta,
                                &artifact_summary, &artifact_error)) {
-    return fail_or_warn(artifact_error.empty()
-                            ? "failed to write KV artifact"
-                            : artifact_error);
+    return fail_or_warn(artifact_error.empty() ? "failed to write KV artifact"
+                                               : artifact_error);
   }
 
   LLAMA_LOG_INFO("%s: wrote KV artifact: %s (%llu bytes, crc32=%u)\n", caller,
                  artifact_path_str.c_str(),
-                 (unsigned long long) artifact_summary.payload_bytes,
+                 (unsigned long long)artifact_summary.payload_bytes,
                  artifact_summary.payload_crc32);
 
   llama_decode_handoff_plan publish_plan = plan;
@@ -3661,8 +3675,8 @@ static int llama_decode_publish_prefill_kv_handoff(llama_context * ctx,
 
   llama_decode_publish_diag publish_diag = {};
   std::string publish_status;
-  if (!executor->publish_kv_artifact(artifact_path_str, publish_plan, publish_status,
-                                     &publish_diag)) {
+  if (!executor->publish_kv_artifact(artifact_path_str, publish_plan,
+                                     publish_status, &publish_diag)) {
     return fail_or_warn(publish_status.empty() ? "publish_kv_artifact failed"
                                                : publish_status);
   }
@@ -3672,7 +3686,8 @@ static int llama_decode_publish_prefill_kv_handoff(llama_context * ctx,
   }
 
   if (required && !publish_diag.transport_used) {
-    return fail_or_warn("transport-required handoff did not use network transport");
+    return fail_or_warn(
+        "transport-required handoff did not use network transport");
   }
 
   if (publish_diag.transport_used) {
@@ -3681,10 +3696,10 @@ static int llama_decode_publish_prefill_kv_handoff(llama_context * ctx,
         "streams=%d transfer_ms=%.2f throughput_gbps=%.2f retransmit_chunks=%u "
         "window_stalls_ms=%llu\n",
         caller, publish_diag.transport_backend.c_str(),
-        (unsigned long long) publish_diag.bytes_sent, publish_diag.chunks_sent,
+        (unsigned long long)publish_diag.bytes_sent, publish_diag.chunks_sent,
         publish_diag.stream_count, publish_diag.transfer_ms,
         publish_diag.throughput_gbps, publish_diag.retransmit_chunks,
-        (unsigned long long) publish_diag.window_stalls_ms);
+        (unsigned long long)publish_diag.window_stalls_ms);
   }
 
   return 0;
@@ -7933,8 +7948,8 @@ int32_t llama_decode(struct llama_context *ctx, struct llama_batch batch) {
   }
 
   if (ret == 0 && batch.n_tokens > 1) {
-    const int handoff_ret = llama_decode_publish_prefill_kv_handoff(
-        ctx, batch, __func__);
+    const int handoff_ret =
+        llama_decode_publish_prefill_kv_handoff(ctx, batch, __func__);
     if (handoff_ret < 0) {
       return handoff_ret;
     }
