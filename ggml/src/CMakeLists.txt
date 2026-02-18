@@ -689,6 +689,12 @@ if (GGML_RPC)
 
     set(GGML_HEADERS_RPC ../include/ggml-rpc.h)
     set(GGML_SOURCES_RPC ggml-rpc.cpp)
+
+    # Metal+RPC split buffer for graph split mode
+    if (GGML_METAL)
+        list(APPEND GGML_HEADERS_RPC ../include/ggml-metal-rpc-split.h)
+        list(APPEND GGML_SOURCES_RPC ggml-metal-rpc-split.cpp)
+    endif()
 endif()
 
 if (GGML_RDMA)

@@ -34,6 +34,9 @@
 
 #ifdef GGML_USE_RPC
 #include "ggml-rpc.h"
+#if defined(GGML_USE_METAL)
+#include "ggml-metal-rpc-split.h"
+#endif
 #endif
 
 #ifdef GGML_USE_CUDA
@@ -511,6 +514,18 @@ llama_default_buffer_type_split(const llama_model &model, int fallback_gpu) {
 #ifdef GGML_USE_SYCL
   if (ggml_backend_sycl_get_device_count() > 1) {
     buft = ggml_backend_sycl_split_buffer_type(model.splits.data());
+  }
+#endif
+
+#if defined(GGML_USE_METAL) && defined(GGML_USE_RPC)
+  // Metal+RPC split buffer: distribute tensor rows across Metal and RPC devices
+  if (buft == nullptr && model.devices.size() > 1) {
+    std::vector<ggml_backend_buffer_type_t> device_bufts;
+    for (size_t i = 0; i < model.devices.size(); ++i) {
+      device_bufts.push_back(llama_default_buffer_type_offload(model, (int)i));
+    }
+    buft = ggml_backend_metal_rpc_split_buffer_type(
+        device_bufts.data(), (int)device_bufts.size(), model.splits.data());
   }
 #endif
 
@@ -2035,19 +2050,6 @@ static bool llm_load_tensors(llama_model_loader &ml, llama_model &model,
       LLAMA_LOG_WARN(
           "\n=======================================================\n");
       LLAMA_LOG_WARN("Split mode 'graph' is not supported for this model\n");
-      LLAMA_LOG_WARN("  => changing split mode to 'layer'\n");
-      LLAMA_LOG_WARN(
-          "=======================================================\n\n");
-      split_mode = LLAMA_SPLIT_MODE_LAYER;
-    } else if (!model.rpc_servers.empty()) {
-      // Metal/RPC has no split buffer type (unlike CUDA's
-      // ggml_backend_cuda_split_buffer_type). Without it, graph split falls
-      // back to offload(main_gpu) which puts ALL tensors on the RPC device,
-      // sending 2x the model data. Force layer split instead.
-      LLAMA_LOG_WARN(
-          "\n=======================================================\n");
-      LLAMA_LOG_WARN("Split mode 'graph' is not supported with RPC backends\n");
-      LLAMA_LOG_WARN("  (no split buffer implementation for Metal/RPC)\n");
       LLAMA_LOG_WARN("  => changing split mode to 'layer'\n");
       LLAMA_LOG_WARN(
           "=======================================================\n\n");
