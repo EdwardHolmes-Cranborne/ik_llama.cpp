@@ -1566,7 +1566,7 @@ static id<MTLBuffer> ggml_metal_get_buffer(struct ggml_tensor *t,
           GGML_METAL_LOG_ERROR("  sub[%d]: data=%p size=%zu metal=%p\n", dbg_i,
                                buf_ctx->buffers[dbg_i].data,
                                buf_ctx->buffers[dbg_i].size,
-                               buf_ctx->buffers[dbg_i].metal);
+                               (void *)buf_ctx->buffers[dbg_i].metal);
         }
       }
     }
@@ -1736,10 +1736,8 @@ static bool ggml_metal_supports_op(const struct ggml_backend_metal_context *ctx,
 }
 
 static void ggml_metal_encode_node(struct ggml_backend_metal_context *ctx,
-                                   int cb_idx, id<MTLCommandBuffer> *cb_ptr,
-                                   id<MTLComputeCommandEncoder> *enc_ptr,
+                                   id<MTLComputeCommandEncoder> encoder,
                                    struct ggml_tensor *node) {
-  id<MTLComputeCommandEncoder> encoder = *enc_ptr;
 
   struct ggml_tensor *src0 = node->src[0];
   struct ggml_tensor *src1 = node->src[1];
@@ -2571,30 +2569,15 @@ static void ggml_metal_encode_node(struct ggml_backend_metal_context *ctx,
       id<MTLBuffer> id_src_j = ggml_metal_get_buffer(src_j, &offs_src_j);
 
       if (id_src_j == nil) {
-        // Source buffer not in Metal's registered buffers.
-        // On Apple Silicon unified memory, both src and dst data pointers
-        // are CPU-accessible, so do the vector-add on CPU instead of crashing.
-
-        // 1. Commit pending Metal work so dst has up-to-date values
-        [encoder endEncoding];
-
-        id<MTLCommandBuffer> current_cb = *cb_ptr;
-        [current_cb commit];
-        [current_cb waitUntilCompleted];
-
-        // 2. CPU-side float accumulation
-        float *dst_f = (float *)dst->data;
-        const float *src_f = (const float *)src_j->data;
-        for (int64_t k = 0; k < nelem; ++k) {
-          dst_f[k] += src_f[k];
-        }
-
-        // 3. Start a fresh command buffer + encoder for remaining ops
-        *cb_ptr = [ctx->queue commandBuffer];
-        *enc_ptr = [*cb_ptr computeCommandEncoder];
-        ctx->command_buffers[cb_idx] = *cb_ptr;
-        encoder = *enc_ptr;
-        continue;
+        // Source buffer not in Metal's registered buffers (e.g. copied from
+        // RPC). Since the CPU has already retrieved the data via copy_inputs,
+        // we can just wrap it in a temporary MTLBuffer and let the GPU sequence
+        // it correctly.
+        id_src_j =
+            [ctx->device newBufferWithBytes:src_j->data
+                                     length:ggml_nbytes(src_j)
+                                    options:MTLResourceStorageModeShared];
+        offs_src_j = 0;
       }
 
       if (nelem % 4 == 0) {
@@ -6073,7 +6056,7 @@ void ggml_backend_metal_set_n_cb(ggml_backend_t backend, int n_cb) {
                                               encoding:NSUTF8StringEncoding]];
       }
 
-      ggml_metal_encode_node(ctx, cb_idx, &command_buffer, &encoder, node);
+      ggml_metal_encode_node(ctx, encoder, node);
 
       if (should_capture) {
         [encoder popDebugGroup];
