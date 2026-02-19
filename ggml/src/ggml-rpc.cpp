@@ -68,6 +68,9 @@ typedef int sockfd_t;
 struct socket_t {
   sockfd_t fd;
   std::mutex io_mutex;
+  // Push cache: maps tensor data pointer -> pre-fetched data from server-push
+  std::mutex push_cache_mutex;
+  std::unordered_map<uint64_t, std::vector<uint8_t>> push_cache;
   socket_t(sockfd_t fd) : fd(fd) {}
   ~socket_t() {
     LOG_DBG("[%s] closing socket %d\n", __func__, this->fd);
@@ -125,6 +128,9 @@ enum rpc_cmd {
   RPC_CMD_HELLO,
   RPC_CMD_DEVICE_COUNT,
   RPC_CMD_GRAPH_RECOMPUTE,
+  RPC_CMD_COPY_TENSOR_ASYNC,
+  RPC_CMD_GRAPH_COMPUTE_AND_GET,
+  RPC_CMD_GRAPH_RECOMPUTE_AND_GET,
   RPC_CMD_COUNT,
 };
 
@@ -920,6 +926,21 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer,
                                                size_t size) {
   ggml_backend_rpc_buffer_context *ctx =
       (ggml_backend_rpc_buffer_context *)buffer->context;
+
+  // Check push cache first (populated by server-push GRAPH_COMPUTE_AND_GET)
+  if (offset == 0) {
+    uint64_t data_ptr = reinterpret_cast<uint64_t>(tensor->data);
+    std::lock_guard<std::mutex> lock(ctx->sock->push_cache_mutex);
+    auto it = ctx->sock->push_cache.find(data_ptr);
+    if (it != ctx->sock->push_cache.end()) {
+      size_t copy_size = std::min(size, it->second.size());
+      memcpy(data, it->second.data(), copy_size);
+      ctx->sock->push_cache.erase(it);
+      return;
+    }
+  }
+
+  // Cache miss: fall through to blocking RPC
   rpc_msg_get_tensor_req request;
   request.tensor = serialize_tensor(tensor);
   request.offset = offset;
@@ -952,11 +973,12 @@ static bool ggml_backend_rpc_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
     rpc_msg_copy_tensor_req request;
     request.src = serialize_tensor(src);
     request.dst = serialize_tensor(dst);
-    rpc_msg_copy_tensor_rsp response;
-    bool status = send_rpc_cmd(ctx->sock, RPC_CMD_COPY_TENSOR, &request,
-                               sizeof(request), &response, sizeof(response));
+    // Fire-and-forget: TCP ordering guarantees this completes before the
+    // next GRAPH_COMPUTE on the same socket.
+    bool status = send_rpc_cmd(ctx->sock, RPC_CMD_COPY_TENSOR_ASYNC, &request,
+                               sizeof(request));
     RPC_STATUS_ASSERT(status);
-    return response.result;
+    return true;
   }
   return false;
 }
@@ -1201,6 +1223,42 @@ static void serialize_graph(uint32_t device, const ggml_cgraph *cgraph,
   memcpy(out_tensors, tensors.data(), n_tensors * sizeof(rpc_tensor));
 }
 
+// Parse server-push response: n_outputs (4B) + n_outputs × (data_ptr (8B) +
+// size (8B) + data)
+static void parse_push_response(const std::shared_ptr<socket_t> &sock) {
+  std::vector<uint8_t> response;
+  {
+    std::lock_guard<std::mutex> lock(sock->io_mutex);
+    if (!recv_msg(sock->fd, response)) {
+      return;
+    }
+  }
+  if (response.size() < sizeof(uint32_t)) {
+    return;
+  }
+  const uint8_t *ptr = response.data();
+  uint32_t n_outputs;
+  memcpy(&n_outputs, ptr, sizeof(n_outputs));
+  ptr += sizeof(n_outputs);
+
+  std::lock_guard<std::mutex> lock(sock->push_cache_mutex);
+  for (uint32_t i = 0; i < n_outputs; i++) {
+    if (ptr + sizeof(uint64_t) + sizeof(uint64_t) >
+        response.data() + response.size())
+      break;
+    uint64_t data_ptr;
+    memcpy(&data_ptr, ptr, sizeof(data_ptr));
+    ptr += sizeof(data_ptr);
+    uint64_t tsize;
+    memcpy(&tsize, ptr, sizeof(tsize));
+    ptr += sizeof(tsize);
+    if (ptr + tsize > response.data() + response.size())
+      break;
+    sock->push_cache[data_ptr].assign(ptr, ptr + tsize);
+    ptr += tsize;
+  }
+}
+
 static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend,
                                                        ggml_cgraph *cgraph) {
   ggml_backend_rpc_context *rpc_ctx =
@@ -1210,22 +1268,23 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend,
   if (count_non_null_graph_nodes(cgraph) == 0) {
     return GGML_STATUS_SUCCESS;
   }
+  auto sock = get_socket(rpc_ctx->endpoint);
   bool reuse = rpc_ctx->gc.is_cached(cgraph);
   if (reuse) {
     rpc_msg_graph_recompute_req request;
     request.device = rpc_ctx->device;
-    auto sock = get_socket(rpc_ctx->endpoint);
-    bool status =
-        send_rpc_cmd(sock, RPC_CMD_GRAPH_RECOMPUTE, &request, sizeof(request));
+    bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_RECOMPUTE_AND_GET, &request,
+                               sizeof(request));
     RPC_STATUS_ASSERT(status);
+    parse_push_response(sock);
   } else {
     rpc_ctx->gc.add(cgraph);
     std::vector<uint8_t> input;
     serialize_graph(rpc_ctx->device, cgraph, input);
-    auto sock = get_socket(rpc_ctx->endpoint);
-    bool status =
-        send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size());
+    bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE_AND_GET,
+                               input.data(), input.size());
     RPC_STATUS_ASSERT(status);
+    parse_push_response(sock);
   }
   return GGML_STATUS_SUCCESS;
 }
@@ -1429,7 +1488,11 @@ public:
   bool copy_tensor(const rpc_msg_copy_tensor_req &request,
                    rpc_msg_copy_tensor_rsp &response);
   bool graph_compute(const std::vector<uint8_t> &input);
+  bool graph_compute_and_get(const std::vector<uint8_t> &input,
+                             std::vector<uint8_t> &push_response);
   bool graph_recompute(const rpc_msg_graph_recompute_req &request);
+  bool graph_recompute_and_get(const rpc_msg_graph_recompute_req &request,
+                               std::vector<uint8_t> &push_response);
   bool init_tensor(const rpc_msg_init_tensor_req &request);
   bool get_alloc_size(const rpc_msg_get_alloc_size_req &request,
                       rpc_msg_get_alloc_size_rsp &response);
@@ -2135,6 +2198,83 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req &request) {
   return true;
 }
 
+// Serialize all output node tensor data for server-push.
+// Format: n_outputs (4B) + n_outputs × (data_ptr (8B) + size (8B) + data)
+static void serialize_graph_outputs(ggml_cgraph *graph,
+                                    std::vector<uint8_t> &response) {
+  // Collect output data from all graph nodes
+  struct output_entry {
+    uint64_t data_ptr;
+    uint64_t size;
+    std::vector<uint8_t> data;
+  };
+  std::vector<output_entry> outputs;
+
+  for (int i = 0; i < graph->n_nodes; i++) {
+    ggml_tensor *node = graph->nodes[i];
+    if (node == nullptr || node->buffer == nullptr)
+      continue;
+    // Only push non-weight tensors (intermediate results)
+    if (node->flags & GGML_TENSOR_FLAG_INPUT)
+      continue;
+    size_t nbytes = ggml_nbytes(node);
+    if (nbytes == 0)
+      continue;
+    output_entry entry;
+    entry.data_ptr = reinterpret_cast<uint64_t>(node->data);
+    entry.size = nbytes;
+    entry.data.resize(nbytes);
+    ggml_backend_tensor_get(node, entry.data.data(), 0, nbytes);
+    outputs.push_back(std::move(entry));
+  }
+
+  // Serialize
+  uint32_t n_outputs = (uint32_t)outputs.size();
+  size_t total_size = sizeof(n_outputs);
+  for (auto &e : outputs) {
+    total_size += sizeof(e.data_ptr) + sizeof(e.size) + e.size;
+  }
+  response.resize(total_size);
+  uint8_t *ptr = response.data();
+  memcpy(ptr, &n_outputs, sizeof(n_outputs));
+  ptr += sizeof(n_outputs);
+  for (auto &e : outputs) {
+    memcpy(ptr, &e.data_ptr, sizeof(e.data_ptr));
+    ptr += sizeof(e.data_ptr);
+    memcpy(ptr, &e.size, sizeof(e.size));
+    ptr += sizeof(e.size);
+    memcpy(ptr, e.data.data(), e.size);
+    ptr += e.size;
+  }
+}
+
+bool rpc_server::graph_compute_and_get(const std::vector<uint8_t> &input,
+                                       std::vector<uint8_t> &push_response) {
+  if (!graph_compute(input)) {
+    return false;
+  }
+  // Find which device was used (first 4 bytes of input)
+  uint32_t device;
+  memcpy(&device, input.data(), sizeof(device));
+  if (device < stored_graphs.size() && stored_graphs[device].graph) {
+    serialize_graph_outputs(stored_graphs[device].graph, push_response);
+  }
+  return true;
+}
+
+bool rpc_server::graph_recompute_and_get(
+    const rpc_msg_graph_recompute_req &request,
+    std::vector<uint8_t> &push_response) {
+  if (!graph_recompute(request)) {
+    return false;
+  }
+  uint32_t device = request.device;
+  if (device < stored_graphs.size() && stored_graphs[device].graph) {
+    serialize_graph_outputs(stored_graphs[device].graph, push_response);
+  }
+  return true;
+}
+
 rpc_server::~rpc_server() {
   for (auto buffer : buffers) {
     ggml_backend_buffer_free(buffer);
@@ -2369,6 +2509,17 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> &backends,
       }
       break;
     }
+    case RPC_CMD_COPY_TENSOR_ASYNC: {
+      // Fire-and-forget copy: same as COPY_TENSOR but no response sent.
+      rpc_msg_copy_tensor_req request;
+      if (!recv_msg(sockfd, &request, sizeof(request))) {
+        return;
+      }
+      rpc_msg_copy_tensor_rsp response;
+      server.copy_tensor(request, response);
+      // No send_msg — client doesn't wait for ACK.
+      break;
+    }
     case RPC_CMD_GRAPH_COMPUTE: {
       std::vector<uint8_t> input;
       if (!recv_msg(sockfd, input)) {
@@ -2379,12 +2530,40 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> &backends,
       }
       break;
     }
+    case RPC_CMD_GRAPH_COMPUTE_AND_GET: {
+      std::vector<uint8_t> input;
+      if (!recv_msg(sockfd, input)) {
+        return;
+      }
+      std::vector<uint8_t> push_response;
+      if (!server.graph_compute_and_get(input, push_response)) {
+        return;
+      }
+      if (!send_msg(sockfd, push_response.data(), push_response.size())) {
+        return;
+      }
+      break;
+    }
     case RPC_CMD_GRAPH_RECOMPUTE: {
       rpc_msg_graph_recompute_req request;
       if (!recv_msg(sockfd, &request, sizeof(request))) {
         return;
       }
       if (!server.graph_recompute(request)) {
+        return;
+      }
+      break;
+    }
+    case RPC_CMD_GRAPH_RECOMPUTE_AND_GET: {
+      rpc_msg_graph_recompute_req request;
+      if (!recv_msg(sockfd, &request, sizeof(request))) {
+        return;
+      }
+      std::vector<uint8_t> push_response;
+      if (!server.graph_recompute_and_get(request, push_response)) {
+        return;
+      }
+      if (!send_msg(sockfd, push_response.data(), push_response.size())) {
         return;
       }
       break;
