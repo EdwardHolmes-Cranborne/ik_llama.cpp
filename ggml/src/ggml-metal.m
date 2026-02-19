@@ -2573,6 +2573,9 @@ static void ggml_metal_encode_node(struct ggml_backend_metal_context *ctx,
         // Source is on another backend (e.g. RPC) — skip it.
         // The scheduler will have already copied this source's data
         // to a Metal-accessible tensor if needed.
+        fprintf(stderr,
+                "[REDUCE] WARN: src[%d] '%s' buffer nil! data=%p buf=%p\n", j,
+                src_j->name, src_j->data, (void *)src_j->buffer);
         continue;
       }
 
