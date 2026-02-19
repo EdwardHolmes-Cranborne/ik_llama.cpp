@@ -2570,30 +2570,28 @@ static void ggml_metal_encode_node(struct ggml_backend_metal_context *ctx,
       id<MTLBuffer> id_src_j = ggml_metal_get_buffer(src_j, &offs_src_j);
 
       if (id_src_j == nil) {
-        // Source buffer not recognized by Metal — likely a scheduler
-        // copy-tensor in a non-Metal buffer. On Apple Silicon with unified
-        // memory, the data IS accessible — wrap it with a temporary MTLBuffer.
-        if (src_j->data != NULL) {
-          const size_t aligned_size =
-              (ggml_nbytes(src_j) + 4095) & ~(size_t)4095;
-          id<MTLBuffer> tmp_buf =
-              [ctx->device newBufferWithBytesNoCopy:src_j->data
-                                             length:aligned_size
-                                            options:MTLResourceStorageModeShared
-                                        deallocator:nil];
-          if (tmp_buf != nil) {
-            id_src_j = tmp_buf;
-            offs_src_j = 0;
-          } else {
-            fprintf(stderr,
-                    "[REDUCE] WARN: src[%d] '%s' failed to wrap unified memory "
-                    "data=%p size=%zu\n",
-                    j, src_j->name, src_j->data, aligned_size);
-            continue;
+        // Diagnostic: dump the buffer sub-ranges to find why lookup failed
+        ggml_backend_buffer_t sbuf =
+            src_j->view_src ? src_j->view_src->buffer : src_j->buffer;
+        if (sbuf) {
+          struct ggml_backend_metal_buffer_context *sbuf_ctx =
+              (struct ggml_backend_metal_buffer_context *)sbuf->context;
+          fprintf(stderr,
+                  "[REDUCE] src[%d] '%s' data=%p tsize=%lld buf=%p "
+                  "buft_name=%s n_sub=%d\n",
+                  j, src_j->name, src_j->data, (long long)ggml_nbytes(src_j),
+                  (void *)sbuf, sbuf->buft->iface.get_name(sbuf->buft),
+                  sbuf_ctx->n_buffers);
+          for (int di = 0; di < sbuf_ctx->n_buffers && di < 3; di++) {
+            fprintf(stderr, "  sub[%d]: data=%p size=%zu metal=%p\n", di,
+                    sbuf_ctx->buffers[di].data, sbuf_ctx->buffers[di].size,
+                    (__bridge void *)sbuf_ctx->buffers[di].metal);
           }
         } else {
-          continue;
+          fprintf(stderr, "[REDUCE] src[%d] '%s' data=%p NO BUFFER\n", j,
+                  src_j->name, src_j->data);
         }
+        continue;
       }
 
       if (nelem % 4 == 0) {
