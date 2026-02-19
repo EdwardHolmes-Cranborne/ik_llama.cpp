@@ -2062,8 +2062,15 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched,
           }
         }
 
-        if (src_backend_id != cur_backend_id &&
-            !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
+        // For REDUCE ops, computed tensors on RPC aren't directly accessible
+        // to Metal even though Metal_RPC_Split buffer type is "supported"
+        // (that compatibility is for weight loading, not computed tensor
+        // access). Force a copy so Metal can read the RPC partial result.
+        bool force_copy =
+            (node->op == GGML_OP_REDUCE && src_backend_id != cur_backend_id);
+        if (force_copy || (src_backend_id != cur_backend_id &&
+                           !ggml_backend_sched_buffer_supported(
+                               sched, src, cur_backend_id))) {
           // create a copy of the input in the split's backend
           if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
             if (node->op == GGML_OP_FAKE_CPY && src->op == GGML_OP_REDUCE) {
