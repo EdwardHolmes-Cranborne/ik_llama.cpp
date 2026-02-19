@@ -1300,6 +1300,10 @@ GGML_CALL static bool ggml_backend_rpc_supports_op(ggml_backend_t backend,
     // REDUCE is a cross-device accumulation op — runs locally on Metal, not on
     // RPC
     return false;
+  case GGML_OP_MOE_FUSED_UP_GATE:
+  case GGML_OP_FUSED_UP_GATE:
+    // Remote Metal may crash on these due to buffer copy/serialization issues
+    return false;
   default:
     return true;
   }
