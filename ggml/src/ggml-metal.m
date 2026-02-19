@@ -2570,13 +2570,30 @@ static void ggml_metal_encode_node(struct ggml_backend_metal_context *ctx,
       id<MTLBuffer> id_src_j = ggml_metal_get_buffer(src_j, &offs_src_j);
 
       if (id_src_j == nil) {
-        // Source is on another backend (e.g. RPC) — skip it.
-        // The scheduler will have already copied this source's data
-        // to a Metal-accessible tensor if needed.
-        fprintf(stderr,
-                "[REDUCE] WARN: src[%d] '%s' buffer nil! data=%p buf=%p\n", j,
-                src_j->name, src_j->data, (void *)src_j->buffer);
-        continue;
+        // Source buffer not recognized by Metal — likely a scheduler
+        // copy-tensor in a non-Metal buffer. On Apple Silicon with unified
+        // memory, the data IS accessible — wrap it with a temporary MTLBuffer.
+        if (src_j->data != NULL) {
+          const size_t aligned_size =
+              (ggml_nbytes(src_j) + 4095) & ~(size_t)4095;
+          id<MTLBuffer> tmp_buf =
+              [ctx->device newBufferWithBytesNoCopy:src_j->data
+                                             length:aligned_size
+                                            options:MTLResourceStorageModeShared
+                                        deallocator:nil];
+          if (tmp_buf != nil) {
+            id_src_j = tmp_buf;
+            offs_src_j = 0;
+          } else {
+            fprintf(stderr,
+                    "[REDUCE] WARN: src[%d] '%s' failed to wrap unified memory "
+                    "data=%p size=%zu\n",
+                    j, src_j->name, src_j->data, aligned_size);
+            continue;
+          }
+        } else {
+          continue;
+        }
       }
 
       if (nelem % 4 == 0) {
