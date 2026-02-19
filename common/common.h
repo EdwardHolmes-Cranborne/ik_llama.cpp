@@ -212,7 +212,8 @@ struct gpt_params {
   ggml_numa_strategy numa = GGML_NUMA_STRATEGY_DISABLED;
 
   enum llama_split_mode split_mode =
-      LLAMA_SPLIT_MODE_LAYER; // how to split the model across GPUs
+      LLAMA_SPLIT_MODE_LAYER;  // how to split the model across GPUs
+  int32_t n_split_layers = -1; // number of layers to graph-split (-1 = all)
   enum llama_rope_scaling_type rope_scaling_type =
       LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED;
   enum llama_pooling_type pooling_type =
@@ -471,10 +472,12 @@ struct gpt_params {
   int32_t prefill_buffers = 2;    // number of GPU rotation buffers
   int32_t prefill_prefetch = 1;   // layer lookahead distance
   size_t prefill_slab_bytes = 16 * 1024 * 1024; // upload chunk size
-  int32_t prefill_min_stream_batch_tokens = -1; // -1 keeps runtime crossover logic
+  int32_t prefill_min_stream_batch_tokens =
+      -1; // -1 keeps runtime crossover logic
 
   // Prefill->decode handoff planner/runtime controls
-  std::string prefill_decode_mode = "auto";      // auto|cpu_kv|gpu_kv|hybrid|split_thunderbolt
+  std::string prefill_decode_mode =
+      "auto"; // auto|cpu_kv|gpu_kv|hybrid|split_thunderbolt
   std::string prefill_transport_mode = "disabled"; // disabled|bulk|progressive
   std::string prefill_execution_mode = "coupled";  // coupled|decoupled
   int32_t decode_gpu_layers_hint = -1;             // -1 = auto

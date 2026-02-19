@@ -2036,8 +2036,9 @@ static bool is_model_split_supported(const llama_model &model) {
 static bool llm_load_tensors(llama_model_loader &ml, llama_model &model,
                              int n_gpu_layers, int mla_attn,
                              enum llama_split_mode split_mode, int main_gpu,
-                             int max_gpu, const float *tensor_split,
-                             bool use_mlock, bool validate_quants,
+                             int max_gpu, int n_split_layers,
+                             const float *tensor_split, bool use_mlock,
+                             bool validate_quants,
                              llama_progress_callback progress_callback,
                              void *progress_callback_user_data) {
   model.t_start_us = ggml_time_us();
@@ -2076,6 +2077,18 @@ static bool llm_load_tensors(llama_model_loader &ml, llama_model &model,
 
   const int n_layer = hparams.n_layer;
   const int i_gpu_start = std::max((int)hparams.n_layer - n_gpu_layers, (int)0);
+
+  // resolve n_split_layers: -1 means all layers, otherwise clamp
+  if (n_split_layers < 0 || n_split_layers > n_layer) {
+    n_split_layers = n_layer;
+  }
+  model.n_split_layers = n_split_layers;
+  if (n_split_layers < n_layer && (split_mode == LLAMA_SPLIT_MODE_GRAPH ||
+                                   split_mode == LLAMA_SPLIT_MODE_ATTN)) {
+    LLAMA_LOG_INFO("%s: hybrid split: first %d layers tensor-parallel, "
+                   "remaining %d layers on main GPU\n",
+                   __func__, n_split_layers, n_layer - n_split_layers);
+  }
   bool use_mmap_buffer = true;
 
   // there is very little benefit to offloading the input layer, so always keep
@@ -2161,7 +2174,10 @@ static bool llm_load_tensors(llama_model_loader &ml, llama_model &model,
         llama_default_buffer_type_offload(model, model.devices[main_gpu]);
     // assign the repeating layers
     for (int i = i_gpu_start; i < n_layer; ++i) {
-      if (split_mode == LLAMA_SPLIT_MODE_ATTN) {
+      // hybrid split: layers beyond n_split_layers get main GPU only
+      if (i >= n_split_layers) {
+        model.buft_layer[i] = buft_layer;
+      } else if (split_mode == LLAMA_SPLIT_MODE_ATTN) {
         int layer_gpu =
             std::upper_bound(model.splits.begin(),
                              model.splits.begin() + device_count,
@@ -2508,11 +2524,11 @@ static int llama_model_load(const std::string &fname, llama_model &model,
     }
 #endif
 
-    if (!llm_load_tensors(ml, model, params.n_gpu_layers, params.mla,
-                          params.split_mode, params.main_gpu, params.max_gpu,
-                          params.tensor_split, params.use_mlock,
-                          params.validate_quants, params.progress_callback,
-                          params.progress_callback_user_data)) {
+    if (!llm_load_tensors(
+            ml, model, params.n_gpu_layers, params.mla, params.split_mode,
+            params.main_gpu, params.max_gpu, params.n_split_layers,
+            params.tensor_split, params.use_mlock, params.validate_quants,
+            params.progress_callback, params.progress_callback_user_data)) {
       return -2;
     }
   } catch (const std::exception &err) {
@@ -4900,6 +4916,7 @@ struct llama_model_params llama_model_default_params() {
       /*.split_mode                  =*/LLAMA_SPLIT_MODE_LAYER,
       /*.main_gpu                    =*/0,
       /*.max_gpu                     =*/0,
+      /*.n_split_layers              =*/-1,
       /*.tensor_split                =*/nullptr,
       /*.rpc_servers                 =*/nullptr,
       /*.progress_callback           =*/nullptr,

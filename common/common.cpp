@@ -1564,6 +1564,11 @@ bool gpt_params_find_arg(int argc, char **argv, const std::string &arg,
 #endif // GGML_USE_CUDA_SYCL_VULKAN
     return true;
   }
+  if (arg == "--split-layers" || arg == "-sl") {
+    CHECK_ARG
+    params.n_split_layers = std::stoi(argv[i]);
+    return true;
+  }
   if (arg == "--rpc") {
     CHECK_ARG
 #ifdef GGML_USE_RPC
@@ -4363,6 +4368,7 @@ llama_model_params_from_gpt_params(const gpt_params &params) {
   mparams.main_gpu = params.main_gpu;
   mparams.max_gpu = params.max_gpu;
   mparams.split_mode = params.split_mode;
+  mparams.n_split_layers = params.n_split_layers;
   mparams.tensor_split = params.tensor_split;
   mparams.use_mmap = params.use_mmap;
   mparams.use_mlock = params.use_mlock;

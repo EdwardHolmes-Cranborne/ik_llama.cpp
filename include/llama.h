@@ -396,6 +396,11 @@ struct llama_model_params {
   int32_t main_gpu;
   int32_t max_gpu;
 
+  // number of layers to tensor-parallel (graph split) across devices.
+  // -1 = all layers (default). Only used with split_mode graph.
+  // Layers beyond this count run on main_gpu only.
+  int32_t n_split_layers;
+
   // proportion of the model (layers or rows) to offload to each GPU, size:
   // llama_max_devices()
   const float *tensor_split;
@@ -518,31 +523,31 @@ struct llama_context_params {
   int32_t prefill_min_stream_batch_tokens; // -1 keeps runtime crossover logic
 
   // RTX prefill->decode handoff controls
-  int32_t prefill_decode_mode;          // enum llama_prefill_decode_mode
-  int32_t prefill_transport_mode;       // enum llama_prefill_transport_mode
-  int32_t prefill_execution_mode;       // enum llama_prefill_execution_mode
-  int32_t decode_gpu_layers_hint;       // -1 = auto
-  int32_t decode_remote_layers_hint;    // 0 = none
-  int32_t decode_remote_nodes_hint;     // default: 1
+  int32_t prefill_decode_mode;           // enum llama_prefill_decode_mode
+  int32_t prefill_transport_mode;        // enum llama_prefill_transport_mode
+  int32_t prefill_execution_mode;        // enum llama_prefill_execution_mode
+  int32_t decode_gpu_layers_hint;        // -1 = auto
+  int32_t decode_remote_layers_hint;     // 0 = none
+  int32_t decode_remote_nodes_hint;      // default: 1
   int32_t prefill_transport_chunk_bytes; // default: 4 MiB
   bool prefill_decode_transport_required;
 
-  const char * decode_remote_ranges;          // node:start-end,node:start-end
-  const char * decode_remote_failover_policy; // reroute|local|fail
-  const char * prefill_transport_session_dir; // optional transport session dir
-  const char * kv_transport;                  // auto|rdma|tcp|mixed|disabled
-  const char * tb_direct_endpoint;            // optional explicit endpoint
-  const char * kv_host;                       // optional sender host override
-  int32_t kv_port;                            // optional sender port override
-  int32_t kv_streams;                         // sender stream count
-  int32_t kv_stream_chunk_bytes;              // sender stream chunk bytes
-  int32_t kv_max_inflight_bytes;              // sender in-flight window
-  int32_t kv_socket_send_buf;                 // sender SO_SNDBUF
-  int32_t kv_socket_recv_buf;                 // sender SO_RCVBUF
-  const char * kv_bind_addrs;                 // sender bind interface list
-  const char * kv_peer_addrs;                 // sender peer list
-  const char * kv_balance;                    // sender balancing policy
-  bool kv_transport_fallback;                 // allow transport fallback mode
+  const char *decode_remote_ranges;          // node:start-end,node:start-end
+  const char *decode_remote_failover_policy; // reroute|local|fail
+  const char *prefill_transport_session_dir; // optional transport session dir
+  const char *kv_transport;                  // auto|rdma|tcp|mixed|disabled
+  const char *tb_direct_endpoint;            // optional explicit endpoint
+  const char *kv_host;                       // optional sender host override
+  int32_t kv_port;                           // optional sender port override
+  int32_t kv_streams;                        // sender stream count
+  int32_t kv_stream_chunk_bytes;             // sender stream chunk bytes
+  int32_t kv_max_inflight_bytes;             // sender in-flight window
+  int32_t kv_socket_send_buf;                // sender SO_SNDBUF
+  int32_t kv_socket_recv_buf;                // sender SO_RCVBUF
+  const char *kv_bind_addrs;                 // sender bind interface list
+  const char *kv_peer_addrs;                 // sender peer list
+  const char *kv_balance;                    // sender balancing policy
+  bool kv_transport_fallback;                // allow transport fallback mode
 };
 
 // model quantization parameters
