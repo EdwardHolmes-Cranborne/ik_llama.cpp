@@ -2318,7 +2318,13 @@ static void ggml_backend_sched_copy_inputs(
 
     auto copy_input_to_split = [&](bool allow_async_host_set) {
       if (input->buffer && input_cpy->buffer) {
+        void *before = input_cpy->data;
         ggml_backend_tensor_copy(input, input_cpy);
+        if (input_cpy->data != before) {
+          fprintf(stderr,
+                  "DIAG copy_inputs: data ptr CHANGED for '%s': %p -> %p\n",
+                  input_cpy->name, before, input_cpy->data);
+        }
         return true;
       }
       if (input->data && input_cpy->buffer) {
