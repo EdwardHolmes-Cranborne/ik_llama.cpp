@@ -1551,8 +1551,26 @@ static id<MTLBuffer> ggml_metal_get_buffer(struct ggml_tensor *t,
     }
   }
 
-  GGML_METAL_LOG_ERROR("%s: error: tensor '%s' buffer is nil\n", __func__,
-                       t->name);
+  // detailed diagnostic when buffer lookup fails
+  {
+    static int diag_count = 0;
+    if (diag_count < 3) {
+      diag_count++;
+      GGML_METAL_LOG_ERROR("%s: error: tensor '%s' buffer is nil "
+                           "(buffer=%p view_src=%p data=%p tsize=%lld)\n",
+                           __func__, t->name, (void *)buffer,
+                           (void *)t->view_src, t->data, (long long)tsize);
+      if (buf_ctx) {
+        GGML_METAL_LOG_ERROR("  buf_ctx->n_buffers=%d\n", buf_ctx->n_buffers);
+        for (int dbg_i = 0; dbg_i < buf_ctx->n_buffers; dbg_i++) {
+          GGML_METAL_LOG_ERROR("  sub[%d]: data=%p size=%zu metal=%p\n", dbg_i,
+                               buf_ctx->buffers[dbg_i].data,
+                               buf_ctx->buffers[dbg_i].size,
+                               buf_ctx->buffers[dbg_i].metal);
+        }
+      }
+    }
+  }
 
   return nil;
 }
@@ -2537,6 +2555,9 @@ static void ggml_metal_encode_node(struct ggml_backend_metal_context *ctx,
     // Phase 1: Accumulate all other sources into dst using ADD_4 or ADD
     // kernels. dst->data already points to one of the source buffers (the last
     // active one).
+    // In graph split mode, some sources may be on other backends (e.g. RPC).
+    // The scheduler handles cross-backend transfers via copy tensors, so we
+    // only accumulate sources that are accessible in Metal memory.
     for (int j = 0; j < n_src; ++j) {
       struct ggml_tensor *src_j = dst->src[j];
       if (src_j == NULL || src_j->data == dst->data) {
@@ -2547,6 +2568,13 @@ static void ggml_metal_encode_node(struct ggml_backend_metal_context *ctx,
 
       size_t offs_src_j = 0;
       id<MTLBuffer> id_src_j = ggml_metal_get_buffer(src_j, &offs_src_j);
+
+      if (id_src_j == nil) {
+        // Source is on another backend (e.g. RPC) — skip it.
+        // The scheduler will have already copied this source's data
+        // to a Metal-accessible tensor if needed.
+        continue;
+      }
 
       if (nelem % 4 == 0) {
         id<MTLComputePipelineState> pipeline =
@@ -2608,6 +2636,8 @@ static void ggml_metal_encode_node(struct ggml_backend_metal_context *ctx,
     // Phase 2: Copy the reduced result back to all other sources.
     // In unified memory (macOS Metal), this is a simple memcpy-style copy via
     // the cpy_f32_f32 kernel.
+    // Skip sources on other backends — the scheduler handles cross-backend
+    // data distribution.
     for (int j = 0; j < n_src; ++j) {
       struct ggml_tensor *src_j = dst->src[j];
       if (src_j == NULL || src_j->data == dst->data) {
@@ -2616,6 +2646,11 @@ static void ggml_metal_encode_node(struct ggml_backend_metal_context *ctx,
 
       size_t offs_src_j = 0;
       id<MTLBuffer> id_src_j = ggml_metal_get_buffer(src_j, &offs_src_j);
+
+      if (id_src_j == nil) {
+        // Source is on another backend — skip copy-back.
+        continue;
+      }
 
       id<MTLComputePipelineState> pipeline =
           ctx->kernels[GGML_METAL_KERNEL_TYPE_CPY_F32_F32].pipeline;
