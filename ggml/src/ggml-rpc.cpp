@@ -1297,8 +1297,8 @@ GGML_CALL static bool ggml_backend_rpc_supports_op(ggml_backend_t backend,
   // remote Metal backends on fused up/gate expert ops they do not implement.
   switch (op->op) {
   case GGML_OP_REDUCE:
-  case GGML_OP_MOE_FUSED_UP_GATE:
-  case GGML_OP_FUSED_UP_GATE:
+    // REDUCE is a cross-device accumulation op — runs locally on Metal, not on
+    // RPC
     return false;
   default:
     return true;
