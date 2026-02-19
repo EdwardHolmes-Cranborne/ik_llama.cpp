@@ -1415,14 +1415,27 @@ ggml_backend_sched_backend_from_buffer(ggml_backend_sched_t sched,
     return -1;
   }
 
-  // printf("%s: have %d backends, buffer is %s\n", __func__, sched->n_backends,
-  // ggml_backend_buffer_name(buffer));
-  //  find highest prio backend that supports the buffer type and the op
+  bool trace = tensor->name && strstr(tensor->name, ".1") != NULL &&
+               strstr(tensor->name, "weight") != NULL;
+  if (trace) {
+    fprintf(stderr,
+            "DIAG backend_from_buffer: tensor=%s buffer_name=%s buft_name=%s\n",
+            tensor->name, ggml_backend_buffer_name(buffer),
+            buffer->buft->iface.get_name(buffer->buft));
+  }
+
+  // find highest prio backend that supports the buffer type and the op
   for (int i = 0; i < sched->n_backends; i++) {
-    // printf("  Checking bacckend %d (%s)\n", i,
-    // ggml_backend_name(sched->backends[i]));
-    if (ggml_backend_supports_buft(sched->backends[i], buffer->buft) &&
-        ggml_backend_supports_op(sched->backends[i], op)) {
+    bool buft_ok = ggml_backend_supports_buft(sched->backends[i], buffer->buft);
+    bool op_ok = ggml_backend_supports_op(sched->backends[i], op);
+    if (trace) {
+      fprintf(stderr, "  backend %d (%s): supports_buft=%d supports_op=%d\n", i,
+              ggml_backend_name(sched->backends[i]), buft_ok, op_ok);
+    }
+    if (buft_ok && op_ok) {
+      if (trace) {
+        fprintf(stderr, "  -> selected backend %d\n", i);
+      }
       return i;
     }
   }
@@ -1638,10 +1651,12 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched,
       for (int j = 0; j < node->op_params[1]; ++j) {
         if (node->src[j]) {
           int *this_node_backend_id = &tensor_backend_id(node->src[j]);
-          if (*this_node_backend_id == -1) {
+          if (*this_node_backend_id == -1 || *this_node_backend_id != j) {
+            // REDUCE requires src[j] on backend j (device index).
+            // With heterogeneous backends (e.g. Metal+RPC split),
+            // the leaf pass may pre-assign all split-buffer tensors
+            // to the first matching backend. Override to correct device.
             *this_node_backend_id = j;
-          } else {
-            GGML_ASSERT(*this_node_backend_id == j);
           }
           if (view_src == node->src[j]) {
             src_id = j;
@@ -2245,6 +2260,21 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     if (!ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
       fprintf(stderr, "%s: failed to allocate graph\n", __func__);
       return false;
+    }
+  }
+
+  // DIAG: check copy tensor allocation status
+  {
+    int diag_count = 0;
+    for (int i = 0; i < sched->graph.n_nodes && diag_count < 5; i++) {
+      struct ggml_tensor *node = sched->graph.nodes[i];
+      if (node->name && strstr(node->name, "Metal#") &&
+          strstr(node->name, "#0")) {
+        fprintf(stderr, "DIAG alloc: tensor=%s buffer=%p view_src=%p data=%p\n",
+                node->name, (void *)node->buffer, (void *)node->view_src,
+                node->data);
+        diag_count++;
+      }
     }
   }
 

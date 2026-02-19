@@ -5164,14 +5164,26 @@ llama_load_model_from_file(const char *path_model,
   if (params_devices.size()) {
     device_names = params_devices;
   } else {
-    // add RPC servers at the front of the list to minimize the network
-    // transfers
-    if (has_rpc) {
+    if (has_rpc && params.split_mode == LLAMA_SPLIT_MODE_GRAPH) {
+      // graph split: GPU devices must come first so that device_index ==
+      // backend_index (the REDUCE handler and graph scheduling assume this
+      // invariant)
+      device_names.insert(device_names.end(), gpu_names.begin(),
+                          gpu_names.end());
       for (auto &it : model->rpc_servers) {
         device_names.push_back(create_rpc_name(it.endpoint, it.device));
       }
+    } else if (has_rpc) {
+      // layer split: add RPC servers at the front to minimize network transfers
+      for (auto &it : model->rpc_servers) {
+        device_names.push_back(create_rpc_name(it.endpoint, it.device));
+      }
+      device_names.insert(device_names.end(), gpu_names.begin(),
+                          gpu_names.end());
+    } else {
+      device_names.insert(device_names.end(), gpu_names.begin(),
+                          gpu_names.end());
     }
-    device_names.insert(device_names.end(), gpu_names.begin(), gpu_names.end());
   }
 
   for (auto &device : device_names) {
@@ -5904,6 +5916,10 @@ llama_new_context_with_model(struct llama_model *model,
       // currently this is only implemented in the CUDA backend
       pipeline_parallel = false;
 #endif
+      for (size_t bi = 0; bi < ctx->backends.size(); bi++) {
+        LLAMA_LOG_INFO("%s: backend[%zu] = %s\n", __func__, bi,
+                       ggml_backend_name(ctx->backends[bi]));
+      }
       ctx->sched = ggml_backend_sched_new(
           ctx->backends.data(), backend_buft.data(), ctx->backends.size(),
           max_nodes, pipeline_parallel);
