@@ -1736,8 +1736,10 @@ static bool ggml_metal_supports_op(const struct ggml_backend_metal_context *ctx,
 }
 
 static void ggml_metal_encode_node(struct ggml_backend_metal_context *ctx,
-                                   struct ggml_tensor *node,
-                                   id<MTLComputeCommandEncoder> encoder) {
+                                   int cb_idx, id<MTLCommandBuffer> *cb_ptr,
+                                   id<MTLComputeCommandEncoder> *enc_ptr,
+                                   struct ggml_tensor *node) {
+  id<MTLComputeCommandEncoder> encoder = *enc_ptr;
 
   struct ggml_tensor *src0 = node->src[0];
   struct ggml_tensor *src1 = node->src[1];
@@ -2565,32 +2567,33 @@ static void ggml_metal_encode_node(struct ggml_backend_metal_context *ctx,
       }
       GGML_ASSERT(src_j->type == GGML_TYPE_F32);
       GGML_ASSERT(ggml_are_same_shape(src_j, dst));
-
       size_t offs_src_j = 0;
       id<MTLBuffer> id_src_j = ggml_metal_get_buffer(src_j, &offs_src_j);
 
       if (id_src_j == nil) {
-        // Diagnostic: dump the buffer sub-ranges to find why lookup failed
-        ggml_backend_buffer_t sbuf =
-            src_j->view_src ? src_j->view_src->buffer : src_j->buffer;
-        if (sbuf) {
-          struct ggml_backend_metal_buffer_context *sbuf_ctx =
-              (struct ggml_backend_metal_buffer_context *)sbuf->context;
-          fprintf(stderr,
-                  "[REDUCE] src[%d] '%s' data=%p tsize=%lld buf=%p "
-                  "buft_name=%s n_sub=%d\n",
-                  j, src_j->name, src_j->data, (long long)ggml_nbytes(src_j),
-                  (void *)sbuf, sbuf->buft->iface.get_name(sbuf->buft),
-                  sbuf_ctx->n_buffers);
-          for (int di = 0; di < sbuf_ctx->n_buffers && di < 3; di++) {
-            fprintf(stderr, "  sub[%d]: data=%p size=%zu metal=%p\n", di,
-                    sbuf_ctx->buffers[di].data, sbuf_ctx->buffers[di].size,
-                    (__bridge void *)sbuf_ctx->buffers[di].metal);
-          }
-        } else {
-          fprintf(stderr, "[REDUCE] src[%d] '%s' data=%p NO BUFFER\n", j,
-                  src_j->name, src_j->data);
+        // Source buffer not in Metal's registered buffers.
+        // On Apple Silicon unified memory, both src and dst data pointers
+        // are CPU-accessible, so do the vector-add on CPU instead of crashing.
+
+        // 1. Commit pending Metal work so dst has up-to-date values
+        [encoder endEncoding];
+
+        id<MTLCommandBuffer> current_cb = *cb_ptr;
+        [current_cb commit];
+        [current_cb waitUntilCompleted];
+
+        // 2. CPU-side float accumulation
+        float *dst_f = (float *)dst->data;
+        const float *src_f = (const float *)src_j->data;
+        for (int64_t k = 0; k < nelem; ++k) {
+          dst_f[k] += src_f[k];
         }
+
+        // 3. Start a fresh command buffer + encoder for remaining ops
+        *cb_ptr = [ctx->queue commandBuffer];
+        *enc_ptr = [*cb_ptr computeCommandEncoder];
+        ctx->command_buffers[cb_idx] = *cb_ptr;
+        encoder = *enc_ptr;
         continue;
       }
 
@@ -6070,7 +6073,7 @@ void ggml_backend_metal_set_n_cb(ggml_backend_t backend, int n_cb) {
                                               encoding:NSUTF8StringEncoding]];
       }
 
-      ggml_metal_encode_node(ctx, node, encoder);
+      ggml_metal_encode_node(ctx, cb_idx, &command_buffer, &encoder, node);
 
       if (should_capture) {
         [encoder popDebugGroup];
