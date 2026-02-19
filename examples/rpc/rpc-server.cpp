@@ -385,6 +385,134 @@ static std::vector<iface_ip> collect_all_ipv4_interfaces() {
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// Automatic Thunderbolt route & ARP fixup
+//
+// macOS often has multiple interfaces on 169.254.0.0/16 (en1, en2, en3,
+// bridge0).  The kernel may pick the wrong interface for link-local traffic,
+// causing TCP connections to hang even though ICMP ping works.  This helper
+// ensures the entire 169.254.0.0/16 subnet is routed through bridge0, and
+// flushes stale ARP entries for any discovered peers so macOS re-resolves
+// MAC addresses via the correct interface.
+// ---------------------------------------------------------------------------
+static void ensure_thunderbolt_routes(const std::string &tb_iface,
+                                      const std::string &local_ip) {
+  // 1. Check if 169.254.0.0/16 is already routed via our TB interface.
+  bool subnet_route_ok = false;
+  bool subnet_route_wrong = false;
+  std::string wrong_iface;
+  {
+    std::string out;
+    if (run_command_capture("netstat -rn", out)) {
+      std::istringstream ss(out);
+      std::string line;
+      while (std::getline(ss, line)) {
+        // Look for the link-local subnet route: "169.254" at start of line
+        if (line.rfind("169.254", 0) != 0)
+          continue;
+        std::istringstream ls(line);
+        std::string dest, gw, flags;
+        ls >> dest >> gw >> flags;
+        // Skip host routes (no /mask or /32 suffix)
+        if (dest == "169.254" || dest == "169.254.0.0/16" ||
+            dest.find("/16") != std::string::npos) {
+          if (line.find(tb_iface) != std::string::npos) {
+            subnet_route_ok = true;
+          } else {
+            // Route exists but via wrong interface — need to fix.
+            subnet_route_wrong = true;
+            // Extract interface name (last field on the line).
+            std::string token;
+            while (ls >> token) {
+            }
+            // 'token' is now the last word (could be the iface or something
+            // else) Re-parse: split line by whitespace, take last token.
+            std::istringstream ls2(line);
+            while (ls2 >> token) {
+            }
+            wrong_iface = token;
+          }
+        }
+      }
+    }
+  }
+
+  if (subnet_route_ok) {
+    fprintf(stderr, "[rdma] route: 169.254.0.0/16 already routed via %s ✓\n",
+            tb_iface.c_str());
+  } else {
+    // Delete any conflicting route first.
+    if (subnet_route_wrong) {
+      fprintf(
+          stderr,
+          "[rdma] route: 169.254.0.0/16 is routed via %s (wrong), fixing...\n",
+          wrong_iface.c_str());
+      std::string cmd = "route -n delete -net 169.254.0.0/16 2>&1";
+      std::string out;
+      run_command_capture(cmd.c_str(), out);
+    }
+
+    // Add subnet route via our TB interface.
+    std::string cmd =
+        "route -n add -net 169.254.0.0/16 -interface " + tb_iface + " 2>&1";
+    std::string out;
+    if (run_command_capture(cmd.c_str(), out)) {
+      fprintf(stderr, "[rdma] route: added 169.254.0.0/16 via %s ✓\n",
+              tb_iface.c_str());
+    } else {
+      out = trim_copy(out);
+      if (out.find("exists") != std::string::npos) {
+        fprintf(stderr,
+                "[rdma] route: 169.254.0.0/16 via %s already exists (kernel)\n",
+                tb_iface.c_str());
+      } else if (out.find("ermission") != std::string::npos ||
+                 out.find("EPERM") != std::string::npos) {
+        fprintf(stderr,
+                "[rdma] route: permission denied. Run with sudo for "
+                "auto-route, or manually:\n"
+                "[rdma]   sudo route delete -net 169.254.0.0/16 2>/dev/null\n"
+                "[rdma]   sudo route add -net 169.254.0.0/16 -interface %s\n",
+                tb_iface.c_str());
+      } else {
+        fprintf(stderr, "[rdma] route: failed to add subnet route: %s\n",
+                out.c_str());
+      }
+    }
+  }
+
+  // 2. Flush ARP for any discovered peers on the TB interface so macOS
+  //    re-resolves MAC addresses via bridge0 instead of en1.
+  {
+    std::string out;
+    if (run_command_capture("arp -a", out)) {
+      std::istringstream ss(out);
+      std::string line;
+      while (std::getline(ss, line)) {
+        if (line.find(tb_iface) == std::string::npos)
+          continue;
+        auto paren_open = line.find('(');
+        auto paren_close = line.find(')');
+        if (paren_open == std::string::npos || paren_close == std::string::npos)
+          continue;
+        std::string ip =
+            line.substr(paren_open + 1, paren_close - paren_open - 1);
+        if (ip == local_ip)
+          continue;
+        if (ip.rfind("169.254.", 0) != 0)
+          continue;
+
+        fprintf(stderr, "[rdma] route: peer %s on %s\n", ip.c_str(),
+                tb_iface.c_str());
+
+        // Flush so ARP re-resolves via bridge0.
+        std::string arp_cmd = "arp -d " + ip + " 2>/dev/null";
+        std::string discard;
+        run_command_capture(arp_cmd.c_str(), discard);
+      }
+    }
+  }
+}
+
 } // namespace rdma_detect
 #endif // __APPLE__
 
@@ -730,6 +858,11 @@ int main(int argc, char *argv[]) {
       fprintf(
           stderr,
           "[rdma]   falling back to 0.0.0.0 (plain TCP on all interfaces)\n");
+    }
+
+    // Ensure host routes and ARP entries are correct for Thunderbolt peers.
+    if (!rdma_ip.empty()) {
+      rdma_detect::ensure_thunderbolt_routes(rdma_iface, rdma_ip);
     }
 #else
     fprintf(stderr,
