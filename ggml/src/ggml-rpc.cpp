@@ -2217,10 +2217,9 @@ static void serialize_graph_outputs(ggml_cgraph *graph,
   for (int i = 0; i < graph->n_nodes; i++) {
     ggml_tensor *node = graph->nodes[i];
     if (node == nullptr || node->buffer == nullptr)
-      continue;
-    // Only push non-weight tensors (intermediate results)
-    if (node->flags & GGML_TENSOR_FLAG_INPUT)
-      continue;
+      // Only push output tensors
+      if (!(node->flags & GGML_TENSOR_FLAG_OUTPUT))
+        continue;
     size_t nbytes = ggml_nbytes(node);
     if (nbytes == 0)
       continue;
