@@ -2216,10 +2216,15 @@ static void serialize_graph_outputs(ggml_cgraph *graph,
 
   for (int i = 0; i < graph->n_nodes; i++) {
     ggml_tensor *node = graph->nodes[i];
-    if (node == nullptr || node->buffer == nullptr)
-      // Only push output tensors
-      if (!(node->flags & GGML_TENSOR_FLAG_OUTPUT))
-        continue;
+    if (node == nullptr || node->buffer == nullptr) {
+      continue;
+    }
+    // Only push output-flagged tensors to avoid serializing all
+    // intermediates (KV cache, attention, etc.) which the client
+    // doesn't need and which cause massive RPC overhead.
+    if (!(node->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+      continue;
+    }
     size_t nbytes = ggml_nbytes(node);
     if (nbytes == 0)
       continue;

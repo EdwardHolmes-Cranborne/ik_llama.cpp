@@ -1551,26 +1551,41 @@ static id<MTLBuffer> ggml_metal_get_buffer(struct ggml_tensor *t,
     }
   }
 
-  // detailed diagnostic when buffer lookup fails
-  {
-    static int diag_count = 0;
-    if (diag_count < 3) {
-      diag_count++;
-      GGML_METAL_LOG_ERROR("%s: error: tensor '%s' buffer is nil "
-                           "(buffer=%p view_src=%p data=%p tsize=%lld)\n",
-                           __func__, t->name, (void *)buffer,
-                           (void *)t->view_src, t->data, (long long)tsize);
-      if (buf_ctx) {
-        GGML_METAL_LOG_ERROR("  buf_ctx->n_buffers=%d\n", buf_ctx->n_buffers);
-        for (int dbg_i = 0; dbg_i < buf_ctx->n_buffers; dbg_i++) {
-          GGML_METAL_LOG_ERROR("  sub[%d]: data=%p size=%zu metal=%p\n", dbg_i,
-                               buf_ctx->buffers[dbg_i].data,
-                               buf_ctx->buffers[dbg_i].size,
-                               (void *)buf_ctx->buffers[dbg_i].metal);
-        }
-      }
+  // Tensor data not in any registered Metal sub-buffer (e.g. cross-backend
+  // copy from RPC/CPU scheduler). On Apple UMA, wrap the existing memory
+  // directly so the GPU can access it without copying.
+  if (t->data && buf_ctx->n_buffers > 0) {
+    id<MTLDevice> device = buf_ctx->buffers[0].metal.device;
+    const size_t len = (size_t)tsize;
+    const uintptr_t addr = (uintptr_t)t->data;
+    const uintptr_t page = (uintptr_t)vm_page_size;
+    const uintptr_t aligned = addr & ~(page - 1);
+    const size_t aligned_len =
+        ((len + (addr - aligned)) + page - 1) & ~(page - 1);
+
+    id<MTLBuffer> wrapped =
+        [device newBufferWithBytesNoCopy:(void *)aligned
+                                  length:aligned_len
+                                 options:MTLResourceStorageModeShared
+                             deallocator:nil];
+    if (wrapped) {
+      *offs = addr - aligned;
+      return wrapped;
+    }
+    // NoCopy failed (non-page-aligned), fall back to data copy
+    wrapped = [device newBufferWithBytes:t->data
+                                  length:len
+                                 options:MTLResourceStorageModeShared];
+    if (wrapped) {
+      *offs = 0;
+      return wrapped;
     }
   }
+
+  GGML_METAL_LOG_ERROR("%s: error: tensor '%s' buffer is nil "
+                       "(buffer=%p view_src=%p data=%p tsize=%lld)\n",
+                       __func__, t->name, (void *)buffer, (void *)t->view_src,
+                       t->data, (long long)tsize);
 
   return nil;
 }
@@ -2552,96 +2567,122 @@ static void ggml_metal_encode_node(struct ggml_backend_metal_context *ctx,
 
     const int64_t nelem = ggml_nelements(dst);
 
-    // Phase 1: Accumulate all other sources into dst using ADD_4 or ADD
-    // kernels. dst->data already points to one of the source buffers (the last
-    // active one).
-    // In graph split mode, some sources may be on other backends (e.g. RPC).
-    // The scheduler handles cross-backend transfers via copy tensors, so we
-    // only accumulate sources that are accessible in Metal memory.
+    // Phase 1: Accumulate all sources into dst.
+    // First, COPY one source to initialize dst (in case dst does not alias
+    // any source, e.g. when the copy-tensor has a separate allocation in
+    // graph-split mode). Then ADD remaining sources.
+    bool dst_initialized = false;
     for (int j = 0; j < n_src; ++j) {
       struct ggml_tensor *src_j = dst->src[j];
-      if (src_j == NULL || src_j->data == dst->data) {
-        continue; // skip null sources and the self-alias
+      if (src_j == NULL) {
+        continue;
+      }
+
+      // If this source aliases dst, dst is already initialized with its
+      // data.
+      if (src_j->data == dst->data) {
+        dst_initialized = true;
+        continue;
       }
       GGML_ASSERT(src_j->type == GGML_TYPE_F32);
       GGML_ASSERT(ggml_are_same_shape(src_j, dst));
       size_t offs_src_j = 0;
       id<MTLBuffer> id_src_j = ggml_metal_get_buffer(src_j, &offs_src_j);
 
-      if (id_src_j == nil) {
-        // Source buffer not in Metal's registered buffers (e.g. copied from
-        // RPC). Since the CPU has already retrieved the data via copy_inputs,
-        // we can just wrap it in a temporary MTLBuffer and let the GPU sequence
-        // it correctly.
-        id_src_j =
-            [ctx->device newBufferWithBytes:src_j->data
-                                     length:ggml_nbytes(src_j)
-                                    options:MTLResourceStorageModeShared];
-        offs_src_j = 0;
-      }
-
-      if (nelem % 4 == 0) {
+      if (!dst_initialized) {
+        // First non-aliased, non-null source: GPU-copy to dst to initialize.
         id<MTLComputePipelineState> pipeline =
-            ctx->kernels[GGML_METAL_KERNEL_TYPE_ADD_4].pipeline;
+            ctx->kernels[GGML_METAL_KERNEL_TYPE_CPY_F32_F32].pipeline;
         [encoder setComputePipelineState:pipeline];
-        [encoder setBuffer:id_dst
-                    offset:offs_dst
-                   atIndex:0]; // src0 = dst (accumulator)
         [encoder setBuffer:id_src_j
                     offset:offs_src_j
-                   atIndex:1];                                // src1 = source j
-        [encoder setBuffer:id_dst offset:offs_dst atIndex:2]; // dst  = dst
-        [encoder dispatchThreadgroups:MTLSizeMake(nelem / 4, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
-      } else {
-        id<MTLComputePipelineState> pipeline =
-            ctx->kernels[GGML_METAL_KERNEL_TYPE_ADD].pipeline;
-        [encoder setComputePipelineState:pipeline];
-        [encoder setBuffer:id_dst offset:offs_dst atIndex:0];
-        [encoder setBuffer:id_src_j offset:offs_src_j atIndex:1];
-        [encoder setBuffer:id_dst offset:offs_dst atIndex:2];
-        [encoder setBytes:&ne0 length:sizeof(ne0) atIndex:3];
-        [encoder setBytes:&ne1 length:sizeof(ne1) atIndex:4];
-        [encoder setBytes:&ne2 length:sizeof(ne2) atIndex:5];
-        [encoder setBytes:&ne3 length:sizeof(ne3) atIndex:6];
-        [encoder setBytes:&nb0 length:sizeof(nb0) atIndex:7];
-        [encoder setBytes:&nb1 length:sizeof(nb1) atIndex:8];
-        [encoder setBytes:&nb2 length:sizeof(nb2) atIndex:9];
-        [encoder setBytes:&nb3 length:sizeof(nb3) atIndex:10];
-        [encoder setBytes:&ne0
-                   length:sizeof(ne0)
-                  atIndex:11]; // src1 ne/nb = same as dst
-        [encoder setBytes:&ne1 length:sizeof(ne1) atIndex:12];
-        [encoder setBytes:&ne2 length:sizeof(ne2) atIndex:13];
-        [encoder setBytes:&ne3 length:sizeof(ne3) atIndex:14];
-        [encoder setBytes:&nb0 length:sizeof(nb0) atIndex:15];
-        [encoder setBytes:&nb1 length:sizeof(nb1) atIndex:16];
-        [encoder setBytes:&nb2 length:sizeof(nb2) atIndex:17];
-        [encoder setBytes:&nb3 length:sizeof(nb3) atIndex:18];
-        [encoder setBytes:&ne0 length:sizeof(ne0) atIndex:19];
-        [encoder setBytes:&ne1 length:sizeof(ne1) atIndex:20];
-        [encoder setBytes:&ne2 length:sizeof(ne2) atIndex:21];
-        [encoder setBytes:&ne3 length:sizeof(ne3) atIndex:22];
-        [encoder setBytes:&nb0 length:sizeof(nb0) atIndex:23];
-        [encoder setBytes:&nb1 length:sizeof(nb1) atIndex:24];
-        [encoder setBytes:&nb2 length:sizeof(nb2) atIndex:25];
-        [encoder setBytes:&nb3 length:sizeof(nb3) atIndex:26];
-        const size_t zero = 0;
-        const int64_t nb_ne00 = ne0;
-        [encoder setBytes:&zero length:sizeof(zero) atIndex:27];
-        [encoder setBytes:&nb_ne00 length:sizeof(nb_ne00) atIndex:28];
+                   atIndex:0];                                // src (source j)
+        [encoder setBuffer:id_dst offset:offs_dst atIndex:1]; // dst
+        [encoder setBytes:&ne0 length:sizeof(ne0) atIndex:2];
+        [encoder setBytes:&ne1 length:sizeof(ne1) atIndex:3];
+        [encoder setBytes:&ne2 length:sizeof(ne2) atIndex:4];
+        [encoder setBytes:&ne3 length:sizeof(ne3) atIndex:5];
+        [encoder setBytes:&nb0 length:sizeof(nb0) atIndex:6];
+        [encoder setBytes:&nb1 length:sizeof(nb1) atIndex:7];
+        [encoder setBytes:&nb2 length:sizeof(nb2) atIndex:8];
+        [encoder setBytes:&nb3 length:sizeof(nb3) atIndex:9];
+        [encoder setBytes:&ne0 length:sizeof(ne0) atIndex:10];
+        [encoder setBytes:&ne1 length:sizeof(ne1) atIndex:11];
+        [encoder setBytes:&ne2 length:sizeof(ne2) atIndex:12];
+        [encoder setBytes:&ne3 length:sizeof(ne3) atIndex:13];
+        [encoder setBytes:&nb0 length:sizeof(nb0) atIndex:14];
+        [encoder setBytes:&nb1 length:sizeof(nb1) atIndex:15];
+        [encoder setBytes:&nb2 length:sizeof(nb2) atIndex:16];
+        [encoder setBytes:&nb3 length:sizeof(nb3) atIndex:17];
         const int nth =
             MIN((int)pipeline.maxTotalThreadsPerThreadgroup, (int)ne0);
-        [encoder dispatchThreadgroups:MTLSizeMake(ne1, ne2, ne3)
+        [encoder dispatchThreadgroups:MTLSizeMake(ne1 * ne2 * ne3, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+        dst_initialized = true;
+      } else {
+        // Subsequent sources: ADD to dst.
+        if (nelem % 4 == 0) {
+          id<MTLComputePipelineState> pipeline =
+              ctx->kernels[GGML_METAL_KERNEL_TYPE_ADD_4].pipeline;
+          [encoder setComputePipelineState:pipeline];
+          [encoder setBuffer:id_dst
+                      offset:offs_dst
+                     atIndex:0]; // src0 = dst (accumulator)
+          [encoder setBuffer:id_src_j
+                      offset:offs_src_j
+                     atIndex:1]; // src1 = source j
+          [encoder setBuffer:id_dst offset:offs_dst atIndex:2]; // dst  = dst
+          [encoder dispatchThreadgroups:MTLSizeMake(nelem / 4, 1, 1)
+                  threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        } else {
+          id<MTLComputePipelineState> pipeline =
+              ctx->kernels[GGML_METAL_KERNEL_TYPE_ADD].pipeline;
+          [encoder setComputePipelineState:pipeline];
+          [encoder setBuffer:id_dst offset:offs_dst atIndex:0];
+          [encoder setBuffer:id_src_j offset:offs_src_j atIndex:1];
+          [encoder setBuffer:id_dst offset:offs_dst atIndex:2];
+          [encoder setBytes:&ne0 length:sizeof(ne0) atIndex:3];
+          [encoder setBytes:&ne1 length:sizeof(ne1) atIndex:4];
+          [encoder setBytes:&ne2 length:sizeof(ne2) atIndex:5];
+          [encoder setBytes:&ne3 length:sizeof(ne3) atIndex:6];
+          [encoder setBytes:&nb0 length:sizeof(nb0) atIndex:7];
+          [encoder setBytes:&nb1 length:sizeof(nb1) atIndex:8];
+          [encoder setBytes:&nb2 length:sizeof(nb2) atIndex:9];
+          [encoder setBytes:&nb3 length:sizeof(nb3) atIndex:10];
+          [encoder setBytes:&ne0
+                     length:sizeof(ne0)
+                    atIndex:11]; // src1 ne/nb = same as dst
+          [encoder setBytes:&ne1 length:sizeof(ne1) atIndex:12];
+          [encoder setBytes:&ne2 length:sizeof(ne2) atIndex:13];
+          [encoder setBytes:&ne3 length:sizeof(ne3) atIndex:14];
+          [encoder setBytes:&nb0 length:sizeof(nb0) atIndex:15];
+          [encoder setBytes:&nb1 length:sizeof(nb1) atIndex:16];
+          [encoder setBytes:&nb2 length:sizeof(nb2) atIndex:17];
+          [encoder setBytes:&nb3 length:sizeof(nb3) atIndex:18];
+          [encoder setBytes:&ne0 length:sizeof(ne0) atIndex:19];
+          [encoder setBytes:&ne1 length:sizeof(ne1) atIndex:20];
+          [encoder setBytes:&ne2 length:sizeof(ne2) atIndex:21];
+          [encoder setBytes:&ne3 length:sizeof(ne3) atIndex:22];
+          [encoder setBytes:&nb0 length:sizeof(nb0) atIndex:23];
+          [encoder setBytes:&nb1 length:sizeof(nb1) atIndex:24];
+          [encoder setBytes:&nb2 length:sizeof(nb2) atIndex:25];
+          [encoder setBytes:&nb3 length:sizeof(nb3) atIndex:26];
+          const size_t zero = 0;
+          const int64_t nb_ne00 = ne0;
+          [encoder setBytes:&zero length:sizeof(zero) atIndex:27];
+          [encoder setBytes:&nb_ne00 length:sizeof(nb_ne00) atIndex:28];
+          const int nth =
+              MIN((int)pipeline.maxTotalThreadsPerThreadgroup, (int)ne0);
+          [encoder dispatchThreadgroups:MTLSizeMake(ne1, ne2, ne3)
+                  threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+        }
       }
     }
 
     // Phase 2: Copy the reduced result back to all other sources.
-    // In unified memory (macOS Metal), this is a simple memcpy-style copy via
-    // the cpy_f32_f32 kernel.
-    // Skip sources on other backends — the scheduler handles cross-backend
-    // data distribution.
+    // In unified memory (macOS Metal), this is a simple memcpy-style copy
+    // via the cpy_f32_f32 kernel. Skip sources on other backends — the
+    // scheduler handles cross-backend data distribution.
     for (int j = 0; j < n_src; ++j) {
       struct ggml_tensor *src_j = dst->src[j];
       if (src_j == NULL || src_j->data == dst->data) {
@@ -2899,8 +2940,8 @@ static void ggml_metal_encode_node(struct ggml_backend_metal_context *ctx,
         (src1t == GGML_TYPE_F32 || src1t == GGML_TYPE_F16) && ne00 % 32 == 0 &&
         ne00 >= 64 &&
         (ne11 > ne11_mm_min || (ggml_is_quantized(src0t) && ne12 > 1))) {
-      // printf("matrix: ne00 = %6d, ne01 = %6d, ne02 = %6d, ne11 = %6d, ne12 =
-      // %6d\n", ne00, ne01, ne02, ne11, ne12);
+      // printf("matrix: ne00 = %6d, ne01 = %6d, ne02 = %6d, ne11 = %6d, ne12
+      // = %6d\n", ne00, ne01, ne02, ne11, ne12);
 
       // some Metal matrix data types require aligned pointers
       // ref:
@@ -3275,8 +3316,8 @@ static void ggml_metal_encode_node(struct ggml_backend_metal_context *ctx,
       int nth0 = 32;
       int nth1 = 1;
       int nrows = 1;
-      // printf("vector: ne00 = %6d, ne01 = %6d, ne02 = %6d, ne11 = %6d, ne12 =
-      // %6d\n", ne00, ne01, ne02, ne11, ne12);
+      // printf("vector: ne00 = %6d, ne01 = %6d, ne02 = %6d, ne11 = %6d, ne12
+      // = %6d\n", ne00, ne01, ne02, ne11, ne12);
 
       id<MTLComputePipelineState> pipeline = nil;
 
@@ -3661,8 +3702,8 @@ static void ggml_metal_encode_node(struct ggml_backend_metal_context *ctx,
     GGML_ASSERT(src1t == GGML_TYPE_F32);
 
     // find the break-even point where the matrix-matrix kernel becomes more
-    // efficient compared to the matrix-vector kernel ne20 = n_used_experts ne21
-    // = n_rows
+    // efficient compared to the matrix-vector kernel ne20 = n_used_experts
+    // ne21 = n_rows
     const int dst_rows = ne20 * ne21;
     const int dst_rows_min = n_as;
     // const int dst_rows_max = (ctx->device.maxThreadgroupMemoryLength/2 -
@@ -5203,8 +5244,8 @@ static void ggml_metal_encode_node(struct ggml_backend_metal_context *ctx,
 
     if (!use_vec_kernel) {
       // half8x8 kernel
-      const int64_t nqptg = 8; // queries per threadgroup    !! sync with kernel
-                               // template arguments !!
+      const int64_t nqptg = 8;  // queries per threadgroup    !! sync with
+                                // kernel template arguments !!
       const int64_t ncpsg = 32; // cache values per simdgroup !! sync with
                                 // kernel template arguments !!
 
@@ -5218,8 +5259,8 @@ static void ggml_metal_encode_node(struct ggml_backend_metal_context *ctx,
       //
       // 16*32*(nsg)
       // the shared memory needed for the simdgroups to load the KV cache
-      // each thread loads (dequantizes) 16 head elements, there are 32 threads
-      // in th SG
+      // each thread loads (dequantizes) 16 head elements, there are 32
+      // threads in th SG
       //
 #define FATTN_SMEM(nsg)                                                        \
   (GGML_PAD(                                                                   \
@@ -5260,8 +5301,8 @@ static void ggml_metal_encode_node(struct ggml_backend_metal_context *ctx,
 
     } else {
       // half1x4 kernel
-      const int64_t nqptg = 1; // queries per threadgroup    !! sync with kernel
-                               // template arguments !!
+      const int64_t nqptg = 1;  // queries per threadgroup    !! sync with
+                                // kernel template arguments !!
       const int64_t ncpsg = 32; // cache values per simdgroup !! sync with
                                 // kernel template arguments !!
 
@@ -5782,10 +5823,12 @@ GGML_CALL ggml_backend_buffer_type_t ggml_backend_metal_buffer_type(void) {
   static struct ggml_backend_buffer_type ggml_backend_buffer_type_metal = {
       /* .iface = */ {
           /* .get_name         = */ ggml_backend_metal_buffer_type_get_name,
-          /* .alloc_buffer     = */ ggml_backend_metal_buffer_type_alloc_buffer,
+          /* .alloc_buffer     = */
+          ggml_backend_metal_buffer_type_alloc_buffer,
           /* .get_alignment    = */
           ggml_backend_metal_buffer_type_get_alignment,
-          /* .get_max_size     = */ ggml_backend_metal_buffer_type_get_max_size,
+          /* .get_max_size     = */
+          ggml_backend_metal_buffer_type_get_max_size,
           /* .get_alloc_size   = */ NULL, // defaults to ggml_nbytes
           /* .is_host          = */ ggml_backend_metal_buffer_type_is_host,
       },
@@ -5845,8 +5888,8 @@ ggml_backend_metal_buffer_from_ptr(void *data, size_t size, size_t max_size) {
 
     ++ctx->n_buffers;
   } else {
-    // this overlap between the views will guarantee that the tensor with the
-    // maximum size will fully fit into one of the views
+    // this overlap between the views will guarantee that the tensor with
+    // the maximum size will fully fit into one of the views
     const size_t size_ovlp = ((max_size + size_page - 1) / size_page + 1) *
                              size_page; // round-up 2 pages just in case
     const size_t size_step = device.maxBufferLength - size_ovlp;
@@ -5947,7 +5990,8 @@ ggml_backend_metal_supports_buft(ggml_backend_t backend,
 static struct ggml_backend_i ggml_backend_metal_i = {
     /* .get_name                = */ ggml_backend_metal_name,
     /* .free                    = */ ggml_backend_metal_free,
-    /* .get_default_buffer_type = */ ggml_backend_metal_get_default_buffer_type,
+    /* .get_default_buffer_type = */
+    ggml_backend_metal_get_default_buffer_type,
     /* .set_tensor_async        = */ NULL,
     /* .get_tensor_async        = */ NULL,
     /* .cpy_tensor_async        = */ NULL,

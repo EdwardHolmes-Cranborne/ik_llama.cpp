@@ -1415,27 +1415,13 @@ ggml_backend_sched_backend_from_buffer(ggml_backend_sched_t sched,
     return -1;
   }
 
-  bool trace = tensor->name && strstr(tensor->name, ".1") != NULL &&
-               strstr(tensor->name, "weight") != NULL;
-  if (trace) {
-    fprintf(stderr,
-            "DIAG backend_from_buffer: tensor=%s buffer_name=%s buft_name=%s\n",
-            tensor->name, ggml_backend_buffer_name(buffer),
-            buffer->buft->iface.get_name(buffer->buft));
-  }
+  bool trace = false;
 
   // find highest prio backend that supports the buffer type and the op
   for (int i = 0; i < sched->n_backends; i++) {
     bool buft_ok = ggml_backend_supports_buft(sched->backends[i], buffer->buft);
     bool op_ok = ggml_backend_supports_op(sched->backends[i], op);
-    if (trace) {
-      fprintf(stderr, "  backend %d (%s): supports_buft=%d supports_op=%d\n", i,
-              ggml_backend_name(sched->backends[i]), buft_ok, op_ok);
-    }
     if (buft_ok && op_ok) {
-      if (trace) {
-        fprintf(stderr, "  -> selected backend %d\n", i);
-      }
       return i;
     }
   }
@@ -2084,11 +2070,9 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched,
                     ggml_dup_tensor_layout(sched->ctx, src);
                 ggml_format_name(tensor_copy, "%s#%s#%d",
                                  ggml_backend_name(backend), src->name, c);
-                if (sched->n_copies > 1) {
-                  ggml_set_input(tensor_copy);
-                  ggml_set_output(tensor_copy); // prevent ggml-alloc from
-                                                // overwriting the tensor
-                }
+                ggml_set_input(tensor_copy);
+                ggml_set_output(tensor_copy); // prevent ggml-alloc from
+                                              // overwriting the tensor
                 tensor_id_copy(src_id, cur_backend_id, c) = tensor_copy;
                 SET_CAUSE(tensor_copy, "4.cpy");
               }
@@ -2262,6 +2246,7 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
         "%s: failed to allocate graph, reserving (backend_ids_changed = %d)\n",
         __func__, backend_ids_changed);
 #endif
+
     ggml_gallocr_reserve_n(sched->galloc, &sched->graph,
                            sched->node_backend_ids, sched->leaf_backend_ids);
     if (!ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
@@ -2270,17 +2255,18 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     }
   }
 
-  // DIAG: check copy tensor allocation status
-  {
-    int diag_count = 0;
-    for (int i = 0; i < sched->graph.n_nodes && diag_count < 5; i++) {
-      struct ggml_tensor *node = sched->graph.nodes[i];
-      if (node->name && strstr(node->name, "Metal#") &&
-          strstr(node->name, "#0")) {
-        fprintf(stderr, "DIAG alloc: tensor=%s buffer=%p view_src=%p data=%p\n",
-                node->name, (void *)node->buffer, (void *)node->view_src,
-                node->data);
-        diag_count++;
+  // Post-allocation fixup: REDUCE nodes are views of one of their sources.
+  // During Pass 5 (split graph), view_src was updated to point at the copy
+  // tensor, but src_copy->data was still NULL (not yet allocated). Now that
+  // allocation is done, sync the REDUCE node's data pointer from its view_src.
+  for (int i = 0; i < sched->graph.n_nodes; i++) {
+    struct ggml_tensor *node = sched->graph.nodes[i];
+    if (node->op == GGML_OP_REDUCE && node->view_src) {
+      void *expected = node->view_src->data
+                           ? (char *)node->view_src->data + node->view_offs
+                           : NULL;
+      if (node->data != expected) {
+        node->data = expected;
       }
     }
   }
@@ -2318,13 +2304,7 @@ static void ggml_backend_sched_copy_inputs(
 
     auto copy_input_to_split = [&](bool allow_async_host_set) {
       if (input->buffer && input_cpy->buffer) {
-        void *before = input_cpy->data;
         ggml_backend_tensor_copy(input, input_cpy);
-        if (input_cpy->data != before) {
-          fprintf(stderr,
-                  "DIAG copy_inputs: data ptr CHANGED for '%s': %p -> %p\n",
-                  input_cpy->name, before, input_cpy->data);
-        }
         return true;
       }
       if (input->data && input_cpy->buffer) {
@@ -2577,17 +2557,8 @@ ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
   for (auto &item : sched->needs_sync)
     item = true;
 
-  fprintf(stderr,
-          "DIAG compute_splits: n_splits=%d is_async=%d n_backends=%d "
-          "split_mode_graph=%d has_reduce=%d\n",
-          sched->n_splits, sched->is_async, sched->n_backends,
-          sched->split_mode_graph, sched->has_reduce);
-  fflush(stderr);
-
   if (sched->is_async && sched->n_backends > 2 && sched->split_mode_graph &&
       sched->has_reduce) {
-    fprintf(stderr, "DIAG: taking PARALLEL execution path\n");
-    fflush(stderr);
 
     for (auto &s : sched->statuses)
       s = GGML_STATUS_SUCCESS;
@@ -2807,9 +2778,6 @@ ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
   std::vector<uint32_t> unique_ids;
   ggml_tensor *last_ids_tensor = nullptr;
 
-  fprintf(stderr, "DIAG: taking SEQUENTIAL execution path for %d splits\n",
-          sched->n_splits);
-  fflush(stderr);
   for (int i = 0; i < sched->n_splits; i++) {
 #if IK_PRINT_TIMING
     int64_t tim1 = ggml_time_us();
@@ -2817,17 +2785,6 @@ ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     struct ggml_backend_sched_split *split = &splits[i];
     int split_backend_id = split->backend_id;
     ggml_backend_t split_backend = sched->backends[split_backend_id];
-
-    if (i < 5 || i % 200 == 0) {
-      fprintf(stderr,
-              "DIAG split %d/%d: backend=%d op=%s(%s) n_nodes=%d n_inputs=%d\n",
-              i, sched->n_splits, split_backend_id,
-              split->graph.n_nodes > 0 ? ggml_op_name(split->graph.nodes[0]->op)
-                                       : "?",
-              split->graph.n_nodes > 0 ? split->graph.nodes[0]->name : "?",
-              split->graph.n_nodes, split->n_inputs);
-      fflush(stderr);
-    }
 
     // copy the input tensors to the split backend
     ggml_backend_sched_copy_inputs(sched, split, sched->needs_sync, ids,
