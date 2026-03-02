@@ -93,6 +93,29 @@ GGML_API int ggml_ane_n_outputs(ggml_ane_kernel_t k);
 GGML_API const char * ggml_ane_output_name(ggml_ane_kernel_t k, int idx);
 
 // =========================================================================
+// Fused FFN kernel compilation
+// =========================================================================
+
+// Compile a fused FFN kernel (gate + up + SiLU + mul + down) with baked weights.
+// The kernel computes: output = SiLU(x @ gate) * (x @ up) @ down
+// Layout: input [1, hidden_dim, 1, spatial] → output [1, hidden_dim, 1, spatial]
+//
+// python_path: path to python3 with coremltools (NULL = auto-detect)
+// hidden_dim:  input/output channel dimension
+// inter_dim:   intermediate dimension (after gate/up, before down)
+// spatial:     sequence length dimension
+// gate_f32:    row-major [inter_dim, hidden_dim] float32 gate weights
+// up_f32:      row-major [inter_dim, hidden_dim] float32 up weights
+// down_f32:    row-major [hidden_dim, inter_dim] float32 down weights
+// cache_dir:   directory for caching compiled models (NULL = temp dir)
+// Returns loaded kernel or NULL on failure.
+GGML_API ggml_ane_kernel_t ggml_ane_compile_ffn(
+    const char * python_path,
+    int hidden_dim, int inter_dim, int spatial,
+    const float * gate_f32, const float * up_f32, const float * down_f32,
+    const char * cache_dir);
+
+// =========================================================================
 // Weight blob builders (used by Python model generator)
 // =========================================================================
 

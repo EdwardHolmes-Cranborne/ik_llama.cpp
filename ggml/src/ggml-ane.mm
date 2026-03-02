@@ -338,6 +338,194 @@ ggml_ane_kernel_t ggml_ane_compile(
 }
 
 // ===========================================================================
+// Fused FFN kernel compilation
+// ===========================================================================
+
+ggml_ane_kernel_t ggml_ane_compile_ffn(
+    const char * python_path,
+    int hidden_dim, int inter_dim, int spatial,
+    const float * gate_f32, const float * up_f32, const float * down_f32,
+    const char * cache_dir)
+{
+    @autoreleasepool {
+        if (!gate_f32 || !up_f32 || !down_f32) return NULL;
+        if (hidden_dim <= 0 || inter_dim <= 0 || spatial <= 0) return NULL;
+
+        // Auto-detect Python if needed (reuse logic from ggml_ane_compile)
+        NSString *pyPath = nil;
+        if (python_path) {
+            pyPath = [NSString stringWithUTF8String:python_path];
+        } else {
+            NSArray *candidates = @[
+                [NSString stringWithFormat:@"%@/.local/bin/python3.12", NSHomeDirectory()],
+                @"/opt/homebrew/bin/python3.12",
+                @"/usr/local/bin/python3.12",
+                @"/opt/homebrew/bin/python3.11",
+                @"/usr/local/bin/python3.11",
+                [NSString stringWithFormat:@"%@/.local/bin/python3", NSHomeDirectory()],
+                @"/opt/homebrew/bin/python3",
+                @"/usr/local/bin/python3",
+                @"/usr/bin/python3",
+            ];
+            NSString *testScript = @"import coremltools; "
+                "from coremltools.converters.mil import Builder as mb; "
+                "from coremltools.converters.mil.mil import types; "
+                "from coremltools.converters.mil._deployment_compatibility import AvailableTarget as target";
+            for (NSString *candidate in candidates) {
+                if ([[NSFileManager defaultManager] isExecutableFileAtPath:candidate]) {
+                    NSTask *test = [[NSTask alloc] init];
+                    test.launchPath = candidate;
+                    test.arguments = @[@"-c", testScript];
+                    test.standardOutput = [NSFileHandle fileHandleWithNullDevice];
+                    test.standardError = [NSFileHandle fileHandleWithNullDevice];
+                    NSError *testErr = nil;
+                    [test launchAndReturnError:&testErr];
+                    if (!testErr) {
+                        [test waitUntilExit];
+                        if (test.terminationStatus == 0) {
+                            pyPath = candidate;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (!pyPath) {
+                fprintf(stderr, "[ANE] No Python with coremltools found for FFN compile\n");
+                return NULL;
+            }
+        }
+
+        // Create cache directory
+        NSString *baseDir;
+        if (cache_dir) {
+            baseDir = [NSString stringWithUTF8String:cache_dir];
+        } else {
+            baseDir = [NSTemporaryDirectory() stringByAppendingPathComponent:@"ggml_ane_cache"];
+        }
+        [[NSFileManager defaultManager] createDirectoryAtPath:baseDir
+                                  withIntermediateDirectories:YES
+                                                   attributes:nil
+                                                        error:nil];
+
+        NSString *modelName = [NSString stringWithFormat:@"ffn_%dx%d_sp%d",
+                               hidden_dim, inter_dim, spatial];
+        NSString *compiledPath = [baseDir stringByAppendingPathComponent:
+            [modelName stringByAppendingString:@".mlmodelc"]];
+
+        // Check cache
+        if ([[NSFileManager defaultManager] fileExistsAtPath:compiledPath]) {
+            ggml_ane_kernel_t k = ggml_ane_load([compiledPath UTF8String], "x", 2);
+            if (k) return k;
+        }
+
+        // Write weight blobs to temp files
+        NSString *gatePath = [baseDir stringByAppendingPathComponent:
+            [modelName stringByAppendingString:@"_gate.bin"]];
+        NSString *upPath = [baseDir stringByAppendingPathComponent:
+            [modelName stringByAppendingString:@"_up.bin"]];
+        NSString *downPath = [baseDir stringByAppendingPathComponent:
+            [modelName stringByAppendingString:@"_down.bin"]];
+
+        size_t gate_bytes = (size_t)inter_dim * hidden_dim * sizeof(float);
+        size_t up_bytes   = (size_t)inter_dim * hidden_dim * sizeof(float);
+        size_t down_bytes = (size_t)hidden_dim * inter_dim * sizeof(float);
+
+        [[NSData dataWithBytes:gate_f32 length:gate_bytes] writeToFile:gatePath atomically:YES];
+        [[NSData dataWithBytes:up_f32 length:up_bytes] writeToFile:upPath atomically:YES];
+        [[NSData dataWithBytes:down_f32 length:down_bytes] writeToFile:downPath atomically:YES];
+
+        // Write Python script for fused FFN model generation
+        NSString *scriptPath = [baseDir stringByAppendingPathComponent:@"_gen_ffn.py"];
+        NSString *script = [NSString stringWithFormat:
+            @"#!/usr/bin/env python3\n"
+            "import sys, os, subprocess, numpy as np\n"
+            "import coremltools as ct\n"
+            "from coremltools.converters.mil import Builder as mb\n"
+            "from coremltools.converters.mil.mil import types\n"
+            "from coremltools.converters.mil._deployment_compatibility import AvailableTarget as target\n"
+            "\n"
+            "hidden_dim = %d\n"
+            "inter_dim = %d\n"
+            "spatial = %d\n"
+            "gate_path = '%@'\n"
+            "up_path = '%@'\n"
+            "down_path = '%@'\n"
+            "out_dir = '%@'\n"
+            "model_name = '%@'\n"
+            "\n"
+            "# Load weights as float32, convert to float16, reshape for conv [Cout, Cin, 1, 1]\n"
+            "W_gate = np.fromfile(gate_path, dtype=np.float32).reshape(inter_dim, hidden_dim).astype(np.float16).reshape(inter_dim, hidden_dim, 1, 1)\n"
+            "W_up   = np.fromfile(up_path,   dtype=np.float32).reshape(inter_dim, hidden_dim).astype(np.float16).reshape(inter_dim, hidden_dim, 1, 1)\n"
+            "W_down = np.fromfile(down_path,  dtype=np.float32).reshape(hidden_dim, inter_dim).astype(np.float16).reshape(hidden_dim, inter_dim, 1, 1)\n"
+            "\n"
+            "@mb.program(input_specs=[mb.TensorSpec(shape=(1, hidden_dim, 1, spatial), dtype=types.fp16)],\n"
+            "            opset_version=target.iOS17)\n"
+            "def model(x):\n"
+            "    gate = mb.conv(x=x, weight=mb.const(val=W_gate, name='W_gate'), pad_type='valid', name='gate')\n"
+            "    up   = mb.conv(x=x, weight=mb.const(val=W_up,   name='W_up'),   pad_type='valid', name='up')\n"
+            "    act  = mb.silu(x=gate, name='silu')\n"
+            "    mul  = mb.mul(x=act, y=up, name='gate_up')\n"
+            "    out  = mb.conv(x=mul, weight=mb.const(val=W_down, name='W_down'), pad_type='valid', name='out')\n"
+            "    return out\n"
+            "\n"
+            "m = ct.convert(model, compute_units=ct.ComputeUnit.ALL,\n"
+            "               compute_precision=ct.precision.FLOAT16,\n"
+            "               minimum_deployment_target=ct.target.iOS17)\n"
+            "pkg = os.path.join(out_dir, model_name + '.mlpackage')\n"
+            "m.save(pkg)\n"
+            "subprocess.run(['xcrun', 'coremlcompiler', 'compile', pkg, out_dir], check=True)\n"
+            "print('OK')\n",
+            hidden_dim, inter_dim, spatial,
+            gatePath, upPath, downPath, baseDir, modelName];
+        [script writeToFile:scriptPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+
+        // Run Python
+        fprintf(stderr, "[ANE] Compiling fused FFN kernel: hidden=%d inter=%d spatial=%d...\n",
+                hidden_dim, inter_dim, spatial);
+
+        NSTask *task = [[NSTask alloc] init];
+        task.launchPath = pyPath;
+        task.arguments = @[scriptPath];
+        task.standardOutput = [NSFileHandle fileHandleWithNullDevice];
+        NSPipe *errPipe = [NSPipe pipe];
+        task.standardError = errPipe;
+
+        NSError *error = nil;
+        [task launchAndReturnError:&error];
+        if (error) {
+            fprintf(stderr, "[ANE] Failed to launch Python for FFN: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            return NULL;
+        }
+
+        NSData *errData = [[errPipe fileHandleForReading] readDataToEndOfFile];
+        [task waitUntilExit];
+
+        if (task.terminationStatus != 0) {
+            NSString *errStr = [[NSString alloc] initWithData:errData encoding:NSUTF8StringEncoding];
+            fprintf(stderr, "[ANE] FFN model gen failed: %s\n", [errStr UTF8String]);
+            return NULL;
+        }
+
+        // Clean up temp weight files
+        [[NSFileManager defaultManager] removeItemAtPath:gatePath error:nil];
+        [[NSFileManager defaultManager] removeItemAtPath:upPath error:nil];
+        [[NSFileManager defaultManager] removeItemAtPath:downPath error:nil];
+        [[NSFileManager defaultManager] removeItemAtPath:scriptPath error:nil];
+
+        fprintf(stderr, "[ANE] FFN kernel compiled successfully\n");
+
+        // Load the compiled model
+        ggml_ane_kernel_t k = ggml_ane_load([compiledPath UTF8String], "x", 2);
+        if (k) {
+            k->ownsTemp = (cache_dir == NULL);
+            k->tempPath = [baseDir retain];
+        }
+        return k;
+    }
+}
+
+// ===========================================================================
 // I/O operations
 // ===========================================================================
 

@@ -417,6 +417,87 @@ struct gpt_params {
     std::string sql_save_file;
     std::string sqlite_zstd_ext_file;
 
+    // KV handoff receiver (prefill -> decode bridge)
+    bool kv_receiver_enable = false;
+    std::string kv_transport = "disabled"; // auto|rdma|tcp|mixed|disabled
+    bool kv_transport_fallback = false;
+    std::string kv_receiver_host = "";
+    int32_t kv_receiver_port = -1;
+    int32_t kv_receiver_slot_id = 0;
+    std::string kv_receiver_output_dir = "";
+    bool kv_receiver_dry_run = false;
+    bool kv_receiver_ack = true;
+    bool kv_receiver_nack_on_crc_bad = true;
+    int32_t kv_receiver_max_connections = 32;
+    int32_t kv_receiver_idle_timeout_sec = 30;
+    int32_t kv_receiver_stale_finalize_timeout_sec = 120;
+    int32_t kv_receiver_session_retention_sec = 1800;
+    int32_t kv_receiver_cleanup_interval_sec = 10;
+    int32_t kv_receiver_socket_send_buf = 0;
+    int32_t kv_receiver_socket_recv_buf = 0;
+
+    // KV bridge import policy (decode-side artifact compatibility conversion)
+    std::string kv_bridge_mode = "strict"; // off|strict|relaxed
+    std::string kv_bridge_plan_cache_dir = "";
+    bool kv_bridge_allow_vtrans_convert = false;
+    bool kv_bridge_dry_run = false;
+    bool kv_bridge_no_fallback = false;
+    bool kv_bridge_telemetry = true;
+
+    // RTX Accelerated Prefill Streaming
+    bool prefill_streaming = false; // enable 2-buffer streaming prefill
+    bool prefill_telemetry = true;  // emit per-layer timing info
+    bool prefill_overlap = false;   // overlap upload with compute (Phase 2)
+    int32_t prefill_buffers = 2;    // number of GPU rotation buffers
+    int32_t prefill_prefetch = 1;   // layer lookahead distance
+    size_t prefill_slab_bytes = 16 * 1024 * 1024; // upload chunk size
+    int32_t prefill_min_stream_batch_tokens =
+        -1; // -1 keeps runtime crossover logic
+
+    // ANE GPU+ANE split prefill
+    bool prefill_ane = false;            // enable ANE co-processing during prefill
+    float prefill_ane_ratio = 0.5f;      // fraction of FFN intermediate to ANE
+    bool prefill_ane_validate = false;   // validate ANE output vs CPU reference
+    std::string prefill_ane_cache = "";  // CoreML model cache directory
+
+    // Prefill->decode handoff planner/runtime controls
+    std::string prefill_decode_mode =
+        "auto"; // auto|cpu_kv|gpu_kv|hybrid|split_thunderbolt
+    std::string prefill_transport_mode = "disabled"; // disabled|bulk|progressive
+    std::string prefill_execution_mode = "coupled";  // coupled|decoupled
+    int32_t decode_gpu_layers_hint = -1;             // -1 = auto
+    int32_t decode_remote_layers_hint = 0;
+    int32_t decode_remote_nodes_hint = 1;
+    std::string decode_remote_ranges = "";
+    std::string decode_remote_failover_policy = "reroute"; // reroute|local|fail
+    int32_t prefill_transport_chunk_bytes = 4 * 1024 * 1024;
+    bool prefill_decode_transport_required = false;
+    std::string prefill_transport_session_dir = "";
+
+    // Sender-side transport settings used by split handoff publish
+    std::string kv_host = "";
+    int32_t kv_port = 0;
+    int32_t kv_streams = 0;
+    int32_t kv_stream_chunk_bytes = 0;
+    int32_t kv_max_inflight_bytes = 0;
+    int32_t kv_socket_send_buf = 0;
+    int32_t kv_socket_recv_buf = 0;
+    std::string kv_bind_addrs = "";
+    std::string kv_peer_addrs = "";
+    std::string kv_balance = "";
+    std::string tb_direct_endpoint = "";
+
+    // Decode route planner/dispatch controls (server-side)
+    std::string decode_node_id = "";
+    std::string decode_cluster_file = "";
+    std::string decode_cluster_nodes_json = "";
+    bool decode_route_dispatch_enable = false;
+    int32_t decode_route_dispatch_max_hops = -1;
+    std::string decode_route_dispatch_session_dir = "";
+    int32_t decode_route_dispatch_streams = 0;
+    int32_t decode_route_dispatch_chunk_bytes = 0;
+    int32_t decode_route_dispatch_max_inflight_bytes = 0;
+
     float slot_prompt_similarity = 0.1f;
 
     bool do_checkpoint = false;               // do checkpoint for recurrent models only

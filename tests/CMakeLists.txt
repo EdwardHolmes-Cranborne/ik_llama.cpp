@@ -233,6 +233,15 @@ if (GGML_ANE AND APPLE)
     add_test(NAME test-ane-weights COMMAND test-ane-weights)
     set_property(TEST test-ane-weights PROPERTY LABELS "ane")
 
+    # Phase 3: ANE FFN dispatch correctness test
+    add_executable(test-ane-dispatch
+        ${CMAKE_SOURCE_DIR}/tests/test-ane-dispatch.cpp)
+    target_link_libraries(test-ane-dispatch PRIVATE llama ggml)
+    target_include_directories(test-ane-dispatch PRIVATE
+        ${CMAKE_SOURCE_DIR}/ggml/include
+        ${CMAKE_SOURCE_DIR}/src)
+    install(TARGETS test-ane-dispatch RUNTIME)
+
     # ANE layer benchmark tool
     add_executable(ane-layer-bench
         ${CMAKE_SOURCE_DIR}/tools/ane-layer-bench.cpp)
@@ -240,4 +249,10 @@ if (GGML_ANE AND APPLE)
     target_include_directories(ane-layer-bench PRIVATE
         ${CMAKE_SOURCE_DIR}/ggml/include)
     install(TARGETS ane-layer-bench RUNTIME)
+
+    # ANE prefill benchmark tool (GPU-only vs GPU+ANE)
+    add_executable(bench-ane-prefill
+        ${CMAKE_SOURCE_DIR}/tools/bench-ane-prefill.cpp)
+    target_link_libraries(bench-ane-prefill PRIVATE common llama)
+    install(TARGETS bench-ane-prefill RUNTIME)
 endif()

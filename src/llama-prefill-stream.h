@@ -41,6 +41,13 @@ struct llama_prefill_stream_params {
     int    host_cache_window_layers = 0;         // S3: moving-window layer count (0 = disabled)
     size_t host_cache_window_bytes  = 0;         // S3: moving-window byte budget (0 = disabled)
     int    host_cache_prefetch_distance = 1;     // S3: host prefetch lookahead in layers
+
+    // ANE GPU+ANE split prefill (Phase 3+4)
+    bool   ane_enabled       = false;            // enable ANE co-processing
+    float  ane_ratio         = 0.5f;             // fraction of FFN intermediate to ANE
+    bool   ane_validate      = false;            // validate ANE output vs CPU reference
+    const char * ane_cache_dir  = nullptr;       // CoreML model cache directory
+    const char * ane_python_path = nullptr;      // Python path for coremltools
 };
 
 struct llama_layer_metrics {
@@ -57,6 +64,11 @@ struct llama_prefill_stream_result {
     float                            total_tok_s;
     int                              n_tokens_processed;
     bool                             used_streaming;
+    bool                             ane_active = false;
+    float                            ane_ratio = 0.0f;
+    int                              ane_gpu_inter = 0;
+    int                              ane_inter = 0;
+    float                            ane_total_wait_ms = 0.0f;
     bool                             host_cache_enabled = false;
     bool                             host_cache_advice_supported = true;
     int                              host_prefetch_layers = 0;

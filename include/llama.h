@@ -279,6 +279,27 @@ extern "C" {
         LLAMA_SPLIT_MODE_GRAPH   = 3, // splits computations across GPUs
     };
 
+    // === RTX Accelerated Prefill Streaming Enums ===
+
+    enum llama_prefill_decode_mode {
+        LLAMA_PREFILL_DECODE_MODE_AUTO              = 0, // preserve existing KV/offload behavior
+        LLAMA_PREFILL_DECODE_MODE_CPU_KV            = 1, // prefer CPU-resident KV for decode
+        LLAMA_PREFILL_DECODE_MODE_GPU_KV            = 2, // prefer GPU-resident KV for decode
+        LLAMA_PREFILL_DECODE_MODE_HYBRID            = 3, // mixed decode placement (policy-defined)
+        LLAMA_PREFILL_DECODE_MODE_SPLIT_THUNDERBOLT = 4, // mixed decode split intended for TB transport path
+    };
+
+    enum llama_prefill_transport_mode {
+        LLAMA_PREFILL_TRANSPORT_MODE_DISABLED    = 0,
+        LLAMA_PREFILL_TRANSPORT_MODE_BULK        = 1,
+        LLAMA_PREFILL_TRANSPORT_MODE_PROGRESSIVE = 2,
+    };
+
+    enum llama_prefill_execution_mode {
+        LLAMA_PREFILL_EXECUTION_MODE_COUPLED   = 0,
+        LLAMA_PREFILL_EXECUTION_MODE_DECOUPLED = 1,
+    };
+
     enum llama_mtp_op_type {
         MTP_OP_NONE             = 0,
         MTP_OP_WARMUP           = 1,
@@ -370,6 +391,10 @@ extern "C" {
         // LLAMA_SPLIT_LAYER: ignored
         int32_t main_gpu;
         int32_t max_gpu;
+
+        // number of layers to tensor-parallel (graph split) across devices.
+        // -1 = all layers (default). Only used with split_mode graph.
+        int32_t n_split_layers;
 
         // proportion of the model (layers or rows) to offload to each GPU, size: llama_max_devices()
         const float * tensor_split;
@@ -466,6 +491,48 @@ extern "C" {
         void *              abort_callback_data;
         void *              offload_policy;
         void *              cuda_params;
+
+        // RTX Accelerated Prefill Streaming
+        bool     prefill_streaming;    // enable 2-buffer GPU rotation streaming prefill
+        bool     prefill_telemetry;    // emit per-layer timing telemetry
+        bool     prefill_overlap;      // overlap upload and compute (Phase 2)
+        int32_t  prefill_buffers;      // number of GPU rotation buffers (default: 2)
+        int32_t  prefill_prefetch;     // layer lookahead distance
+        size_t   prefill_slab_bytes;   // upload chunk size in bytes
+        int32_t  prefill_min_stream_batch_tokens; // -1 keeps runtime crossover logic
+
+        // ANE GPU+ANE split prefill (Phase 3+4)
+        bool     prefill_ane;             // enable ANE co-processing during prefill
+        float    prefill_ane_ratio;       // fraction of FFN intermediate to ANE (default: 0.5)
+        bool     prefill_ane_validate;    // validate ANE output vs CPU reference
+        const char * prefill_ane_cache;   // CoreML model cache directory (NULL = temp)
+
+        // RTX prefill->decode handoff controls
+        int32_t  prefill_decode_mode;           // enum llama_prefill_decode_mode
+        int32_t  prefill_transport_mode;        // enum llama_prefill_transport_mode
+        int32_t  prefill_execution_mode;        // enum llama_prefill_execution_mode
+        int32_t  decode_gpu_layers_hint;        // -1 = auto
+        int32_t  decode_remote_layers_hint;     // 0 = none
+        int32_t  decode_remote_nodes_hint;      // default: 1
+        int32_t  prefill_transport_chunk_bytes;  // default: 4 MiB
+        bool     prefill_decode_transport_required;
+
+        const char * decode_remote_ranges;          // node:start-end,node:start-end
+        const char * decode_remote_failover_policy; // reroute|local|fail
+        const char * prefill_transport_session_dir; // optional transport session dir
+        const char * kv_transport;                  // auto|rdma|tcp|mixed|disabled
+        const char * tb_direct_endpoint;            // optional explicit endpoint
+        const char * kv_host;                       // optional sender host override
+        int32_t  kv_port;                           // optional sender port override
+        int32_t  kv_streams;                        // sender stream count
+        int32_t  kv_stream_chunk_bytes;             // sender stream chunk bytes
+        int32_t  kv_max_inflight_bytes;             // sender in-flight window
+        int32_t  kv_socket_send_buf;                // sender SO_SNDBUF
+        int32_t  kv_socket_recv_buf;                // sender SO_RCVBUF
+        const char * kv_bind_addrs;                 // sender bind interface list
+        const char * kv_peer_addrs;                 // sender peer list
+        const char * kv_balance;                    // sender balancing policy
+        bool     kv_transport_fallback;             // allow transport fallback mode
     };
 
     // model quantization parameters

@@ -6,9 +6,11 @@
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-tb-transport.h"
+#include "llama-ane-dispatch.h"
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <limits>
 #include <future>
 #include <unordered_map>
@@ -819,6 +821,64 @@ int llama_prefill_stream(llama_context *                     ctx,
     LLAMA_LOG_INFO("%s: [DIAG] GPU buffers allocated successfully\n", __func__);
 
     // ====================================================================
+    // Step 2.5: Initialize ANE dispatch (if enabled)
+    // ====================================================================
+
+    ane_dispatch_ctx_t ane_ctx = nullptr;
+    bool ane_active = false;
+    std::vector<uint16_t> ane_output_buf;  // reusable ANE output buffer
+    float ane_total_wait_ms = 0.0f;
+
+    if (params.ane_enabled) {
+#ifdef GGML_USE_ANE
+        // Try to reuse existing ANE dispatch context from the llama_context
+        if (ctx->ane_ctx && ane_dispatch_is_ready(ctx->ane_ctx, batch.n_tokens)) {
+            ane_ctx = ctx->ane_ctx;
+            ane_active = true;
+            const int hidden = (int)model->hparams.n_embd;
+            ane_output_buf.resize(batch.n_tokens * hidden);
+            LLAMA_LOG_INFO("%s: [ANE] reusing compiled kernels (gpu_inter=%d ane_inter=%d)\n", __func__,
+                           ane_dispatch_gpu_inter_dim(ane_ctx), ane_dispatch_ane_inter_dim(ane_ctx));
+        } else {
+            // Free stale context if seq_len changed
+            if (ctx->ane_ctx) {
+                ane_dispatch_free(ctx->ane_ctx);
+                ctx->ane_ctx = nullptr;
+            }
+            ane_ctx = ane_dispatch_init(&model->hparams, params.ane_ratio,
+                                         params.ane_cache_dir, params.ane_python_path);
+            if (ane_ctx) {
+                LLAMA_LOG_INFO("%s: [ANE] compiling FFN kernels (ratio=%.2f, seq=%d)...\n",
+                               __func__, params.ane_ratio, batch.n_tokens);
+                if (ane_dispatch_compile_kernels(ane_ctx, model->layers.data(), n_layer, batch.n_tokens)) {
+                    ane_active = true;
+                    ctx->ane_ctx = ane_ctx;
+                    ctx->ane_prefill_active = true;
+                    const int hidden = (int)model->hparams.n_embd;
+                    ane_output_buf.resize(batch.n_tokens * hidden);
+                    LLAMA_LOG_INFO("%s: [ANE] active: gpu_inter=%d ane_inter=%d\n", __func__,
+                                   ane_dispatch_gpu_inter_dim(ane_ctx), ane_dispatch_ane_inter_dim(ane_ctx));
+                } else {
+                    LLAMA_LOG_WARN("%s: [ANE] kernel compilation failed, falling back to GPU-only\n", __func__);
+                    ane_dispatch_free(ane_ctx);
+                    ane_ctx = nullptr;
+                }
+            } else {
+                LLAMA_LOG_WARN("%s: [ANE] dispatch init failed, falling back to GPU-only\n", __func__);
+            }
+        }
+#else
+        LLAMA_LOG_WARN("%s: [ANE] requested but GGML_ANE not enabled at build time\n", __func__);
+#endif
+    }
+
+    // On scope exit: clear callbacks but keep ane_ctx on the llama_context for reuse
+    const auto cleanup_ane = llama_scope_exit([&]() {
+        ctx->ane_prefill_active = false;
+        ctx->pre_ffn_cb = nullptr;
+    });
+
+    // ====================================================================
     // Step 3: Remap → Build Graph → Restore
     //
     // We temporarily make all weight tensors look GPU-resident so the
@@ -826,8 +886,108 @@ int llama_prefill_stream(llama_context *                     ctx,
     // pointers redirected to the active ping-pong buffer.
     // ====================================================================
 
+    // If ANE active, modify FFN tensor shapes to use reduced GPU-half dimensions
+    // We save originals so we can restore after graph allocation.
+    struct ffn_shape_save {
+        ggml_tensor * tensor;
+        int64_t       orig_ne[4];
+        size_t        orig_nb[4];
+        ggml_type     orig_type;
+    };
+    std::vector<ffn_shape_save> ffn_saves;
+
+    if (ane_active) {
+        const int gpu_inter = ane_dispatch_gpu_inter_dim(ane_ctx);
+        for (int il = 0; il < n_layer; il++) {
+            if (!ane_dispatch_layer_active(ane_ctx, il)) continue;
+            const llama_layer & layer = model->layers[il];
+
+            auto save_and_modify = [&](ggml_tensor * t, bool is_down) {
+                if (!t) return;
+                ffn_shape_save s;
+                s.tensor = t;
+                s.orig_type = t->type;
+                for (int d = 0; d < 4; d++) { s.orig_ne[d] = t->ne[d]; s.orig_nb[d] = t->nb[d]; }
+
+                // gate/up: [hidden, inter] → [hidden, gpu_inter], type→FP16
+                // down:    [inter, hidden] → [gpu_inter, hidden], type→FP16
+                if (is_down) {
+                    t->ne[0] = gpu_inter;  // reduce first dim (was full_inter)
+                } else {
+                    t->ne[1] = gpu_inter;  // reduce second dim (was full_inter)
+                }
+                t->type = GGML_TYPE_F16;
+                // Recompute strides for FP16
+                t->nb[0] = ggml_type_size(GGML_TYPE_F16);
+                t->nb[1] = t->nb[0] * t->ne[0];
+                t->nb[2] = t->nb[1] * t->ne[1];
+                t->nb[3] = t->nb[2] * t->ne[2];
+
+                ffn_saves.push_back(s);
+            };
+
+            save_and_modify(layer.ffn_gate, false);
+            save_and_modify(layer.ffn_up,   false);
+            save_and_modify(layer.ffn_down, true);
+        }
+        LLAMA_LOG_INFO("%s: [ANE] modified %zu FFN tensor shapes (gpu_inter=%d)\n",
+                       __func__, ffn_saves.size(), gpu_inter);
+
+        // Recalculate entry.nbytes for modified FFN tensors so buffer sizing is correct
+        size_t new_max_layer_bytes = 0;
+        for (int il = 0; il < n_layer; il++) {
+            size_t layer_bytes = 0;
+            for (auto & entry : layer_infos[il].entries) {
+                const char * tname = entry.tensor->name;
+                // Check if this is a modified FFN tensor (not MoE expert, not ffn_gate_inp)
+                bool is_modified_ffn = false;
+                if (ane_dispatch_layer_active(ane_ctx, il)) {
+                    if ((strstr(tname, "ffn_gate") && !strstr(tname, "inp") && !strstr(tname, "exp")) ||
+                        (strstr(tname, "ffn_up")   && !strstr(tname, "exp") && !strstr(tname, "gate")) ||
+                        (strstr(tname, "ffn_down")  && !strstr(tname, "exp"))) {
+                        is_modified_ffn = true;
+                    }
+                }
+                if (is_modified_ffn) {
+                    entry.nbytes = ggml_nbytes(entry.tensor);  // tensor was modified to FP16 reduced dims
+                }
+                layer_bytes += entry.nbytes;
+            }
+            layer_infos[il].total_bytes = layer_bytes;
+            if (layer_bytes > new_max_layer_bytes) new_max_layer_bytes = layer_bytes;
+        }
+
+        // If FP16 weights are larger than original quantized, reallocate GPU buffers
+        if (new_max_layer_bytes > max_layer_bytes) {
+            LLAMA_LOG_INFO("%s: [ANE] FP16 GPU-half requires larger buffers: %.2f MB -> %.2f MB\n",
+                           __func__, max_layer_bytes / (1024.0 * 1024.0),
+                           new_max_layer_bytes / (1024.0 * 1024.0));
+            ggml_backend_buffer_free(gpu_buf_a);
+            ggml_backend_buffer_free(gpu_buf_b);
+            gpu_buf_a = nullptr;
+            gpu_buf_b = nullptr;
+            max_layer_bytes = new_max_layer_bytes;
+            if (!prefill_allocate_gpu_buffers(gpu_backend, max_layer_bytes, &gpu_buf_a, &gpu_buf_b)) {
+                LLAMA_LOG_ERROR("%s: failed to reallocate GPU buffers for ANE FP16\n", __func__);
+                return -1;
+            }
+        }
+    }
+
     prefill_remap_tensors_to_gpu(layer_infos, gpu_buf_a);
     LLAMA_LOG_INFO("%s: [DIAG] tensor remap complete\n", __func__);
+
+    // After graph allocation, restore original FFN tensor shapes
+    // (they must be correct for non-prefill decode later)
+    const auto restore_ffn_shapes = llama_scope_exit([&]() {
+        for (auto & s : ffn_saves) {
+            s.tensor->type = s.orig_type;
+            for (int d = 0; d < 4; d++) {
+                s.tensor->ne[d] = s.orig_ne[d];
+                s.tensor->nb[d] = s.orig_nb[d];
+            }
+        }
+    });
 
     std::vector<float> upload_times(n_layer, 0.0f);
     std::vector<float> stall_times(n_layer, 0.0f);
@@ -857,6 +1017,7 @@ int llama_prefill_stream(llama_context *                     ctx,
         if (callbacks_registered) {
             ctx->pre_layer_cb = nullptr;
             ctx->post_layer_cb = nullptr;
+            ctx->pre_ffn_cb = nullptr;
         }
         if (pending_upload.active) {
             pending_upload.fut.wait();
@@ -889,8 +1050,50 @@ int llama_prefill_stream(llama_context *                     ctx,
         if (trace_swap) {
             LLAMA_LOG_INFO("%s: [SWAP_TRACE] sync upload layer %d start @ %.2fms\n", __func__, il, elapsed_ms());
         }
+
+        // If ANE active, temporarily substitute GPU-half FP16 weights for FFN tensors.
+        // We must save/restore orig_data+nbytes because prefill_restore_tensor_pointers
+        // uses orig_data to restore the model's original weight pointers after decode.
+        struct ane_upload_save { void * orig_data; size_t nbytes; int idx; };
+        std::vector<ane_upload_save> ane_saves;
+
+        if (ane_active && ane_dispatch_layer_active(ane_ctx, il)) {
+            auto & entries = layer_infos[il].entries;
+            for (int ei = 0; ei < (int)entries.size(); ei++) {
+                auto & entry = entries[ei];
+                const char * tname = entry.tensor->name;
+                const char * ane_name = nullptr;
+                if (strstr(tname, "ffn_gate") && !strstr(tname, "inp") && !strstr(tname, "exp")) {
+                    ane_name = "ffn_gate";
+                } else if (strstr(tname, "ffn_up") && !strstr(tname, "exp") && !strstr(tname, "gate")) {
+                    ane_name = "ffn_up";
+                } else if (strstr(tname, "ffn_down") && !strstr(tname, "exp")) {
+                    ane_name = "ffn_down";
+                }
+
+                if (ane_name) {
+                    const void * gpu_data = ane_dispatch_gpu_weight(ane_ctx, il, ane_name);
+                    size_t gpu_bytes = ane_dispatch_gpu_weight_bytes(ane_ctx, il, ane_name);
+                    if (gpu_data && gpu_bytes > 0) {
+                        // Save original pointers before substitution
+                        ane_saves.push_back({entry.orig_data, entry.nbytes, ei});
+                        entry.orig_data = const_cast<void *>(gpu_data);
+                        entry.nbytes = gpu_bytes;
+                    }
+                }
+            }
+        }
+
         upload_times[il] = prefill_upload_layer(layer_infos[il].entries, get_buf_for_layer(il), slab_bytes, il, trace_swap,
                                                 remote_weight_relay);
+
+        // Restore orig_data/nbytes after upload so prefill_restore_tensor_pointers
+        // restores model tensors to their original weight data, not ANE dispatch buffers
+        for (auto & as : ane_saves) {
+            layer_infos[il].entries[as.idx].orig_data = as.orig_data;
+            layer_infos[il].entries[as.idx].nbytes    = as.nbytes;
+        }
+
         layer_loaded[il] = true;
         if (trace_swap) {
             LLAMA_LOG_INFO("%s: [SWAP_TRACE] sync upload layer %d done @ %.2fms\n", __func__, il, elapsed_ms());
@@ -993,16 +1196,149 @@ int llama_prefill_stream(llama_context *                     ctx,
         slide_host_cache_window(il);
     };
 
+    // FP16 input buffer for ANE (reused across layers, sized for max seq_len * hidden)
+    const int ane_hidden = (int)model->hparams.n_embd;
+    const int ane_seq = batch.n_tokens;
+    std::vector<uint16_t> ane_inp_buf;
+    if (ane_active) {
+        ane_inp_buf.resize((size_t)ane_seq * ane_hidden);
+    }
+
+    // Debug: ANE_NO_MERGE=1 skips adding ANE output (isolates GPU-half correctness)
+    static const bool ane_no_merge = (getenv("ANE_NO_MERGE") != nullptr);
+    static const bool ane_validate = (getenv("ANE_VALIDATE") != nullptr);
+    // Saved normed input for layer 0 validation (only when ANE_VALIDATE=1)
+    std::vector<float> val_normed_input;
+
     auto post_layer_cb = [&](int il, int /*n_layer_total*/) {
-        // Intentionally keep post-layer callback side-effect free for overlap.
-        // Scheduling the next upload in pre_layer_cb gives the async worker
-        // the full compute window of the current layer.
-        GGML_UNUSED(il);
+        // If ANE active, wait for ANE result and add to layer output
+        if (ane_active && ane_dispatch_layer_active(ane_ctx, il)) {
+            float wait = ane_dispatch_ffn_sync(ane_ctx, il, ane_output_buf.data(),
+                                                ane_output_buf.size() * sizeof(uint16_t));
+            ane_total_wait_ms += wait;
+
+            // Add ANE output to l_out tensor in-place (unified memory).
+            // l_out is the last tensor that triggered this callback.
+            ggml_tensor * l_out = ctx->last_l_out_tensor;
+            if (l_out && l_out->data) {
+                // l_out is FP32 in the graph; ANE output is FP16.
+                // Add: l_out[i] += fp16_to_fp32(ane_output[i])
+                const int n = ane_seq * ane_hidden;
+                float * dst = (float *)l_out->data;
+                const uint16_t * src = ane_output_buf.data();
+
+                // Debug: log norms for first, middle, and last layers
+                if (il == 0 || il == n_layer / 2 || il == n_layer - 1) {
+                    double l_sum = 0, a_sum = 0;
+                    float a_max = 0;
+                    for (int i = 0; i < n; i++) {
+                        l_sum += (double)dst[i] * dst[i];
+                        float av = ggml_fp16_to_fp32(src[i]);
+                        a_sum += (double)av * av;
+                        float aabs = fabsf(av);
+                        if (aabs > a_max) a_max = aabs;
+                    }
+                    LLAMA_LOG_INFO("[ANE-DEBUG] layer %d: l_out_L2=%.4f ane_L2=%.4f ane_max=%.4f ratio=%.4f type=%s\n",
+                                  il, (float)sqrt(l_sum), (float)sqrt(a_sum), a_max,
+                                  l_sum > 0 ? (float)sqrt(a_sum / l_sum) : 0.0f,
+                                  l_out->type == GGML_TYPE_F32 ? "F32" : "other");
+                }
+
+                // Validate layer 0 ANE output vs CPU reference
+                if (ane_validate && il == 0 && !val_normed_input.empty()) {
+                    ane_dispatch_validate_layer0(ane_ctx, val_normed_input.data(),
+                                                 src, ane_seq);
+                }
+
+                if (!ane_no_merge) {
+                    for (int i = 0; i < n; i++) {
+                        dst[i] += ggml_fp16_to_fp32(src[i]);
+                    }
+                } else if (il == 0) {
+                    LLAMA_LOG_INFO("[ANE-DEBUG] ANE_NO_MERGE=1: skipping ANE output addition\n");
+                }
+            }
+        }
+    };
+
+    // ANE pre-FFN callback: fires when ffn_norm-N (= ffn_inp) tensor data is computed.
+    // The tensor contains PRE-normalization data (attention + residual).
+    // We apply RMS normalization on CPU, convert to FP16, then dispatch to ANE.
+    const float rms_eps = model->hparams.f_norm_rms_eps;
+    std::vector<float> ane_norm_buf(ane_hidden * ane_seq);  // scratch for normalized data
+
+    auto pre_ffn_cb = [&](int il, int /*n_layer_total*/, struct ggml_tensor * ffn_inp) {
+        if (!ane_active || !ane_dispatch_layer_active(ane_ctx, il)) return;
+        if (!ffn_inp || !ffn_inp->data) return;
+
+        // ffn_inp is [n_embd, seq_len] FP32, PRE-normalization.
+        // Apply RMS norm: x_norm[i] = x[i] / sqrt(mean(x^2) + eps) * weight[i]
+        const int n = ane_seq * ane_hidden;
+        const float * inp_f32 = (const float *)ffn_inp->data;
+        float * norm_f32 = ane_norm_buf.data();
+
+        // Get ffn_norm weights for this layer
+        const ggml_tensor * norm_w = model->layers[il].ffn_norm;
+        const float * w = norm_w ? (const float *)norm_w->data : nullptr;
+
+        // RMS norm per-token (each row of [seq_len, hidden])
+        for (int s = 0; s < ane_seq; s++) {
+            const float * row = inp_f32 + s * ane_hidden;
+            float * out = norm_f32 + s * ane_hidden;
+
+            // Compute RMS
+            float sum_sq = 0.0f;
+            for (int h = 0; h < ane_hidden; h++) {
+                sum_sq += row[h] * row[h];
+            }
+            const float rms = sqrtf(sum_sq / (float)ane_hidden + rms_eps);
+            const float inv_rms = 1.0f / rms;
+
+            // Normalize and scale
+            if (w) {
+                for (int h = 0; h < ane_hidden; h++) {
+                    out[h] = row[h] * inv_rms * w[h];
+                }
+            } else {
+                for (int h = 0; h < ane_hidden; h++) {
+                    out[h] = row[h] * inv_rms;
+                }
+            }
+        }
+
+        // Convert normalized data to FP16 for ANE dispatch
+        uint16_t * inp_f16 = ane_inp_buf.data();
+        for (int i = 0; i < n; i++) {
+            inp_f16[i] = ggml_fp32_to_fp16(norm_f32[i]);
+        }
+
+        // Debug: log input norms for first, middle, and last layers
+        if (il == 0 || il == n_layer / 2 || il == n_layer - 1) {
+            double raw_sum = 0, norm_sum = 0;
+            for (int i = 0; i < n; i++) {
+                raw_sum += (double)inp_f32[i] * inp_f32[i];
+                norm_sum += (double)norm_f32[i] * norm_f32[i];
+            }
+            LLAMA_LOG_INFO("[ANE-DEBUG] layer %d pre_ffn: raw_L2=%.4f normed_L2=%.4f ffn_inp_type=%s ne=[%lld,%lld]\n",
+                          il, (float)sqrt(raw_sum), (float)sqrt(norm_sum),
+                          ggml_type_name(ffn_inp->type),
+                          (long long)ffn_inp->ne[0], (long long)ffn_inp->ne[1]);
+        }
+
+        // Save normed input for layer 0 validation
+        if (ane_validate && il == 0) {
+            val_normed_input.assign(norm_f32, norm_f32 + n);
+        }
+
+        ane_dispatch_ffn_async(ane_ctx, il, inp_f16, ane_seq);
     };
 
     // Register callbacks in the context
     ctx->pre_layer_cb = pre_layer_cb;
     ctx->post_layer_cb = post_layer_cb;
+    if (ane_active) {
+        ctx->pre_ffn_cb = pre_ffn_cb;
+    }
     callbacks_registered = true;
     LLAMA_LOG_INFO("%s: [DIAG] callbacks registered, calling llama_decode...\n", __func__);
 
@@ -1037,6 +1373,7 @@ int llama_prefill_stream(llama_context *                     ctx,
         // Disable callbacks and restore tensor pointers before fallback decode.
         ctx->pre_layer_cb = nullptr;
         ctx->post_layer_cb = nullptr;
+        ctx->pre_ffn_cb = nullptr;
         callbacks_registered = false;
         prefill_restore_tensor_pointers(layer_infos);
         remap_applied = false;
@@ -1096,6 +1433,13 @@ int llama_prefill_stream(llama_context *                     ctx,
         ? (100.0f * ((float) host_cache.hits / (float) host_cache.lookups))
         : 0.0f;
     result->host_storage_wait_ms = host_cache.storage_wait_ms;
+    result->ane_active = ane_active;
+    if (ane_active) {
+        result->ane_ratio = params.ane_ratio;
+        result->ane_gpu_inter = ane_dispatch_gpu_inter_dim(ane_ctx);
+        result->ane_inter = ane_dispatch_ane_inter_dim(ane_ctx);
+        result->ane_total_wait_ms = ane_total_wait_ms;
+    }
 
     // Summary
     float upload_bw = (total_bytes / (1024.0 * 1024.0 * 1024.0)) / (total_upload_ms / 1000.0);
@@ -1107,6 +1451,11 @@ int llama_prefill_stream(llama_context *                     ctx,
     LLAMA_LOG_INFO("%s: forward pass: %.2f ms\n", __func__, compute_ms);
     LLAMA_LOG_INFO("%s: total: %d tokens, %.2f ms, %.2f tok/s\n", __func__, result->n_tokens_processed,
                    result->total_time_ms, result->total_tok_s);
+    if (ane_active) {
+        LLAMA_LOG_INFO("%s: ANE active: ratio=%.2f gpu_inter=%d ane_inter=%d total_wait=%.2fms\n",
+                       __func__, params.ane_ratio, ane_dispatch_gpu_inter_dim(ane_ctx),
+                       ane_dispatch_ane_inter_dim(ane_ctx), ane_total_wait_ms);
+    }
     if (host_cache.enabled) {
         LLAMA_LOG_INFO("%s: S3 host moving-window activity: prefetched=%d layers (%.2f MB), evicted=%d layers (%.2f MB), lookups=%d hits=%d misses=%d hit_rate=%.1f%% storage_wait_ms=%.2f advise_supported=%s\n",
                        __func__, host_cache.prefetched_layers, host_cache.prefetched_bytes / (1024.0 * 1024.0),

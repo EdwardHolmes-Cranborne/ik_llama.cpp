@@ -278,6 +278,21 @@ struct llama_context {
   std::function<void(int, int)> pre_layer_cb;
   std::function<void(int, int)> post_layer_cb;
 
+  // Per-layer callback for ANE FFN dispatch (fires when ffn_inp-N is computed)
+  // Signature: (layer_idx, n_layers, ffn_inp_tensor)
+  std::function<void(int, int, struct ggml_tensor *)> pre_ffn_cb;
+
+  // Tensor pointer for last completed l_out (set by eval callback for post_layer_cb)
+  struct ggml_tensor * last_l_out_tensor = nullptr;
+
+  // ANE GPU+ANE split prefill state and config
+  struct ane_dispatch_ctx * ane_ctx = nullptr;
+  bool ane_prefill_active = false;
+  bool prefill_ane = false;
+  float prefill_ane_ratio = 0.5f;
+  bool prefill_ane_validate = false;
+  std::string prefill_ane_cache;
+
   // Per-layer compute times (populated by build context)
   std::vector<float> last_layer_compute_times_ms;
 

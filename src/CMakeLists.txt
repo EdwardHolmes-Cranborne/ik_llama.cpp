@@ -78,6 +78,8 @@ add_library(llama
             llama-prefill-stream.cpp
             llama-ane-weights.h
             llama-ane-weights.cpp
+            llama-ane-dispatch.h
+            llama-ane-dispatch.cpp
             )
 
 target_include_directories(llama PUBLIC . ../include)
