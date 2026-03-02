@@ -39,7 +39,7 @@ int main(int argc, char ** argv) {
     }
 
     // tokenize prompt
-    auto tokens = llama_tokenize(ctx, params.prompt, true);
+    auto tokens = common_tokenize(ctx, params.prompt, true);
 
     // evaluate prompt
     llama_decode(ctx, llama_batch_get_one(tokens.data(), tokens.size(), n_past, 0));
@@ -94,7 +94,7 @@ int main(int argc, char ** argv) {
     llama_free(ctx);
 
     // make new context
-    auto * ctx2 = llama_new_context_with_model(model, llama_context_params_from_gpt_params(params));
+    auto * ctx2 = llama_init_from_model(model, common_context_params_to_llama(params));
 
     printf("\nsecond run: %s", params.prompt.c_str());
 
@@ -157,7 +157,7 @@ int main(int argc, char ** argv) {
     }
 
     // make new context
-    auto* ctx3 = llama_new_context_with_model(model, llama_context_params_from_gpt_params(params));
+    auto* ctx3 = llama_init_from_model(model, common_context_params_to_llama(params));
 
     printf("\nsingle seq run: %s", params.prompt.c_str());
 
@@ -188,8 +188,8 @@ int main(int argc, char ** argv) {
     // save seq 0 and load into seq 1
     {
         // save kv of seq 0
-        std::vector<uint8_t> seq_store(llama_state_seq_get_size(ctx3, 0));
-        const size_t ncopy = llama_state_seq_get_data(ctx3, seq_store.data(), seq_store.size(), 0);
+        std::vector<uint8_t> seq_store(llama_state_seq_get_size(ctx3, 0, 0));
+        const size_t ncopy = llama_state_seq_get_data(ctx3, seq_store.data(), seq_store.size(), 0, 0);
         if (ncopy != seq_store.size()) {
             fprintf(stderr, "\n%s : seq copy data length %zd does not match expected length %zd\n", __func__, ncopy, seq_store.size());
             llama_free(ctx3);
@@ -203,7 +203,7 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "%s : kv cache cleared\n", __func__);
 
         // restore kv into seq 1
-        const size_t nset = llama_state_seq_set_data(ctx3, seq_store.data(), seq_store.size(), 1);
+        const size_t nset = llama_state_seq_set_data(ctx3, seq_store.data(), seq_store.size(), 1, 0);
         if (nset != seq_store.size()) {
             fprintf(stderr, "\n%s : seq set data length %zd does not match expected length %zd\n", __func__, nset, seq_store.size());
             llama_free(ctx3);

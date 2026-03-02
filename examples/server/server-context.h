@@ -29,6 +29,10 @@ struct server_slot {
 
     struct slot_params params;
 
+    llama_batch batch_spec = {};
+    llama_context * ctx_dft = nullptr;
+
+    bool released = false;
     slot_state state = SLOT_STATE_IDLE;
     slot_command command = SLOT_COMMAND_NONE;
 
@@ -42,6 +46,7 @@ struct server_slot {
     int32_t n_ctx = 0;  // context size per slot
     int32_t n_past = 0;
     int32_t n_past_prompt = 0;
+    int32_t n_past_offset = 0;
     int32_t n_decoded = 0;
     int32_t n_remaining = -1;
     int32_t n_discarded_prompt = 0;
@@ -99,12 +104,13 @@ struct server_slot {
 
     void prompt_load(server_prompt_cache& prompt_cache, const server_tokens& tokens);
 
+    size_t checkpoint_pos = 0;
+    bool do_checkpoint = false;
+
     // sampling
     llama_token sampled; // in speculative mode, this is the last accepted token
     llama_tokens drafted;
 
-    struct llama_sampling_params sparams;
-    llama_sampling_context* ctx_sampling = nullptr;
     json json_schema;
 
     common_chat_format chat_format = COMMON_CHAT_FORMAT_CONTENT_ONLY;
@@ -112,6 +118,14 @@ struct server_slot {
 
     bool anthropic_thinking_block_started = false;
     bool anthropic_text_block_started = false;
+
+    bool oai_resp_thinking_block_started = false;
+    bool oai_resp_text_block_started = false;
+
+    std::string oai_resp_id;
+    std::string oai_resp_reasoning_id;
+    std::string oai_resp_message_id;
+    std::string oai_resp_fc_id;
 
     int32_t ga_i = 0;   // group-attention state
     int32_t ga_n = 1;   // group-attention factor
@@ -121,9 +135,12 @@ struct server_slot {
     mtmd_context* mctx = nullptr;
 
     // speculative decoding
-    struct llama_speculative* spec = nullptr;
-    llama_context* ctx_dft = nullptr;
-    llama_batch batch_spec = {};
+    struct common_speculative * spec = nullptr;
+    struct common_params_sampling sparams;
+    common_sampler * ctx_sampling = nullptr;
+
+    bool has_mtp = false;
+    std::vector<float> mtp_hidden_state;
 
     // speculative decoding stats
     int32_t n_draft_total = 0;      // Total draft tokens generated
@@ -151,6 +168,8 @@ struct server_slot {
 
     void add_token_string(const completion_token_output& token);
 
+    bool can_speculate() const;
+
     int get_n_draft_max() const;
 
     void release();
@@ -164,6 +183,7 @@ struct server_slot {
     size_t find_stopping_strings(const std::string& text, const size_t last_token_size, bool is_full_stop);
 
     void print_timings() const;
+
 };
 
 struct server_metrics {
@@ -337,4 +357,11 @@ struct server_context {
     // Re-aggregates all active vectors and updates the model state
     bool apply_control_vectors_internal();
 
+    void create_checkpoint(server_slot & slot);
+
+    void apply_checkpoint(server_slot & slot);
+
+    void create_checkpoint_at_interval(server_slot & slot, const gpt_params & params_base);
+
+    void release_slot_after_final_response(server_slot & slot);
 };

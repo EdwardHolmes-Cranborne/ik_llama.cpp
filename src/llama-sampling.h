@@ -25,35 +25,16 @@ struct llama_sampling {
 
 void llama_set_rng_seed_impl(struct llama_sampling *smpl, uint32_t seed);
 
-void llama_sample_softmax_impl(struct llama_sampling *smpl,
-                               llama_token_data_array *candidates);
-void llama_sample_top_k_impl(struct llama_sampling *smpl,
-                             llama_token_data_array *candidates, int32_t k,
-                             size_t min_keep);
-void llama_sample_top_p_impl(struct llama_sampling *smpl,
-                             llama_token_data_array *candidates, float p,
-                             size_t min_keep);
-void llama_sample_min_p_impl(struct llama_sampling *smpl,
-                             llama_token_data_array *candidates, float p,
-                             size_t min_keep);
-void llama_sample_tail_free_impl(struct llama_sampling *smpl,
-                                 llama_token_data_array *candidates, float z,
-                                 size_t min_keep);
-void llama_sample_typical_impl(struct llama_sampling *smpl,
-                               llama_token_data_array *candidates, float p,
-                               size_t min_keep);
-void llama_sample_entropy_impl(struct llama_sampling *smpl,
-                               llama_token_data_array *candidates,
-                               float min_temp, float max_temp,
-                               float exponent_val);
-void llama_sample_temp_impl(struct llama_sampling *smpl,
-                            llama_token_data_array *candidates, float temp);
-void llama_sample_xtc_impl(struct llama_sampling *smpl,
-                           llama_token_data_array *candidates,
-                           float probability, float threshold, size_t min_keep);
-void llama_sample_top_n_sigma_impl(struct llama_sampling *smpl,
-                                   llama_token_data_array *candidates,
-                                   float top_n_sigma);
+void llama_sample_softmax_impl  (struct llama_sampling * smpl, llama_token_data_array * candidates, bool normalize = true);
+void llama_sample_top_k_impl    (struct llama_sampling * smpl, llama_token_data_array * candidates, int32_t k, size_t min_keep);
+void llama_sample_top_p_impl    (struct llama_sampling * smpl, llama_token_data_array * candidates, float p, size_t min_keep);
+void llama_sample_min_p_impl    (struct llama_sampling * smpl, llama_token_data_array * candidates, float p, size_t min_keep);
+void llama_sample_tail_free_impl(struct llama_sampling * smpl, llama_token_data_array * candidates, float z, size_t min_keep);
+void llama_sample_typical_impl  (struct llama_sampling * smpl, llama_token_data_array * candidates, float p, size_t min_keep);
+void llama_sample_entropy_impl  (struct llama_sampling * smpl, llama_token_data_array * candidates, float min_temp, float max_temp, float exponent_val);
+void llama_sample_temp_impl     (struct llama_sampling * smpl, llama_token_data_array * candidates, float temp);
+void llama_sample_xtc_impl      (struct llama_sampling * smpl, llama_token_data_array * candidates, float probability, float threshold, size_t min_keep);
+void llama_sample_top_n_sigma_impl(struct llama_sampling * smpl, llama_token_data_array * candidates, float top_n_sigma);
 
 struct llama_sampler_dry {
   int32_t total_context_size;
@@ -99,19 +80,27 @@ struct llama_sampler_adaptive_p {
 
   // first referenced in sample_token
   std::vector<float> cum_probs; // cumulative probability distribution
+
+  // recorded states for rewinding
+  float recd_weighted_sum;
+  float recd_total_weight;
 };
 
 struct llama_sampler_adaptive_p *
 llama_init_adaptive_p_impl(int n_vocab, const float target, const float decay,
                            const bool updt_w_cur, const uint32_t seed);
 
-void llama_prep_adaptive_p_impl(struct llama_sampling *smpl,
-                                llama_token_data_array *candidates,
-                                struct llama_sampler_adaptive_p *adapt_p_ctx);
+void llama_prep_adaptive_p_impl(
+              struct llama_sampling * smpl,
+                              float * logits,
+    struct llama_sampler_adaptive_p * adapt_p_ctx);
 
-void llama_sample_adaptive_p_impl(struct llama_sampling *smpl,
-                                  llama_token_data_array *candidates,
-                                  struct llama_sampler_adaptive_p *adapt_p_ctx);
+void llama_sample_adaptive_p_impl(
+              struct llama_sampling * smpl,
+             llama_token_data_array * candidates,
+    struct llama_sampler_adaptive_p * adapt_p_ctx);
+
+void llama_review_adaptive_p_impl(llama_sampler_adaptive_p * adapt_p_ctx, const bool record, const bool rewind);
 
 void llama_sample_repetition_penalties_impl(
     struct llama_sampling *smpl, llama_token_data_array *candidates,

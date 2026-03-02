@@ -1247,7 +1247,7 @@ static bool ggml_is_view_op(enum ggml_op op) {
 #endif
 
 #ifndef GGML_SCHED_MAX_SPLITS
-#define GGML_SCHED_MAX_SPLITS 2048
+#define GGML_SCHED_MAX_SPLITS 4096
 #endif
 
 #ifndef GGML_SCHED_MAX_SPLIT_INPUTS
@@ -3137,6 +3137,16 @@ ggml_backend_t ggml_backend_sched_get_backend(ggml_backend_sched_t sched,
                                               int i) {
   GGML_ASSERT(i >= 0 && i < sched->n_backends);
   return sched->backends[i];
+}
+
+int ggml_backend_sched_get_backend_idx(ggml_backend_sched_t sched, ggml_backend_buffer_t buffer) {
+    if (!buffer || !buffer->buft) return -1;
+    if (buffer && buffer->buft) {
+        for (int i = 0; i < sched->n_backends; ++i) {
+            if (ggml_backend_get_default_buffer_type(sched->backends[i]) == buffer->buft) return i;
+        }
+    }
+    return -1;
 }
 
 size_t ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched,
