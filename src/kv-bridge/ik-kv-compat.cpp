@@ -1561,7 +1561,7 @@ ik_kv_compat_convert_result_t ik_kv_dest_introspect_from_model(
     llama_model_params model_params = llama_model_default_params();
     model_params.vocab_only = true;
 
-    struct llama_model * model = llama_load_model_from_file(model_path, model_params);
+    struct llama_model * model = llama_model_load_from_file(model_path, model_params);
     if (!model) {
         return IK_KV_COMPAT_CONVERT_ERR_DST_MISMATCH;
     }
@@ -2217,7 +2217,7 @@ ik_kv_compat_convert_result_t ik_kv_import_into_context(
         if (g_kv_bridge.config.dry_run) {
             return true;
         }
-        const size_t n_read = llama_state_seq_set_data(ctx, payload, payload_size, dest_seq_id);
+        const size_t n_read = llama_state_seq_set_data(ctx, payload, payload_size, dest_seq_id, 0);
         return n_read == payload_size;
     };
 
@@ -2349,7 +2349,7 @@ ik_kv_compat_convert_result_t ik_kv_import_into_context(
     }
 
     // Import converted state into destination sequence.
-    const size_t n_read = llama_state_seq_set_data(ctx, converted.data(), cvt.bytes_written, dest_seq_id);
+    const size_t n_read = llama_state_seq_set_data(ctx, converted.data(), cvt.bytes_written, dest_seq_id, 0);
     if (n_read != cvt.bytes_written) {
         if (try_fallback_payload_import(src_desc.payload, (size_t) src_desc.payload_size)) {
             return finalize(IK_KV_COMPAT_CONVERT_OK, IK_KV_COMPAT_REJECT_NONE);
@@ -2377,7 +2377,7 @@ ik_kv_compat_convert_result_t ik_kv_import_into_context_with_plan(
         return IK_KV_COMPAT_CONVERT_ERR_DST_MISMATCH;
     }
 
-    const size_t n_read = llama_state_seq_set_data(ctx, payload_data, payload_size, dest_seq_id);
+    const size_t n_read = llama_state_seq_set_data(ctx, payload_data, payload_size, dest_seq_id, 0);
     if (n_read != payload_size) {
         if (reject_reason) *reject_reason = IK_KV_COMPAT_REJECT_INCOMPATIBLE_PROFILE;
         return IK_KV_COMPAT_CONVERT_ERR_CONVERT;

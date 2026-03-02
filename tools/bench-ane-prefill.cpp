@@ -4,6 +4,7 @@
 // compares wall-clock time, and generates text to verify correctness.
 //
 // Usage: bench-ane-prefill -m <model.gguf> [-s seq_len] [-r ratio] [-n n_runs] [-g gen_tokens]
+//        bench-ane-prefill -m <model.gguf> --sweep [-r ratio]   (seq sweep mode)
 
 #include "llama.h"
 #include "common.h"
@@ -20,12 +21,15 @@
 
 static void print_usage(const char * prog) {
     fprintf(stderr, "Usage: %s -m <model.gguf> [-s seq_len] [-r ratio] [-n n_runs] [-c n_ctx] [-g gen_tokens]\n", prog);
+    fprintf(stderr, "       %s -m <model.gguf> --sweep [-r ratio]  (seq length sweep)\n", prog);
     fprintf(stderr, "  -m  model path (required)\n");
     fprintf(stderr, "  -s  sequence length for prefill benchmark (default: 512)\n");
     fprintf(stderr, "  -r  ANE split ratio (default: 0.5)\n");
     fprintf(stderr, "  -n  number of benchmark runs (default: 3)\n");
     fprintf(stderr, "  -c  context size (default: max(2048, seq_len*2))\n");
     fprintf(stderr, "  -g  tokens to generate in coherence test (default: 64)\n");
+    fprintf(stderr, "  --sweep  seq length sweep: test 128,512,1024,2048,4096,8192,16384\n");
+    fprintf(stderr, "  --no-coherence  skip coherence test (faster for sweep)\n");
 }
 
 // Greedy-sample the top token from logits
@@ -149,6 +153,8 @@ int main(int argc, char ** argv) {
     int n_runs = 3;
     int n_ctx = 0;
     int n_gen = 64;
+    bool sweep_mode = false;
+    bool do_coherence = true;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
@@ -163,6 +169,10 @@ int main(int argc, char ** argv) {
             n_ctx = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-g") == 0 && i + 1 < argc) {
             n_gen = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--sweep") == 0) {
+            sweep_mode = true;
+        } else if (strcmp(argv[i], "--no-coherence") == 0) {
+            do_coherence = false;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
             return 0;
@@ -178,12 +188,16 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    if (n_ctx == 0) n_ctx = std::max(2048, seq_len * 2);
+    if (n_ctx == 0) n_ctx = sweep_mode ? 65536 : std::max(2048, seq_len * 2);
 
     fprintf(stderr, "=== ANE Prefill Benchmark ===\n");
     fprintf(stderr, "Model: %s\n", model_path);
-    fprintf(stderr, "Seq length: %d, Context: %d, Ratio: %.2f, Runs: %d, Gen: %d\n\n",
-            seq_len, n_ctx, ratio, n_runs, n_gen);
+    if (sweep_mode) {
+        fprintf(stderr, "Mode: seq length sweep, Ratio: %.2f, Context: %d\n\n", ratio, n_ctx);
+    } else {
+        fprintf(stderr, "Seq length: %d, Context: %d, Ratio: %.2f, Runs: %d, Gen: %d\n\n",
+                seq_len, n_ctx, ratio, n_runs, n_gen);
+    }
 
     llama_backend_init();
 
@@ -204,54 +218,143 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "Model: n_layer=%d, n_embd=%d, n_vocab=%d\n", n_layer, n_embd, n_vocab);
 
     // ================================================================
+    // Sweep mode: test multiple seq lengths with one model load
+    // ================================================================
+    if (sweep_mode) {
+        const int sweep_seqs[] = {128, 512, 1024, 2048, 4096, 8192, 16384};
+        const int n_sweep = sizeof(sweep_seqs) / sizeof(sweep_seqs[0]);
+
+        // Helper lambda: run one prefill, return time in ms
+        auto run_prefill_sweep = [&](int sl, bool ane_enabled, float ane_ratio) -> float {
+            int ctx_size = std::max(n_ctx, sl * 2);
+            llama_context_params cparams = llama_context_default_params();
+            cparams.n_ctx = ctx_size;
+            cparams.n_batch = sl;
+            cparams.n_ubatch = sl;
+            cparams.prefill_streaming = true;
+            cparams.prefill_telemetry = false;
+            cparams.prefill_ane = ane_enabled;
+            cparams.prefill_ane_ratio = ane_ratio;
+            cparams.prefill_ane_cache = "/tmp/ane-bench-cache";
+
+            llama_context * ctx = llama_init_from_model(model, cparams);
+            if (!ctx) return -1.0f;
+
+            std::vector<llama_token> toks(sl);
+            for (int i = 0; i < sl; i++) toks[i] = (i % (n_vocab - 1)) + 1;
+
+            llama_batch batch = llama_batch_init(sl, 0, 1);
+            for (int i = 0; i < sl; i++) {
+                common_batch_add(batch, toks[i], i, {0}, i == sl - 1);
+            }
+
+            // Warmup (compiles kernels if needed)
+            llama_decode(ctx, batch);
+            llama_kv_cache_clear(ctx);
+
+            // Timed run
+            auto t0 = std::chrono::high_resolution_clock::now();
+            int ret = llama_decode(ctx, batch);
+            auto t1 = std::chrono::high_resolution_clock::now();
+            float ms = std::chrono::duration<float, std::milli>(t1 - t0).count();
+
+            if (ret != 0) {
+                fprintf(stderr, "  WARNING: llama_decode returned %d for seq=%d\n", ret, sl);
+            }
+
+            llama_batch_free(batch);
+            llama_free(ctx);
+            return ms;
+        };
+
+        fprintf(stderr, "\n=== Seq Length Sweep (ratio=%.2f) ===\n", ratio);
+        fprintf(stderr, "%8s  %10s  %10s  %10s  %10s  %8s\n",
+                "seq_len", "GPU(ms)", "GPU(tok/s)", "ANE(ms)", "ANE(tok/s)", "speedup");
+        fprintf(stderr, "%8s  %10s  %10s  %10s  %10s  %8s\n",
+                "-------", "--------", "---------", "-------", "---------", "-------");
+
+        for (int si = 0; si < n_sweep; si++) {
+            int sl = sweep_seqs[si];
+            if (sl * 2 > n_ctx) {
+                fprintf(stderr, "%8d  skipped (need n_ctx >= %d, have %d)\n", sl, sl * 2, n_ctx);
+                continue;
+            }
+
+            fprintf(stderr, "Testing seq=%d...\n", sl);
+
+            float gpu_ms = run_prefill_sweep(sl, false, 0.0f);
+            float ane_ms = run_prefill_sweep(sl, true, ratio);
+
+            if (gpu_ms < 0 || ane_ms < 0) {
+                fprintf(stderr, "%8d  FAILED\n", sl);
+                continue;
+            }
+
+            float gpu_tps = sl / (gpu_ms / 1000.0f);
+            float ane_tps = sl / (ane_ms / 1000.0f);
+            float spdup = gpu_ms / ane_ms;
+
+            fprintf(stderr, "%8d  %10.1f  %10.1f  %10.1f  %10.1f  %7.2fx %s\n",
+                    sl, gpu_ms, gpu_tps, ane_ms, ane_tps, spdup,
+                    spdup > 1.0f ? "(FASTER)" : "(slower)");
+        }
+
+        fprintf(stderr, "\n=== Sweep complete ===\n");
+        llama_free_model(model);
+        llama_backend_free();
+        return 0;
+    }
+
+    // ================================================================
     // Part 1: Text Generation Coherence Test
     // ================================================================
-    fprintf(stderr, "\n=== Text Generation Coherence Test ===\n");
+    bool text_match = true;  // default to true when skipping
 
-    const char * test_prompt = "What is the capital of France? Answer in one sentence:";
-    fprintf(stderr, "Prompt: \"%s\"\n\n", test_prompt);
+    if (do_coherence) {
+        fprintf(stderr, "\n=== Text Generation Coherence Test ===\n");
 
-    // Tokenize the prompt
-    std::vector<llama_token> prompt_tokens(strlen(test_prompt) + 16);
-    int n_prompt_tokens = llama_tokenize(model, test_prompt, strlen(test_prompt),
-                                          prompt_tokens.data(), (int)prompt_tokens.size(),
-                                          true, true);
-    if (n_prompt_tokens < 0) {
-        fprintf(stderr, "FAIL: tokenization failed\n");
-        return 1;
+        const char * test_prompt = "What is the capital of France? Answer in one sentence:";
+        fprintf(stderr, "Prompt: \"%s\"\n\n", test_prompt);
+
+        std::vector<llama_token> prompt_tokens(strlen(test_prompt) + 16);
+        int n_prompt_tokens = llama_tokenize(model, test_prompt, strlen(test_prompt),
+                                              prompt_tokens.data(), (int)prompt_tokens.size(),
+                                              true, true);
+        if (n_prompt_tokens < 0) {
+            fprintf(stderr, "FAIL: tokenization failed\n");
+            return 1;
+        }
+        prompt_tokens.resize(n_prompt_tokens);
+        fprintf(stderr, "Prompt tokens: %d\n", n_prompt_tokens);
+
+        int gen_ctx = std::max(n_ctx, n_prompt_tokens + n_gen + 16);
+
+        fprintf(stderr, "\n--- GPU-only generation ---\n");
+        gen_result gpu_gen = run_generation(model, prompt_tokens, gen_ctx, n_gen, false, 0.0f);
+        fprintf(stderr, "  Prefill: %.1f ms (%d tokens, %.1f tok/s)\n",
+                gpu_gen.prefill_ms, n_prompt_tokens,
+                gpu_gen.prefill_ms > 0 ? n_prompt_tokens / (gpu_gen.prefill_ms / 1000.0f) : 0.0f);
+        fprintf(stderr, "  Output: \"%s\"\n", gpu_gen.text.c_str());
+
+        fprintf(stderr, "\n--- GPU+ANE generation ---\n");
+        gen_result ane_gen = run_generation(model, prompt_tokens, gen_ctx, n_gen, true, ratio);
+        fprintf(stderr, "  Prefill: %.1f ms (%d tokens, %.1f tok/s)\n",
+                ane_gen.prefill_ms, n_prompt_tokens,
+                ane_gen.prefill_ms > 0 ? n_prompt_tokens / (ane_gen.prefill_ms / 1000.0f) : 0.0f);
+        fprintf(stderr, "  Output: \"%s\"\n", ane_gen.text.c_str());
+
+        bool text_exact = (gpu_gen.text == ane_gen.text);
+        bool gpu_has_answer = !gpu_gen.text.empty() && gpu_gen.text.find("Paris") != std::string::npos;
+        bool ane_has_answer = !ane_gen.text.empty() && ane_gen.text.find("Paris") != std::string::npos;
+        text_match = gpu_has_answer && ane_has_answer;
+
+        fprintf(stderr, "\n  Exact match: %s\n", text_exact ? "YES" : "NO (expected with FP16 split)");
+        fprintf(stderr, "  GPU  answer correct: %s\n", gpu_has_answer ? "YES (contains 'Paris')" : "NO");
+        fprintf(stderr, "  ANE  answer correct: %s\n", ane_has_answer ? "YES (contains 'Paris')" : "NO");
+        fprintf(stderr, "  Coherence: %s\n", text_match ? "PASS — both produce correct answers" : "FAIL");
+    } else {
+        fprintf(stderr, "\n=== Coherence test skipped (--no-coherence) ===\n");
     }
-    prompt_tokens.resize(n_prompt_tokens);
-    fprintf(stderr, "Prompt tokens: %d\n", n_prompt_tokens);
-
-    int gen_ctx = std::max(n_ctx, n_prompt_tokens + n_gen + 16);
-
-    // GPU-only generation
-    fprintf(stderr, "\n--- GPU-only generation ---\n");
-    gen_result gpu_gen = run_generation(model, prompt_tokens, gen_ctx, n_gen, false, 0.0f);
-    fprintf(stderr, "  Prefill: %.1f ms (%d tokens, %.1f tok/s)\n",
-            gpu_gen.prefill_ms, n_prompt_tokens,
-            gpu_gen.prefill_ms > 0 ? n_prompt_tokens / (gpu_gen.prefill_ms / 1000.0f) : 0.0f);
-    fprintf(stderr, "  Output: \"%s\"\n", gpu_gen.text.c_str());
-
-    // GPU+ANE generation
-    fprintf(stderr, "\n--- GPU+ANE generation ---\n");
-    gen_result ane_gen = run_generation(model, prompt_tokens, gen_ctx, n_gen, true, ratio);
-    fprintf(stderr, "  Prefill: %.1f ms (%d tokens, %.1f tok/s)\n",
-            ane_gen.prefill_ms, n_prompt_tokens,
-            ane_gen.prefill_ms > 0 ? n_prompt_tokens / (ane_gen.prefill_ms / 1000.0f) : 0.0f);
-    fprintf(stderr, "  Output: \"%s\"\n", ane_gen.text.c_str());
-
-    // Compare outputs: exact match is unlikely due to FP16 weight differences,
-    // so we check that both are non-empty and contain the expected answer.
-    bool text_exact = (gpu_gen.text == ane_gen.text);
-    bool gpu_has_answer = !gpu_gen.text.empty() && gpu_gen.text.find("Paris") != std::string::npos;
-    bool ane_has_answer = !ane_gen.text.empty() && ane_gen.text.find("Paris") != std::string::npos;
-    bool text_match = gpu_has_answer && ane_has_answer;
-
-    fprintf(stderr, "\n  Exact match: %s\n", text_exact ? "YES" : "NO (expected with FP16 split)");
-    fprintf(stderr, "  GPU  answer correct: %s\n", gpu_has_answer ? "YES (contains 'Paris')" : "NO");
-    fprintf(stderr, "  ANE  answer correct: %s\n", ane_has_answer ? "YES (contains 'Paris')" : "NO");
-    fprintf(stderr, "  Coherence: %s\n", text_match ? "PASS — both produce correct answers" : "FAIL");
 
     // ================================================================
     // Part 2: Prefill Speed Benchmark

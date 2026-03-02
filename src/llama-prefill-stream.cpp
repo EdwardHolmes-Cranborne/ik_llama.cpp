@@ -898,37 +898,50 @@ int llama_prefill_stream(llama_context *                     ctx,
 
     if (ane_active) {
         const int gpu_inter = ane_dispatch_gpu_inter_dim(ane_ctx);
+
         for (int il = 0; il < n_layer; il++) {
             if (!ane_dispatch_layer_active(ane_ctx, il)) continue;
             const llama_layer & layer = model->layers[il];
 
-            auto save_and_modify = [&](ggml_tensor * t, bool is_down) {
+            auto save_and_modify = [&](ggml_tensor * t, bool is_down, const char * tname) {
                 if (!t) return;
                 ffn_shape_save s;
                 s.tensor = t;
                 s.orig_type = t->type;
                 for (int d = 0; d < 4; d++) { s.orig_ne[d] = t->ne[d]; s.orig_nb[d] = t->nb[d]; }
 
-                // gate/up: [hidden, inter] → [hidden, gpu_inter], type→FP16
-                // down:    [inter, hidden] → [gpu_inter, hidden], type→FP16
+                // gate/up: [hidden, inter] → [hidden, gpu_inter]
+                // down:    [inter, hidden] → [gpu_inter, hidden]
                 if (is_down) {
-                    t->ne[0] = gpu_inter;  // reduce first dim (was full_inter)
+                    t->ne[0] = gpu_inter;
                 } else {
-                    t->ne[1] = gpu_inter;  // reduce second dim (was full_inter)
+                    t->ne[1] = gpu_inter;
                 }
-                t->type = GGML_TYPE_F16;
-                // Recompute strides for FP16
-                t->nb[0] = ggml_type_size(GGML_TYPE_F16);
-                t->nb[1] = t->nb[0] * t->ne[0];
+
+                // Per-tensor type from ANE dispatch (native quant or FP16 fallback)
+                const ggml_type tw = (ggml_type)ane_dispatch_gpu_weight_type(ane_ctx, il, tname);
+                t->type = tw;
+
+                // Recompute strides based on the per-tensor GPU-half type
+                const int64_t blk = ggml_blck_size(tw);
+                if (blk > 1) {
+                    // Quantized type: nb[0] = type_size (per block), nb[1] = nb[0] * (ne[0]/blk)
+                    t->nb[0] = ggml_type_size(tw);
+                    t->nb[1] = t->nb[0] * (t->ne[0] / blk);
+                } else {
+                    // Non-quantized (FP16/FP32): nb[0] = type_size, nb[1] = nb[0] * ne[0]
+                    t->nb[0] = ggml_type_size(tw);
+                    t->nb[1] = t->nb[0] * t->ne[0];
+                }
                 t->nb[2] = t->nb[1] * t->ne[1];
                 t->nb[3] = t->nb[2] * t->ne[2];
 
                 ffn_saves.push_back(s);
             };
 
-            save_and_modify(layer.ffn_gate, false);
-            save_and_modify(layer.ffn_up,   false);
-            save_and_modify(layer.ffn_down, true);
+            save_and_modify(layer.ffn_gate, false, "ffn_gate");
+            save_and_modify(layer.ffn_up,   false, "ffn_up");
+            save_and_modify(layer.ffn_down, true,  "ffn_down");
         }
         LLAMA_LOG_INFO("%s: [ANE] modified %zu FFN tensor shapes (gpu_inter=%d)\n",
                        __func__, ffn_saves.size(), gpu_inter);
@@ -939,7 +952,6 @@ int llama_prefill_stream(llama_context *                     ctx,
             size_t layer_bytes = 0;
             for (auto & entry : layer_infos[il].entries) {
                 const char * tname = entry.tensor->name;
-                // Check if this is a modified FFN tensor (not MoE expert, not ffn_gate_inp)
                 bool is_modified_ffn = false;
                 if (ane_dispatch_layer_active(ane_ctx, il)) {
                     if ((strstr(tname, "ffn_gate") && !strstr(tname, "inp") && !strstr(tname, "exp")) ||
@@ -949,7 +961,7 @@ int llama_prefill_stream(llama_context *                     ctx,
                     }
                 }
                 if (is_modified_ffn) {
-                    entry.nbytes = ggml_nbytes(entry.tensor);  // tensor was modified to FP16 reduced dims
+                    entry.nbytes = ggml_nbytes(entry.tensor);
                 }
                 layer_bytes += entry.nbytes;
             }
@@ -957,9 +969,9 @@ int llama_prefill_stream(llama_context *                     ctx,
             if (layer_bytes > new_max_layer_bytes) new_max_layer_bytes = layer_bytes;
         }
 
-        // If FP16 weights are larger than original quantized, reallocate GPU buffers
-        if (new_max_layer_bytes > max_layer_bytes) {
-            LLAMA_LOG_INFO("%s: [ANE] FP16 GPU-half requires larger buffers: %.2f MB -> %.2f MB\n",
+        // Reallocate GPU buffers if modified layer size differs from original
+        if (new_max_layer_bytes != max_layer_bytes) {
+            LLAMA_LOG_INFO("%s: [ANE] GPU-half requires buffer resize: %.2f MB -> %.2f MB\n",
                            __func__, max_layer_bytes / (1024.0 * 1024.0),
                            new_max_layer_bytes / (1024.0 * 1024.0));
             ggml_backend_buffer_free(gpu_buf_a);
@@ -968,7 +980,7 @@ int llama_prefill_stream(llama_context *                     ctx,
             gpu_buf_b = nullptr;
             max_layer_bytes = new_max_layer_bytes;
             if (!prefill_allocate_gpu_buffers(gpu_backend, max_layer_bytes, &gpu_buf_a, &gpu_buf_b)) {
-                LLAMA_LOG_ERROR("%s: failed to reallocate GPU buffers for ANE FP16\n", __func__);
+                LLAMA_LOG_ERROR("%s: failed to reallocate GPU buffers for ANE\n", __func__);
                 return -1;
             }
         }

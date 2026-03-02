@@ -86,6 +86,11 @@ size_t ane_dispatch_gpu_weight_bytes(
     int il,
     const char * tensor_name);
 
+// Get the ggml_type of a GPU-half weight tensor.
+// tensor_name: "ffn_gate", "ffn_up", or "ffn_down"
+// Returns original quant type (zero-copy) or GGML_TYPE_F16 (fallback).
+int ane_dispatch_gpu_weight_type(ane_dispatch_ctx_t ctx, int il, const char * tensor_name);
+
 // Check whether a layer should use ANE split (false for MoE layers).
 bool ane_dispatch_layer_active(ane_dispatch_ctx_t ctx, int il);
 

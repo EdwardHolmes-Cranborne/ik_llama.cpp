@@ -48,13 +48,19 @@ struct ane_layer_state {
     // Whether this layer uses ANE split (false for MoE, skip layers, etc.)
     bool active = false;
 
-    // GPU-half FP16 weights (pre-computed during compile)
-    void *  gpu_gate_f16 = nullptr;  // [gpu_inter, hidden] FP16
+    // GPU-half weights (may be original quant format or FP16 fallback)
+    void *  gpu_gate_data = nullptr;
     size_t  gpu_gate_bytes = 0;
-    void *  gpu_up_f16   = nullptr;  // [gpu_inter, hidden] FP16
+    bool    gpu_gate_owned = false;  // if true, we allocated it (must free)
+    void *  gpu_up_data   = nullptr;
     size_t  gpu_up_bytes = 0;
-    void *  gpu_down_f16 = nullptr;  // [hidden, gpu_inter] FP16
+    bool    gpu_up_owned = false;
+    void *  gpu_down_data = nullptr;
     size_t  gpu_down_bytes = 0;
+    bool    gpu_down_owned = false;
+    ggml_type gpu_gate_type = GGML_TYPE_F16;  // per-tensor quant type of GPU-half weights
+    ggml_type gpu_up_type   = GGML_TYPE_F16;
+    ggml_type gpu_down_type = GGML_TYPE_F16;
 
     // Async dispatch state
 #ifdef __APPLE__
@@ -153,22 +159,28 @@ ane_dispatch_ctx_t ane_dispatch_init(
     ctx->full_inter_dim = (int)hparams->n_ff_arr[0];
     ctx->split_ratio = split_ratio;
 
-    // Compute split dimensions (round ANE portion down to multiple of 16 for ANE alignment)
+    // Compute split dimensions (round ANE portion down to multiple of 32 for quant block alignment)
+    // 32 covers Q8_0, Q4_0, Q5_0, Q5_1 block sizes. K-quant types (blk=256) may need
+    // FP16 fallback if dimensions don't align — handled in compile_kernels().
     int ane_raw = (int)(ctx->full_inter_dim * split_ratio);
-    ctx->ane_inter_dim = (ane_raw / 16) * 16;
-    if (ctx->ane_inter_dim < 16) ctx->ane_inter_dim = 16;
+    ctx->ane_inter_dim = (ane_raw / 32) * 32;
+    if (ctx->ane_inter_dim < 32) ctx->ane_inter_dim = 32;
 
-    // Cap ane_inter_dim to keep per-layer CoreML model weight size under ~150MB.
+    // Cap ane_inter_dim to keep per-layer CoreML model weight size manageable.
     // Total baked weights: 3 * ane_inter * hidden * sizeof(FP16) = 6 * ane_inter * hidden.
-    // Limit: 150 * 1024 * 1024 bytes → ane_inter_max = 150MB / (6 * hidden)
-    const int64_t max_model_bytes = 150LL * 1024 * 1024;
+    // Default limit: 150MB. Override with ANE_MAX_MODEL_MB env var.
+    int64_t max_model_mb = 150;
+    const char * env_max = getenv("ANE_MAX_MODEL_MB");
+    if (env_max) max_model_mb = atoll(env_max);
+    const int64_t max_model_bytes = max_model_mb * 1024LL * 1024;
     int ane_inter_max = (int)(max_model_bytes / (6LL * ctx->hidden_dim));
-    ane_inter_max = (ane_inter_max / 16) * 16;  // round down to multiple of 16
-    if (ane_inter_max < 16) ane_inter_max = 16;
+    ane_inter_max = (ane_inter_max / 32) * 32;  // round down to multiple of 32
+    if (ane_inter_max < 32) ane_inter_max = 32;
 
     if (ctx->ane_inter_dim > ane_inter_max) {
-        fprintf(stderr, "[ANE-dispatch] auto-capping ane_inter from %d to %d (model weight limit ~150MB)\n",
-                ctx->ane_inter_dim, ane_inter_max);
+        int64_t wanted_bytes = 6LL * ctx->ane_inter_dim * ctx->hidden_dim;
+        fprintf(stderr, "[ANE-dispatch] auto-capping ane_inter from %d to %d (would need %lldMB, limit %lldMB, set ANE_MAX_MODEL_MB to raise)\n",
+                ctx->ane_inter_dim, ane_inter_max, wanted_bytes / (1024*1024), max_model_mb);
         ctx->ane_inter_dim = ane_inter_max;
     }
 
@@ -314,29 +326,75 @@ bool ane_dispatch_compile_kernels(
             continue;
         }
 
-        // --- Pre-compute GPU-half FP16 weights ---
+        // --- Prepare GPU-half weights (per-tensor type support) ---
+        // gate/up: split along ne[1] (rows) → always zero-copy in native format
+        // down:    split along ne[0] (columns) → needs block alignment or FP16 fallback
+        const ggml_type gate_type = layer.ffn_gate->type;
+        const ggml_type up_type   = layer.ffn_up->type;
+        const ggml_type down_type = layer.ffn_down->type;
 
-        // gate GPU half: first gpu_inter rows → [gpu_inter, hidden] FP16
-        ls.gpu_gate_bytes = (size_t)gpu_inter * hidden * sizeof(ggml_fp16_t);
-        ls.gpu_gate_f16 = malloc(ls.gpu_gate_bytes);
-        ane_convert_f32_to_fp16(gate_full, ls.gpu_gate_f16, (int64_t)gpu_inter * hidden);
-
-        // up GPU half: first gpu_inter rows → [gpu_inter, hidden] FP16
-        ls.gpu_up_bytes = (size_t)gpu_inter * hidden * sizeof(ggml_fp16_t);
-        ls.gpu_up_f16 = malloc(ls.gpu_up_bytes);
-        ane_convert_f32_to_fp16(up_full, ls.gpu_up_f16, (int64_t)gpu_inter * hidden);
-
-        // down GPU half: first gpu_inter columns → [hidden, gpu_inter] FP16
-        float * gpu_down_f32 = (float *)malloc((size_t)hidden * gpu_inter * sizeof(float));
-        for (int r = 0; r < hidden; r++) {
-            memcpy(gpu_down_f32 + (size_t)r * gpu_inter,
-                   down_full + (size_t)r * ctx->full_inter_dim,
-                   gpu_inter * sizeof(float));
+        if (il == 0) {
+            fprintf(stderr, "[ANE-dispatch] layer 0: gate=%s ne=[%lld,%lld] up=%s down=%s\n",
+                    ggml_type_name(gate_type),
+                    (long long)layer.ffn_gate->ne[0], (long long)layer.ffn_gate->ne[1],
+                    ggml_type_name(up_type), ggml_type_name(down_type));
         }
-        ls.gpu_down_bytes = (size_t)hidden * gpu_inter * sizeof(ggml_fp16_t);
-        ls.gpu_down_f16 = malloc(ls.gpu_down_bytes);
-        ane_convert_f32_to_fp16(gpu_down_f32, ls.gpu_down_f16, (int64_t)hidden * gpu_inter);
-        free(gpu_down_f32);
+
+        // gate: borrow first gpu_inter rows (zero-copy, any type)
+        ls.gpu_gate_type  = gate_type;
+        ls.gpu_gate_bytes = (size_t)layer.ffn_gate->nb[1] * gpu_inter;
+        ls.gpu_gate_data  = layer.ffn_gate->data;
+        ls.gpu_gate_owned = false;
+
+        // up: borrow first gpu_inter rows (zero-copy, any type)
+        ls.gpu_up_type  = up_type;
+        ls.gpu_up_bytes = (size_t)layer.ffn_up->nb[1] * gpu_inter;
+        ls.gpu_up_data  = layer.ffn_up->data;
+        ls.gpu_up_owned = false;
+
+        // down: column split — check block alignment
+        const int64_t down_blk = ggml_blck_size(down_type);
+        const bool down_block_ok = (down_blk > 0) && (gpu_inter % down_blk == 0);
+
+        if (down_block_ok) {
+            // Keep native format: copy first gpu_inter/blk blocks per row
+            ls.gpu_down_type = down_type;
+            const size_t type_sz = ggml_type_size(down_type);
+            const size_t row_blocks_gpu  = (size_t)(gpu_inter / down_blk);
+            const size_t down_row_bytes_gpu  = type_sz * row_blocks_gpu;
+            const size_t down_row_bytes_full = (size_t)layer.ffn_down->nb[1];
+            ls.gpu_down_bytes = down_row_bytes_gpu * hidden;
+            ls.gpu_down_data  = malloc(ls.gpu_down_bytes);
+            ls.gpu_down_owned = true;
+            const uint8_t * down_src = (const uint8_t *)layer.ffn_down->data;
+            uint8_t * down_dst = (uint8_t *)ls.gpu_down_data;
+            for (int r = 0; r < hidden; r++) {
+                memcpy(down_dst + (size_t)r * down_row_bytes_gpu,
+                       down_src + (size_t)r * down_row_bytes_full,
+                       down_row_bytes_gpu);
+            }
+        } else {
+            // FP16 fallback for down only (block misalignment)
+            ls.gpu_down_type = GGML_TYPE_F16;
+            float * gpu_down_f32 = (float *)malloc((size_t)hidden * gpu_inter * sizeof(float));
+            for (int r = 0; r < hidden; r++) {
+                memcpy(gpu_down_f32 + (size_t)r * gpu_inter,
+                       down_full + (size_t)r * ctx->full_inter_dim,
+                       gpu_inter * sizeof(float));
+            }
+            ls.gpu_down_bytes = (size_t)hidden * gpu_inter * sizeof(ggml_fp16_t);
+            ls.gpu_down_data  = malloc(ls.gpu_down_bytes);
+            ls.gpu_down_owned = true;
+            ane_convert_f32_to_fp16(gpu_down_f32, ls.gpu_down_data, (int64_t)hidden * gpu_inter);
+            free(gpu_down_f32);
+        }
+
+        if (il == 0) {
+            fprintf(stderr, "[ANE-dispatch] GPU-half: gate=%s(borrow) up=%s(borrow) down=%s(%s)\n",
+                    ggml_type_name(gate_type), ggml_type_name(up_type),
+                    ggml_type_name(ls.gpu_down_type),
+                    down_block_ok ? "block-copy" : "FP16-fallback");
+        }
 
         free(gate_full); free(up_full); free(down_full);
 
@@ -479,9 +537,9 @@ const void * ane_dispatch_gpu_weight(
     const auto & ls = ctx->layers[il];
     if (!ls.active) return nullptr;
 
-    if (strcmp(tensor_name, "ffn_gate") == 0) return ls.gpu_gate_f16;
-    if (strcmp(tensor_name, "ffn_up")   == 0) return ls.gpu_up_f16;
-    if (strcmp(tensor_name, "ffn_down") == 0) return ls.gpu_down_f16;
+    if (strcmp(tensor_name, "ffn_gate") == 0) return ls.gpu_gate_data;
+    if (strcmp(tensor_name, "ffn_up")   == 0) return ls.gpu_up_data;
+    if (strcmp(tensor_name, "ffn_down") == 0) return ls.gpu_down_data;
     return nullptr;
 }
 
@@ -498,6 +556,17 @@ size_t ane_dispatch_gpu_weight_bytes(
     if (strcmp(tensor_name, "ffn_up")   == 0) return ls.gpu_up_bytes;
     if (strcmp(tensor_name, "ffn_down") == 0) return ls.gpu_down_bytes;
     return 0;
+}
+
+int ane_dispatch_gpu_weight_type(ane_dispatch_ctx_t ctx, int il, const char * tensor_name) {
+    if (!ctx || il < 0 || il >= ctx->n_layers || !tensor_name) return (int)GGML_TYPE_F16;
+    const auto & ls = ctx->layers[il];
+    if (!ls.active) return (int)GGML_TYPE_F16;
+
+    if (strcmp(tensor_name, "ffn_gate") == 0) return (int)ls.gpu_gate_type;
+    if (strcmp(tensor_name, "ffn_up")   == 0) return (int)ls.gpu_up_type;
+    if (strcmp(tensor_name, "ffn_down") == 0) return (int)ls.gpu_down_type;
+    return (int)GGML_TYPE_F16;
 }
 
 // ---------------------------------------------------------------------------
@@ -613,17 +682,17 @@ void ane_dispatch_free(ane_dispatch_ctx_t ctx) {
             ggml_ane_free(ls.kernel);
             ls.kernel = nullptr;
         }
-        free(ls.gpu_gate_f16);
-        free(ls.gpu_up_f16);
-        free(ls.gpu_down_f16);
+        if (ls.gpu_gate_owned) free(ls.gpu_gate_data);
+        if (ls.gpu_up_owned)   free(ls.gpu_up_data);
+        if (ls.gpu_down_owned) free(ls.gpu_down_data);
         free(ls.inp_transposed);
         free(ls.out_transposed);
         free(ls.val_gate);
         free(ls.val_up);
         free(ls.val_down);
-        ls.gpu_gate_f16 = nullptr;
-        ls.gpu_up_f16   = nullptr;
-        ls.gpu_down_f16 = nullptr;
+        ls.gpu_gate_data = nullptr;
+        ls.gpu_up_data   = nullptr;
+        ls.gpu_down_data = nullptr;
         ls.inp_transposed = nullptr;
         ls.out_transposed = nullptr;
         ls.val_gate = nullptr;
