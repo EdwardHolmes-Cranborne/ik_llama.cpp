@@ -156,6 +156,7 @@ option(GGML_VULKAN_NO_COOPMAT2              "ggml: don't use Vulkan coopmat2 eve
 option(GGML_VULKAN_NO_BF16                  "ggml: don't use Vulkan bf16 even if supported"          OFF)
 option(GGML_VULKAN_NO_INT_DOT               "ggml: don't use Vulkan integer dot even if supported"   OFF)
 option(GGML_KOMPUTE                         "ggml: use Kompute"                               OFF)
+option(GGML_ANE                             "ggml: use Apple Neural Engine"                   OFF)
 option(GGML_METAL                           "ggml: use Metal"                                 ${GGML_METAL_DEFAULT})
 option(GGML_METAL_NDEBUG                    "ggml: disable Metal debugging"                   OFF)
 option(GGML_METAL_SHADER_DEBUG              "ggml: compile Metal with -fno-fast-math"         OFF)
@@ -229,6 +230,7 @@ set(GGML_PUBLIC_HEADERS
     include/ggml-rpc.h
     include/ggml-rdma.h
     include/ggml-sycl.h
+    include/ggml-ane.h
     include/ggml-vulkan.h)
 
 set_target_properties(ggml PROPERTIES PUBLIC_HEADER "${GGML_PUBLIC_HEADERS}")

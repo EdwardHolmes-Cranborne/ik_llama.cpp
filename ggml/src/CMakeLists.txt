@@ -736,6 +736,17 @@ if (GGML_RDMA)
     endif()
 endif()
 
+# Apple Neural Engine backend — built as separate static lib to avoid
+# polluting ggml-metal.m compilation with ObjC++ language settings
+if (GGML_ANE AND APPLE)
+    message(STATUS "ANE backend enabled (Apple Neural Engine)")
+    list(APPEND GGML_CDEF_PUBLIC GGML_USE_ANE)
+    # The actual ggml-ane library is added after the ggml target (see below)
+elseif (GGML_ANE AND NOT APPLE)
+    message(WARNING "GGML_ANE requires Apple platform, disabling")
+    set(GGML_ANE OFF)
+endif()
+
 function(detect_host_compiler)
     if (CMAKE_HOST_SYSTEM_NAME STREQUAL "Windows")
         find_program(HOST_C_COMPILER NAMES cl gcc clang NO_CMAKE_FIND_ROOT_PATH)
@@ -1644,4 +1655,30 @@ endif()
 if (BUILD_SHARED_LIBS)
     set_target_properties(ggml PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_compile_definitions(ggml PRIVATE GGML_SHARED GGML_BUILD)
+endif()
+
+# Apple Neural Engine — separate ObjC++ static library linked into ggml
+# We enable OBJCXX *after* the ggml target is defined, and force ggml-metal.m
+# to remain plain ObjC so that enable_language(OBJCXX) doesn't break it.
+if (GGML_ANE AND APPLE)
+    # Force ggml-metal.m to compile as ObjC (not ObjC++) since
+    # the project now declares OBJCXX which could affect .m files
+    set_source_files_properties(ggml-metal.m PROPERTIES LANGUAGE OBJC)
+
+    add_library(ggml-ane STATIC ggml-ane.mm ../include/ggml-ane.h)
+    target_include_directories(ggml-ane PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+    set_target_properties(ggml-ane PROPERTIES
+        LINKER_LANGUAGE CXX
+    )
+    target_compile_options(ggml-ane PRIVATE -fno-objc-arc -std=c++17)
+    target_link_libraries(ggml-ane PRIVATE
+        "-framework Foundation"
+        "-framework CoreML"
+        "-framework IOSurface"
+        "-framework Accelerate"
+        "-framework Metal"
+        "-ldl"
+        "-lobjc"
+    )
+    target_link_libraries(ggml PUBLIC ggml-ane)
 endif()

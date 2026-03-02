@@ -74,6 +74,8 @@ add_library(llama
             llama-decode-handoff.cpp
             llama-prefill-stream.h
             llama-prefill-stream.cpp
+            llama-ane-weights.h
+            llama-ane-weights.cpp
             )
 
 target_include_directories(llama PUBLIC . ../include)

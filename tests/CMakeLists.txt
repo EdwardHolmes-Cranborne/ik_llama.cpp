@@ -185,3 +185,59 @@ target_link_libraries(test-decode-router PRIVATE common)
 target_include_directories(test-decode-router PRIVATE ${CMAKE_SOURCE_DIR}/examples/server)
 add_test(NAME test-decode-router COMMAND test-decode-router)
 set_property(TEST test-decode-router PROPERTY LABELS "kv-bridge")
+
+#
+# ANE (Apple Neural Engine) tests
+#
+if (GGML_ANE AND APPLE)
+    # Phase 0: Hardware characterization
+    add_executable(test-ane-hardware
+        ${CMAKE_SOURCE_DIR}/ggml/tests/test-ane-hardware.mm)
+    target_link_libraries(test-ane-hardware PRIVATE ggml)
+    target_include_directories(test-ane-hardware PRIVATE
+        ${CMAKE_SOURCE_DIR}/ggml/include
+        ${CMAKE_SOURCE_DIR}/ggml/src)
+    set_target_properties(test-ane-hardware PROPERTIES
+        COMPILE_FLAGS "-fno-objc-arc -std=c++17")
+    target_link_libraries(test-ane-hardware PRIVATE
+        "-framework Foundation" "-framework CoreML" "-framework IOSurface"
+        "-framework Accelerate" "-framework Metal" "-ldl")
+    install(TARGETS test-ane-hardware RUNTIME)
+    add_test(NAME test-ane-hardware COMMAND test-ane-hardware --quick)
+    set_property(TEST test-ane-hardware PROPERTY LABELS "ane")
+
+    # Phase 1: Backend unit tests
+    add_executable(test-ane-backend
+        ${CMAKE_SOURCE_DIR}/ggml/tests/test-ane-backend.mm)
+    target_link_libraries(test-ane-backend PRIVATE ggml)
+    target_include_directories(test-ane-backend PRIVATE
+        ${CMAKE_SOURCE_DIR}/ggml/include
+        ${CMAKE_SOURCE_DIR}/ggml/src)
+    set_target_properties(test-ane-backend PROPERTIES
+        COMPILE_FLAGS "-fno-objc-arc -std=c++17")
+    target_link_libraries(test-ane-backend PRIVATE
+        "-framework Foundation" "-framework CoreML" "-framework IOSurface"
+        "-framework Accelerate" "-framework Metal" "-ldl")
+    install(TARGETS test-ane-backend RUNTIME)
+    add_test(NAME test-ane-backend COMMAND test-ane-backend)
+    set_property(TEST test-ane-backend PROPERTY LABELS "ane")
+
+    # Phase 2: Weight splitting and conversion
+    add_executable(test-ane-weights
+        ${CMAKE_SOURCE_DIR}/tests/test-ane-weights.cpp)
+    target_link_libraries(test-ane-weights PRIVATE llama ggml)
+    target_include_directories(test-ane-weights PRIVATE
+        ${CMAKE_SOURCE_DIR}/ggml/include
+        ${CMAKE_SOURCE_DIR}/src)
+    install(TARGETS test-ane-weights RUNTIME)
+    add_test(NAME test-ane-weights COMMAND test-ane-weights)
+    set_property(TEST test-ane-weights PROPERTY LABELS "ane")
+
+    # ANE layer benchmark tool
+    add_executable(ane-layer-bench
+        ${CMAKE_SOURCE_DIR}/tools/ane-layer-bench.cpp)
+    target_link_libraries(ane-layer-bench PRIVATE ggml)
+    target_include_directories(ane-layer-bench PRIVATE
+        ${CMAKE_SOURCE_DIR}/ggml/include)
+    install(TARGETS ane-layer-bench RUNTIME)
+endif()
