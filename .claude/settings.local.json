@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git log:*)",
+      "Bash(ls /c/Users/eholmes/Documents/GitHub/ik_llama.cpp/*.md /c/Users/eholmes/Documents/GitHub/ik_llama.cpp/*.txt)"
+    ]
+  }
+}
