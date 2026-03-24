@@ -233,6 +233,8 @@ json probs_vector_to_json(const llama_context* ctx, const std::vector<completion
 
 bool server_sent_event(httplib::DataSink& sink, const json& data);
 
+bool server_sent_oai_resp_event(httplib::DataSink& sink, const json& data);
+
 bool server_sent_anthropic_event(httplib::DataSink& sink, const json& data);
 
 //
@@ -241,12 +243,12 @@ bool server_sent_anthropic_event(httplib::DataSink& sink, const json& data);
 // used by /completions endpoint
 json oaicompat_chat_params_parse(const json& body);
 
-struct oaicompat_parser_options {
+struct server_chat_params {
     bool use_jinja;
     bool prefill_assistant;
     common_reasoning_format reasoning_format;
     std::map<std::string, std::string> chat_template_kwargs;
-    common_chat_templates* tmpls;
+    common_chat_templates_ptr  tmpls;
     bool allow_image;
     bool allow_audio;
     bool enable_thinking = true;
@@ -254,16 +256,15 @@ struct oaicompat_parser_options {
 
 // used by /chat/completions endpoint
 json oaicompat_chat_params_parse(
-    const struct llama_model* model,
     json& body, /* openai api json semantics */
-    const oaicompat_parser_options& opt,
+    const server_chat_params& opt,
     std::vector<raw_buffer>& out_files);
 
-json anthropic_params_from_json(
-    const struct llama_model* model,
-    const json& body_in, /* anthropic messages api json semantics */
-    const oaicompat_parser_options& opt,
-    std::vector<raw_buffer>& out_files);
+// convert OpenAI Responses API format to OpenAI Chat Completions API format
+json convert_responses_to_chatcmpl(const json& body);
+
+// convert Anthropic Messages API format to OpenAI Chat Completions API format
+json convert_anthropic_to_oai(const json & body);
 
 
 //
@@ -347,12 +348,19 @@ public:
 
     server_tokens(const llama_tokens& tokens, bool has_mtmd);
 
-    llama_pos pos_next() const;
+    // the next position after n_tokens. if n_tokens < 0, return the next position after all tokens.
+    llama_pos pos_next(int64_t n_tokens = -1) const;
+
+    // number of tokens with position <= max_pos
+    size_t size_up_to_pos(llama_pos max_pos) const;
 
     int n_tokens() const {
         return tokens.size();
     }
 
+    bool has_mtmd_data() {
+       return !map_idx_to_media.empty();
+    }
     // for debugging
     std::string str() const;
 
@@ -407,7 +415,7 @@ public:
 
     size_t get_common_prefix_exact(const server_tokens& b) const;
 
-    llama_tokens get_text_tokens_exclude_think(const llama_context* ctx, const thinking_tokens& think_token) const;
+    server_tokens get_tokens_exclude_think(const llama_context * ctx, const thinking_tokens & think_token) const;
 
     common_prefix get_common_prefix(const llama_context* ctx, const server_tokens& b, bool exact = false) const;
     // take first n tokens of tokens list a
@@ -425,6 +433,8 @@ public:
         llama_pos pos,
         int32_t seq_id,
         size_t& n_tokens_out) const;
+
+    server_tokens clone() const;
 
     // Keep the first n_keep and remove n_discard tokens from tokens
     void discard_n_tokens(int32_t n_keep, int32_t n_discard);
@@ -474,4 +484,3 @@ bool prompt_cache_equal(llama_context* ctx, const server_tokens& cache_tokens,
     const server_tokens& prompt_tokens, size_t start, const common_prefix& prefix);
 
 std::string safe_json_to_str(const json& data);
-

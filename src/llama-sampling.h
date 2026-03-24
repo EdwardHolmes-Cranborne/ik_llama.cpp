@@ -24,7 +24,7 @@ struct llama_sampling {
 
 void llama_set_rng_seed_impl(struct llama_sampling * smpl, uint32_t seed);
 
-void llama_sample_softmax_impl  (struct llama_sampling * smpl, llama_token_data_array * candidates);
+void llama_sample_softmax_impl  (struct llama_sampling * smpl, llama_token_data_array * candidates, bool normalize = true);
 void llama_sample_top_k_impl    (struct llama_sampling * smpl, llama_token_data_array * candidates, int32_t k, size_t min_keep);
 void llama_sample_top_p_impl    (struct llama_sampling * smpl, llama_token_data_array * candidates, float p, size_t min_keep);
 void llama_sample_min_p_impl    (struct llama_sampling * smpl, llama_token_data_array * candidates, float p, size_t min_keep);
@@ -70,8 +70,7 @@ struct llama_sampler_adaptive_p {
     const float decay;      // EMA decay; history ≈ 1/(1-decay) tokens (0.0 - 0.99)
     const bool updt_w_cur;  // false=original, true=current
     std::mt19937 rng;       // RNG
-    float weighted_sum;     // sum(p_n * decay^N)
-    float total_weight;     // sum(decay^i), converges to 1/(1-decay)
+    std::vector<std::pair<float, float>> history;   // <weighted_sum, total_weight>
 
     // first referenced in prep
     std::vector<float> orig_prob;   // for storing the original proibabilities
@@ -100,6 +99,8 @@ void llama_sample_adaptive_p_impl(
               struct llama_sampling * smpl,
              llama_token_data_array * candidates,
     struct llama_sampler_adaptive_p * adapt_p_ctx);
+
+void llama_review_adaptive_p_impl(llama_sampler_adaptive_p * adapt_p_ctx, const size_t n_unsent, const bool rewind_status);
 
 
 void llama_sample_repetition_penalties_impl(

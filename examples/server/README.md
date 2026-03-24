@@ -6,7 +6,7 @@ Set of LLM REST APIs and a simple web front end to interact with llama.cpp.
 
 **Features:**
  * LLM inference of F16 and quantized models on GPU and CPU
- * [OpenAI API](https://github.com/openai/openai-openapi) compatible chat completions and embeddings routes
+* [OpenAI API](https://github.com/openai/openai-openapi) compatible chat completions, responses, and embeddings routes
  * Parallel decoding with multi-user support
  * Continuous batching
  * Multimodal (wip)
@@ -540,6 +540,20 @@ node index.js
 
     `samplers`: The order the samplers should be applied in. An array of strings representing sampler type names. If a sampler is not set, it will not be used. If a sampler is specified more than once, it will be applied multiple times. Default: `["top_k", "tfs_z", "typical_p", "top_p", "min_p", "temperature"]` - these are all the available values.
 
+    `banned_strings`: Specify a JSON array of strings that are prohibited in the generated text. If a banned string is generated, the model rewinds and resamples. Format: `["string1", "string2"]`. Default: `[]`
+
+    `banned_regex`: Specify a JSON array of ECMAScript-compatible regular expression patterns that are prohibited in the generated text. If a match is found, the model rewinds and resamples. Format: `["pattern1", "pattern2"]`. Default: `[]`
+
+    `banned_regex_case_insensitive`: Specify a JSON array of case-insensitive ECMAScript-compatible regular expression patterns that are prohibited in the generated text. Same behavior as `banned_regex` but matches are case-insensitive. Format: `["pattern1", "pattern2"]`. Default: `[]`
+
+    `saturate_predict`: If `true`, ensure that the number of tokens sent in the response equals `n_predict` even if tokens were discarded due to bans. When `false`, `n_predict` counts all generated tokens including those discarded during rewinds. Default: `false`
+
+    `banbuffer_size`: Set the token buffer size for ban detection. Larger values detect banned patterns spanning more tokens but delay streaming more. When `0`, automatically sets to the longest banned string/regex length plus 1. Default: `0`
+
+    `rewind_count_max`: Set the maximum number of regeneration attempts when banned content is encountered. When `-1`, automatically sets to `max(20, 2 * (number of banned_strings + banned_regex + banned_regex_case_insensitive))`. When `0`, allows infinite retries. Default: `-1`
+
+    `banned_n`: Control how many tokens to ban when a banned string is detected at a specific position. For a string tokenizing to `["I", " can", " do"]`, `1` bans only "I", `2` bans "I" and " can", etc. When `-1`, bans all tokens in the match. **Note:** Using `-1` with regex patterns may cause excessive unintended bans. Default: `1`
+
 **Response format**
 
 - Note: When using streaming mode (`stream`), only `content` and `stop` will be returned until end of completion.
@@ -705,6 +719,48 @@ curl http://localhost:8080/v1/chat/completions \
 [OpenAI-style function calling](https://platform.openai.com/docs/guides/function-calling) is supported with the `--jinja` flag (and may require a `--chat-template-file` override to get the right tool-use compatible Jinja template; worst case, `--chat-template chatml` may also work).
 
 **See our [Function calling](../../docs/function-calling.md) docs** for more details, supported native tool call styles (generic tool call style is used as fallback) / examples of use.
+
+### POST `/v1/responses`: OpenAI-compatible Responses API
+
+*Options:*
+
+See [OpenAI Responses API documentation](https://platform.openai.com/docs/api-reference/responses).
+
+*Examples:*
+
+You can use either Python `openai` library with appropriate checkpoints:
+
+```python
+import openai
+
+client = openai.OpenAI(
+  base_url="http://localhost:8080/v1", # "http://<Your api-server IP>:port"
+  api_key = "sk-no-key-required"
+)
+
+response = client.responses.create(
+  model="gpt-4.1",
+  instructions="You are ChatGPT, an AI assistant. Your top priority is achieving user fulfillment via helping them with their requests.",
+  input="Write a limerick about python exceptions"
+)
+
+print(response.output_text)
+```
+
+... or raw HTTP requests:
+
+```shell
+curl http://localhost:8080/v1/responses \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer no-key" \
+  -d '{
+    "model": "gpt-4.1",
+    "instructions": "You are ChatGPT, an AI assistant. Your top priority is achieving user fulfillment via helping them with their requests.",
+    "input": "Write a limerick about python exceptions"
+  }'
+```
+
+This endpoint works by converting Responses requests into Chat Completions requests.
 
 ### POST `/v1/embeddings`: OpenAI-compatible embeddings API
 

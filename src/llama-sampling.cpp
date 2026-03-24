@@ -102,7 +102,7 @@ static void llama_sort(llama_token_data_array * candidates, int32_t k) {
     candidates->sorted = true;
 }
 
-void llama_sample_softmax_impl(struct llama_sampling * smpl, llama_token_data_array * candidates) {
+void llama_sample_softmax_impl(struct llama_sampling * smpl, llama_token_data_array * candidates, bool normalize) {
     GGML_ASSERT(candidates->size > 0);
 
     const int64_t t_start_sample_us = ggml_time_us();
@@ -117,9 +117,12 @@ void llama_sample_softmax_impl(struct llama_sampling * smpl, llama_token_data_ar
         candidates->data[i].p = p;
         cum_sum += p;
     }
-    for (size_t i = 0; i < candidates->size; ++i) {
-        candidates->data[i].p /= cum_sum;
+    if (normalize) {
+        for (size_t i = 0; i < candidates->size; ++i) {
+            candidates->data[i].p /= cum_sum;
+        }
     }
+
 
     if (smpl) {
         smpl->t_sample_us += ggml_time_us() - t_start_sample_us;
@@ -477,44 +480,37 @@ void llama_sample_top_n_sigma_impl(struct llama_sampling * smpl, llama_token_dat
 
     const int64_t t_start_sample_us = ggml_time_us();
 
-    float max = candidates->data[0].logit;
-    float mean = 0;
-    size_t count = 0;
+    double sum1 = 0, sum2 = 0;
+    float max = 0;
+    int count = 0;
     for (int i = 0; i < (int)candidates->size; ++i) {
-        // Only count non-negative infinity values
-        if (candidates->data[i].logit != -INFINITY) {
-            max = std::max(max, candidates->data[i].logit);
-            mean += candidates->data[i].logit;
+        if (auto l = candidates->data[i].logit; l != -INFINITY) {
+            max = std::max(max, l);
             ++count;
+            double dl = l;
+            sum1 += dl;
+            sum2 += dl*dl;
         }
     }
     if (count < 4) {
-        return; // again, tandard deviation is not well defined for so few logits (4 is actually pushing it)
+        return;
     }
-    mean /= count;
+    double dmean = sum1/count;
+    double dsigma2 = sum2/count - dmean*dmean;
+    if (dsigma2 <= 0) {
+        return;
+    }
+    float sigma = float(sqrt(dsigma2));
 
-    float sigma2 = 0;
-    for (int i = 0; i < (int)candidates->size; ++i) {
-        if (candidates->data[i].logit != -INFINITY) {
-            float delta = candidates->data[i].logit - mean;
-            sigma2 += delta*delta;
-        }
-    }
-    float sigma = sqrtf(sigma2/count);
     float thresh = max - top_n_sigma*sigma;
-
-    int n_masked = 0;
+    int n_use = 0;
     for (int i = 0; i < (int)candidates->size; ++i) {
-        if (candidates->data[i].logit != -INFINITY && candidates->data[i].logit < thresh) {
-            candidates->data[i].logit = -INFINITY;
-            ++n_masked;
+        if (candidates->data[i].logit >= thresh) {
+            candidates->data[n_use++] = candidates->data[i];
         }
     }
-
-    // do we really want to compute softmax unconditionally?
-    // The following coresponds to mainline implementation with the minor optimization
-    // that we only call the relativly expensive softmax if we masked away some tokens.
-    if (n_masked > 0 || !candidates->sorted) {
+    if (n_use < (int)candidates->size) {
+        candidates->size = n_use;
         llama_sample_softmax_impl(nullptr, candidates);
     }
 
@@ -1050,10 +1046,36 @@ struct llama_sampler_dry* llama_sampler_init_dry_impl(const struct llama_vocab& 
 
 // adaptive p
 
+void llama_review_adaptive_p_impl(llama_sampler_adaptive_p * adapt_p_ctx, const size_t n_unsent, const bool rewind_status) {
+    // LLAMA_LOG_DEBUG("%s: n_unsent = %zu, rewind_status = %s\n", __func__, n_unsent, rewind_status ? "true" : "false");
+    if (adapt_p_ctx->target < 0.0f) {
+        // LLAMA_LOG_DEBUG("%s: sampler disabled, target = %f\n", __func__, adapt_p_ctx->target);
+        return;
+    }
+
+    auto & history = adapt_p_ctx->history;
+    const size_t hsz = history.size();
+    const size_t hsz_next = 1 + n_unsent;
+    // LLAMA_LOG_DEBUG("%s: hsz = %zu, hsz_next = %zu\n", __func__, hsz, hsz_next);
+    if (hsz_next >= hsz >> 1) { return; }   // skip small update
+
+    if (!rewind_status) {
+        // sent results, overwrite old history
+        // LLAMA_LOG_DEBUG("%s: hsz = %zu, hsz_next = %zu\n", __func__, hsz, hsz_next);
+        // LLAMA_LOG_DEBUG("%s: history[hsz-1].first = %f\n", __func__, history[hsz-1].first);
+        const size_t hsz_diff = hsz - hsz_next;
+        for (int j = 0; j < hsz_next; ++j) {
+            history[j] = history[j + hsz_diff];
+        }
+    }
+    history.resize(hsz_next);
+    // LLAMA_LOG_DEBUG("%s: history[hsz_next-1].first = %f\n", __func__, history[hsz_next-1].first);
+}
+
 llama_token llama_sample_token_adaptive_p_impl(
-              struct llama_sampling * smpl,
-             llama_token_data_array * candidates,
-    struct llama_sampler_adaptive_p * adapt_p_ctx) {
+                  struct llama_sampling * smpl,
+                 llama_token_data_array * candidates,
+        struct llama_sampler_adaptive_p * adapt_p_ctx) {
     GGML_ASSERT(candidates->size > 0);
     const int64_t t_start_sample_us = ggml_time_us();
 
@@ -1079,11 +1101,12 @@ llama_token llama_sample_token_adaptive_p_impl(
 
     // update history
     const float update_prob = ctx->updt_w_cur
-    ? candidates->data[idx].p / ctx->cum_cur_p
-    : ctx->orig_prob[id] / ctx->cum_orig_prob;
+        ? candidates->data[idx].p / ctx->cum_cur_p
+        : ctx->orig_prob[id] / ctx->cum_orig_prob;
     if (update_prob > 0) {
-        ctx->weighted_sum = ctx->decay * ctx->weighted_sum + update_prob;
-        ctx->total_weight = ctx->decay * ctx->total_weight + 1.0f;
+        ctx->history.push_back({
+            ctx->decay * ctx->history.back().first + update_prob,   // weighted_sum
+            ctx->decay * ctx->history.back().second + 1.0f });      // total_weight
     }
 
     smpl->t_sample_us += ggml_time_us() - t_start_sample_us;
@@ -1095,7 +1118,7 @@ llama_token llama_sample_token_adaptive_p_impl(
 void llama_sample_adaptive_p_impl(struct llama_sampling * ctx, llama_token_data_array * candidates,
         struct llama_sampler_adaptive_p * adapt_p_ctx) {
     if (adapt_p_ctx->target < 0.0f) {
-        // sampler is disabled
+        // LLAMA_LOG_DEBUG("%s: sampler disabled, target = %f\n", __func__, adapt_p_ctx->target);
         llama_sample_softmax_impl(nullptr, candidates);
         return;
     }
@@ -1118,10 +1141,12 @@ void llama_sample_adaptive_p_impl(struct llama_sampling * ctx, llama_token_data_
     adapt_p_ctx->cum_cur_p = cum_sum;
 
     // compute adapted target probability
+    const float weighted_sum = adapt_p_ctx->history.back().first;
+    const float total_weight = adapt_p_ctx->history.back().second;
     const float target = std::clamp(adapt_p_ctx->target, 0.0f, 1.0f);
-    const float adapted_target = std::clamp(adapt_p_ctx->total_weight == 0.0f
+    const float adapted_target = std::clamp(total_weight == 0.0f
         ? target
-        : 2.0f * target - (adapt_p_ctx->weighted_sum / adapt_p_ctx->total_weight),
+        : 2.0f * target - (weighted_sum / total_weight),
         0.0f, 1.0f);
 
     // transformation constants
@@ -1151,8 +1176,8 @@ void llama_prep_adaptive_p_impl(
               struct llama_sampling * smpl,
              llama_token_data_array * candidates,
     struct llama_sampler_adaptive_p * adapt_p_ctx) {
-    if (adapt_p_ctx->updt_w_cur) {
-        // update with current probability, original not needed
+    if (adapt_p_ctx->updt_w_cur     // update with current probability, original not needed
+        || (adapt_p_ctx->target < 0.0f)) {  // or disabled
         return;
     }
     constexpr float kDelta = 30.0f; //16.6f;
@@ -1183,18 +1208,20 @@ struct llama_sampler_adaptive_p * llama_init_adaptive_p_impl(int n_vocab,
     GGML_ASSERT(n_vocab > 0);
     const float clamped_decay = std::clamp(decay, 0.0f, 0.99f);
     auto result = new llama_sampler_adaptive_p {
-        /* .target          = */ target,
-        /* .decay           = */ clamped_decay,
-        /* .updt_w_cur      = */ updt_w_cur,
-        /* .rng             = */ std::mt19937(seed),
-        /* .weighted_sum    = */ target / (1.0f - clamped_decay),
-        /* .total_weight    = */ 1.0f / (1.0f - clamped_decay),
-        /* .orig_prob       = */ {},
-        /* .cum_orig_prob   = */ 1.0f,
-        /* .cum_cur_p       = */ 1.0f,
-        /* .max_xform_logit = */ -INFINITY,
-        /* .cum_probs       = */ {},
+        /* .target            = */ target,
+        /* .decay             = */ clamped_decay,
+        /* .updt_w_cur        = */ updt_w_cur,
+        /* .rng               = */ std::mt19937(seed),
+        /* .history           = */ {},
+        /* .orig_prob         = */ {},
+        /* .cum_orig_prob     = */ 1.0f,
+        /* .cum_cur_p         = */ 1.0f,
+        /* .max_xform_logit   = */ -INFINITY,
+        /* .cum_probs         = */ {},
     };
+    result->history.push_back({
+        target / (1.0f - clamped_decay),    // weighted_sum
+        1.0f / (1.0f - clamped_decay) });   // total_weight
     result->orig_prob.resize(n_vocab);
     return result;
 }

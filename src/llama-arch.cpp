@@ -27,8 +27,11 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_QWEN2VL,         "qwen2vl"      },
     { LLM_ARCH_QWEN3,           "qwen3"        },
     { LLM_ARCH_QWEN3MOE,        "qwen3moe"     },
+    { LLM_ARCH_QWEN3NEXT,       "qwen3next"    },
     { LLM_ARCH_QWEN3VL,         "qwen3vl"      },
     { LLM_ARCH_QWEN3VLMOE,      "qwen3vlmoe"   },
+    { LLM_ARCH_QWEN35MOE,       "qwen35moe"    },
+    { LLM_ARCH_QWEN35,          "qwen35"       },
     { LLM_ARCH_PHI2,            "phi2"         },
     { LLM_ARCH_PHI3,            "phi3"         },
     { LLM_ARCH_PLAMO,           "plamo"        },
@@ -72,6 +75,8 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_MIMO2,           "mimo2"        },
     { LLM_ARCH_SEED_OSS,        "seed_oss"     },
     { LLM_ARCH_STEP35,          "step35"       },
+    { LLM_ARCH_GLM_DSA,         "glm-dsa"      },
+    { LLM_ARCH_MISTRAL4,        "mistral4"     },
     { LLM_ARCH_UNKNOWN,         "(unknown)"    },
 };
 
@@ -154,6 +159,11 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_ATTENTION_TEMPERATURE_SCALE,      "%s.attention.temperature_scale"      },
     { LLM_KV_ATTENTION_KEY_LENGTH_MLA,         "%s.attention.key_length_mla"         },
     { LLM_KV_ATTENTION_VALUE_LENGTH_MLA,       "%s.attention.value_length_mla"       },
+    { LLM_KV_ATTENTION_INDEXER_HEAD_COUNT,     "%s.attention.indexer.head_count"     },
+    { LLM_KV_ATTENTION_INDEXER_KEY_LENGTH,     "%s.attention.indexer.key_length"     },
+    { LLM_KV_ATTENTION_INDEXER_TOP_K,          "%s.attention.indexer.top_k"          },
+    { LLM_KV_FULL_ATTENTION_INTERVAL,          "%s.full_attention_interval"          },
+
 
     { LLM_KV_ROPE_DIMENSION_COUNT,          "%s.rope.dimension_count"                 },
     { LLM_KV_ROPE_DIMENSION_COUNT_PER_LAYER,"%s.rope.dimension_count_per_layer"       },
@@ -181,6 +191,7 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_SSM_INNER_SIZE,                "%s.ssm.inner_size"     },
     { LLM_KV_SSM_STATE_SIZE,                "%s.ssm.state_size"     },
     { LLM_KV_SSM_TIME_STEP_RANK,            "%s.ssm.time_step_rank" },
+    { LLM_KV_SSM_GROUP_COUNT,               "%s.ssm.group_count"    },
 
     { LLM_KV_TOKENIZER_MODEL,                "tokenizer.ggml.model"                    },
     { LLM_KV_TOKENIZER_PRE,                  "tokenizer.ggml.pre"                      },
@@ -236,5 +247,25 @@ const char * llama_model_arch_name(llm_arch arch) {
         return "unknown";
     }
     return it->second;
+}
+
+bool llm_arch_is_recurrent(const llm_arch & arch) {
+    switch (arch) {
+    case LLM_ARCH_MAMBA:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool llm_arch_is_hybrid(const llm_arch & arch) {
+    switch (arch) {
+    case LLM_ARCH_QWEN3NEXT:
+    case LLM_ARCH_QWEN35MOE:
+    case LLM_ARCH_QWEN35:
+        return true;
+    default:
+        return false;
+    }
 }
 

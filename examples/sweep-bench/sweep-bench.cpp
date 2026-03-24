@@ -14,8 +14,45 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
+
+static void llama_selective_log_callback(ggml_log_level level, const char * text, void * user_data) {
+    (void) level;
+    (void) user_data;
+    const char * skip_patterns[] = {
+        "Setting default device in layer",
+        "llama_model_loader: Dumping metadata",
+        "llama_model_loader: - kv  ",
+        "llama_model_loader: - type ",
+        "validate_override:",
+        "load: printing all EOG",
+        "load:   - ",
+        "load: special tokens cache",
+        "load: token to piece cache",
+        "llm_load_print_meta:",
+        "print_info:",
+        "------------------- Layer sizes",
+        "Layer ",
+        "llm_load_tensors:",
+        "==========================",
+    };
+    for (const char * pat : skip_patterns) {
+        if (strstr(text, pat) != nullptr) {
+            return;
+        }
+    }
+    // Skip incomplete/continuation lines
+    int i = 0;
+    while (text[i] == ' ' || text[i] == '\t') {
+        i++;
+    }
+    if (text[i] == ',' || text[i] == '(' || text[i] == ')'|| (text[i] >= '0' && text[i] <= '9')) {
+        return;
+    }
+    LOG_TEE("%s", text);
+}
 
 static void print_usage(int, char ** argv) {
     LOG_TEE("\nexample usage:\n");
@@ -33,6 +70,10 @@ int main(int argc, char ** argv) {
     }
     if (params.nrep < 1) params.nrep = 1;
 
+    if (params.minilog) {
+        llama_log_set(llama_selective_log_callback, nullptr);
+    }
+
     // init LLM
 
     llama_backend_init();
@@ -40,18 +81,18 @@ int main(int argc, char ** argv) {
 
     // initialize the model
 
-    llama_model_params model_params = llama_model_params_from_gpt_params(params);
+    llama_model_params model_params = common_model_params_to_llama(params);
 
-    llama_model * model = llama_load_model_from_file(params.model.c_str(), model_params);
+    llama_model * model = llama_model_load_from_file(params.model.c_str(), model_params);
 
     if (model == NULL) {
         fprintf(stderr , "%s: error: unable to load model\n" , __func__);
         return 1;
     }
 
-    llama_context_params ctx_params = llama_context_params_from_gpt_params(params);
+    llama_context_params ctx_params = common_context_params_to_llama(params);
 
-    llama_context * ctx = llama_new_context_with_model(model, ctx_params);
+    llama_context * ctx = llama_init_from_model(model, ctx_params);
 
     if (ctx == NULL) {
         fprintf(stderr , "%s: error: failed to create the llama_context\n" , __func__);
@@ -136,6 +177,8 @@ int main(int argc, char ** argv) {
     common_batch_clear(batch);
     llama_kv_cache_clear(ctx);
 
+    llama_reset_timings(ctx);
+
     int i_loop = 0;
 
     for (unsigned int n_kv = 0; n_kv < n_kv_max; n_kv += params.n_ubatch) {
@@ -210,6 +253,8 @@ int main(int argc, char ** argv) {
 
         ++i_loop;
     }
+
+    llama_print_timings(ctx);
 
     llama_batch_free(batch);
 

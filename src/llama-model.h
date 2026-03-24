@@ -45,6 +45,7 @@ enum e_model {
     MODEL_0_3B,
     MODEL_0_5B,
     MODEL_0_6B,
+    MODEL_0_8B,
     MODEL_1B,
     MODEL_1_2B,
     MODEL_1_3B,
@@ -107,14 +108,20 @@ enum e_model {
     MODEL_16B_A1B,
     MODEL_21B_A3B, // Ernie MoE small
     MODEL_30B_A3B,
+    MODEL_35B_A3B,
+    MODEL_80B_A3B, // Qwen3-Next
     MODEL_80B_A13B,
     MODEL_100B_A6B,
     MODEL_106B_A12B,
+    MODEL_119B_A6B,
+    MODEL_122B_A10B,
     MODEL_230B_A10B, // Minimax M2
     MODEL_235B_A22B,
     MODEL_310B_A15B,
     MODEL_300B_A47B, // Ernie MoE big
     MODEL_355B_A32B,
+    MODEL_397B_A17B, // Qwen-3.5-MoE
+    MODEL_744B_A40B,
     MODEL_E2B,
     MODEL_E4B,
 };
@@ -206,6 +213,18 @@ struct llama_layer {
     llama_split_tensor split_sinks;
     llama_split_tensor split_wqkv_gate;
 
+    llama_split_tensor split_ssm_wqkv;
+    llama_split_tensor split_ssm_wqkv_gate;
+    llama_split_tensor split_ssm_in;
+    llama_split_tensor split_ssm_conv1d;
+    llama_split_tensor split_ssm_dt;
+    llama_split_tensor split_ssm_a;
+    llama_split_tensor split_ssm_beta_alpha;
+    llama_split_tensor split_ssm_beta;
+    llama_split_tensor split_ssm_alpha;
+    llama_split_tensor split_ssm_norm;
+    llama_split_tensor split_ssm_out;
+
     // relative position bias
     struct ggml_tensor * attn_rel_b = nullptr;
     struct ggml_tensor * attn_rel_b_enc = nullptr;
@@ -232,6 +251,7 @@ struct llama_layer {
     llama_split_tensor split_ffn_gate;
     llama_split_tensor split_ffn_down;
     llama_split_tensor split_ffn_norm;
+    llama_split_tensor split_ffn_up_gate;
 
     // ff MoE
     struct ggml_tensor * ffn_gate_inp = nullptr;
@@ -244,6 +264,7 @@ struct llama_layer {
     llama_split_tensor split_ffn_up_exps;
     llama_split_tensor split_ffn_gate_exps;
     llama_split_tensor split_ffn_down_exps;
+    llama_split_tensor split_ffn_up_gate_exps;
 
     // ff MoE bias
     struct ggml_tensor * ffn_gate_inp_b = nullptr;
@@ -264,11 +285,13 @@ struct llama_layer {
     llama_split_tensor split_ffn_up_shexp;
     llama_split_tensor split_ffn_gate_shexp;
     llama_split_tensor split_ffn_down_shexp;
+    llama_split_tensor split_ffn_gate_inp_shexp;
 
     llama_split_tensor split_ffn_gate_inp_b;
     llama_split_tensor split_ffn_gate_exps_b;
     llama_split_tensor split_ffn_down_exps_b;
     llama_split_tensor split_ffn_up_exps_b;
+    llama_split_tensor split_ffn_up_gate_exps_b;
 
     // ff bias
     struct ggml_tensor * ffn_gate_b = nullptr;
@@ -288,6 +311,10 @@ struct llama_layer {
     struct ggml_tensor * ssm_x = nullptr;
     struct ggml_tensor * ssm_dt = nullptr;
     struct ggml_tensor * ssm_out = nullptr;
+    struct ggml_tensor * ssm_norm = nullptr;
+    struct ggml_tensor * ssm_beta_alpha = nullptr;
+    struct ggml_tensor * ssm_alpha = nullptr;
+    struct ggml_tensor * ssm_beta = nullptr;
 
     // mamba
     struct ggml_tensor * ssm_conv1d = nullptr;
@@ -297,6 +324,13 @@ struct llama_layer {
     // mamba bias
     struct ggml_tensor * ssm_conv1d_b = nullptr;
     struct ggml_tensor * ssm_dt_b = nullptr;
+
+    // DSA (deepseek sparse attention)
+    struct ggml_tensor * indexer_k_norm   = nullptr;
+    struct ggml_tensor * indexer_k_norm_b = nullptr;
+    struct ggml_tensor * indexer_proj     = nullptr;
+    struct ggml_tensor * indexer_attn_k   = nullptr;
+    struct ggml_tensor * indexer_attn_q_b = nullptr; // note: for lora a/b, not bias
 
     // long rope factors
     struct ggml_tensor * rope_long  = nullptr;
@@ -327,6 +361,8 @@ struct rpc_device {
     std::string endpoint;
     uint32_t device;
 };
+
+struct llama_cparams;
 
 struct llama_model {
     e_model     type  = MODEL_UNKNOWN;
@@ -360,8 +396,11 @@ struct llama_model {
     int max_gpu = 0; // max. number of GPUs to use per layer for aplit mode "graph"
     int n_gpu_layers;
 
+    bool mtp; // use mtp if is supported by the Model
+
     std::vector<rpc_device> rpc_servers;
     std::vector<int32_t> devices;
+    std::vector<int32_t> default_layer_device;
 
     // gguf metadata
     std::unordered_map<std::string, std::string> gguf_kv;
@@ -406,12 +445,21 @@ struct llama_model {
 
     ~llama_model();
 
-    // Not actually needed, but left in place for now
-    size_t max_nodes() const { return 65536; }
+    size_t max_nodes(int n_tokens) const {
+        auto n_tensors = tensors_by_name.size();
+        if (split_mode == LLAMA_SPLIT_MODE_GRAPH && !devices.empty()) n_tensors *= devices.size();
+        if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN35) {
+            return std::max<size_t>(n_tokens * 40, 32u * n_tensors);
+        }
+        //return std::max<size_t>(1024, 8*n_tensors);
+        return 65536;
+    }
 
     bool has_tensor_overrides() const {
         return tensor_overrides;
     }
+
+    size_t cache_size(int il, ggml_type type_k, ggml_type type_v, uint32_t kv_size, int mla_attn, int n_seq_max, bool flash_attn) const;
 
     void set_tensor_overrides(const llama_model_params& params);
 
@@ -493,3 +541,4 @@ struct LLM_TN {
 std::string llama_model_ftype_name(llama_ftype ftype);
 
 const char * llama_model_type_name(e_model type);
+
