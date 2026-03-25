@@ -3406,16 +3406,25 @@ static ggml_status llama_graph_compute_per_layer(
     }
 #endif
 
-    // Parse layer suffix: find last '-' then parse integer
+    // Parse layer suffix: find '-N' pattern where N is a layer number.
+    // Handles names like "attn_norm-5", "Qcur-0 (reshaped)", "l_out-91".
+    // Scans backwards to find the rightmost '-' followed by digits.
     auto parse_layer_suffix = [&](const char * name) -> int {
         if (!name) return -1;
-        const char * dash = strrchr(name, '-');
-        if (!dash || *(dash + 1) == '\0') return -1;
-        char * end = nullptr;
-        long il = strtol(dash + 1, &end, 10);
-        if (!end || *end != '\0') return -1;
-        if (il < 0 || il >= n_layer) return -1;
-        return (int)il;
+        // Scan backwards for '-' followed by digit(s)
+        const char * p = name + strlen(name);
+        while (p > name) {
+            --p;
+            if (*p == '-' && p[1] >= '0' && p[1] <= '9') {
+                char * end = nullptr;
+                long il = strtol(p + 1, &end, 10);
+                // Accept if digits are followed by end-of-string, space, or paren
+                if (end && end > p + 1 && (*end == '\0' || *end == ' ' || *end == '(')) {
+                    if (il >= 0 && il < n_layer) return (int)il;
+                }
+            }
+        }
+        return -1;
     };
 
     // Scan graph for layer boundaries
@@ -3429,40 +3438,92 @@ static ggml_status llama_graph_compute_per_layer(
         last_idx[il] = i;
     }
 
-    for (int il = 0; il < n_layer; ++il) {
-        if (first_idx[il] < 0 || last_idx[il] < first_idx[il]) {
-            LLAMA_LOG_ERROR("%s: could not determine node range for layer %d\n", __func__, il);
-            return GGML_STATUS_FAILED;
+    // Diagnostic: report missing layers and dump unrecognized node names
+    {
+        std::vector<int> missing_layers;
+        for (int il = 0; il < n_layer; ++il) {
+            if (first_idx[il] < 0) missing_layers.push_back(il);
+        }
+        if (!missing_layers.empty()) {
+            LLAMA_LOG_WARN("%s: %zu of %d layers have no graph nodes: ",
+                           __func__, missing_layers.size(), n_layer);
+            for (size_t i = 0; i < std::min(missing_layers.size(), (size_t)10); i++) {
+                fprintf(stderr, "%d ", missing_layers[i]);
+            }
+            if (missing_layers.size() > 10) fprintf(stderr, "...");
+            fprintf(stderr, "\n");
+
+            // Dump last 20 nodes and first 20 unrecognized nodes
+            int unrecognized = 0;
+            for (int i = 0; i < gf->n_nodes && unrecognized < 20; ++i) {
+                const char * name = ggml_get_name(gf->nodes[i]);
+                const int il = parse_layer_suffix(name);
+                if (il < 0) {
+                    LLAMA_LOG_WARN("%s: unrecognized node[%d]: '%s'\n", __func__, i, name ? name : "(null)");
+                    unrecognized++;
+                }
+            }
+            // Also dump last 10 nodes
+            LLAMA_LOG_WARN("%s: last 10 nodes:\n", __func__);
+            for (int i = std::max(0, gf->n_nodes - 10); i < gf->n_nodes; ++i) {
+                const char * name = ggml_get_name(gf->nodes[i]);
+                LLAMA_LOG_WARN("%s:   node[%d]: '%s' (parsed layer=%d)\n",
+                               __func__, i, name ? name : "(null)", parse_layer_suffix(name));
+            }
         }
     }
 
-    // Build contiguous layer ranges
-    std::vector<int> layer_start_idx(n_layer, 0);
-    std::vector<int> layer_end_idx(n_layer, 0);
+    // Check layers — allow missing layers (e.g. nextn prediction layers)
+    // but ensure at least some layers are present
+    int n_active_layers = 0;
     for (int il = 0; il < n_layer; ++il) {
-        const int start      = first_idx[il];
-        const int next_start = (il + 1 < n_layer) ? first_idx[il + 1] : gf->n_nodes;
-        const int end        = std::max(last_idx[il] + 1, next_start);
+        if (first_idx[il] >= 0 && last_idx[il] >= first_idx[il]) {
+            n_active_layers++;
+        }
+    }
+    if (n_active_layers == 0) {
+        LLAMA_LOG_ERROR("%s: no layers found in graph\n", __func__);
+        return GGML_STATUS_FAILED;
+    }
+
+    // Build contiguous layer ranges — skip layers with no graph nodes
+    std::vector<int> layer_start_idx(n_layer, -1);
+    std::vector<int> layer_end_idx(n_layer, -1);
+    for (int il = 0; il < n_layer; ++il) {
+        if (first_idx[il] < 0) continue;  // layer not in graph (e.g. nextn prediction)
+
+        const int start = first_idx[il];
+        // Find next active layer's start
+        int next_start = gf->n_nodes;
+        for (int jl = il + 1; jl < n_layer; ++jl) {
+            if (first_idx[jl] >= 0) { next_start = first_idx[jl]; break; }
+        }
+        const int end = std::max(last_idx[il] + 1, next_start);
 
         if (end <= start) {
             LLAMA_LOG_ERROR("%s: invalid layer range for layer %d: [%d, %d)\n", __func__, il, start, end);
-            return GGML_STATUS_FAILED;
-        }
-        if (il + 1 < n_layer && last_idx[il] >= first_idx[il + 1]) {
-            LLAMA_LOG_ERROR("%s: interleaved layers %d/%d\n", __func__, il, il + 1);
             return GGML_STATUS_FAILED;
         }
         layer_start_idx[il] = start;
         layer_end_idx[il]   = end;
     }
 
-    const int pre_layer_end    = std::max(0, layer_start_idx[0]);
-    const int post_layer_start = layer_end_idx[n_layer - 1];
+    // Find first and last active layer for pre/post boundaries
+    int first_active = -1, last_active = -1;
+    for (int il = 0; il < n_layer; ++il) {
+        if (layer_start_idx[il] >= 0) {
+            if (first_active < 0) first_active = il;
+            last_active = il;
+        }
+    }
+    const int pre_layer_end    = (first_active >= 0) ? std::max(0, layer_start_idx[first_active]) : 0;
+    const int post_layer_start = (last_active >= 0) ? layer_end_idx[last_active] : gf->n_nodes;
 
     // Assign phase to each node: -1=pre, il=layer, -2=post
     std::vector<int> node_phase(gf->n_nodes, -3);
     for (int i = 0; i < pre_layer_end; ++i) node_phase[i] = -1;
     for (int il = 0; il < n_layer; ++il) {
+        if (layer_start_idx[il] < 0) continue;  // skip absent layers
         for (int i = layer_start_idx[il]; i < layer_end_idx[il]; ++i) node_phase[i] = il;
     }
     for (int i = post_layer_start; i < gf->n_nodes; ++i) node_phase[i] = -2;
