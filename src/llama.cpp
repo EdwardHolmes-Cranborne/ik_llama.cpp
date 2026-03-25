@@ -3748,19 +3748,28 @@ int llama_decode_layer_major(
     // it here so the graph builder sees any user callback for tensor routing
     ggml_backend_sched_set_eval_callback(lctx.sched, lctx.cparams.cb_eval, lctx.cparams.cb_eval_user_data);
 
-    // If streaming: temporarily remap tensors to GPU so scheduler routes to GPU
+    // If streaming: remap tensors to GPU buffer for scheduler routing,
+    // build graph, alloc, then restore tensors to CPU.
     if (use_weight_stream) {
         ws->remap_tensors_to_gpu();
     }
 
     ggml_cgraph * gf = llm_build_context::llama_build_graph(lctx, batch_all, false);
 
-    ggml_backend_sched_alloc_graph(lctx.sched, gf);
-
-    // Restore tensors to CPU after scheduler has made backend decisions
+    // Restore tensors to CPU BEFORE alloc — alloc may access tensor data
     if (use_weight_stream) {
         ws->restore_tensors_to_cpu();
     }
+
+    // Force all compute nodes to GPU backend
+    if (use_weight_stream) {
+        ggml_backend_t gpu_be = ws->gpu_backend;
+        for (int i = 0; i < gf->n_nodes; i++) {
+            ggml_backend_sched_set_tensor_backend(lctx.sched, gf->nodes[i], gpu_be);
+        }
+    }
+
+    ggml_backend_sched_alloc_graph(lctx.sched, gf);
 
     // Set inputs
     llama_set_inputs(lctx, batch_all);

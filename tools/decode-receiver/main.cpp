@@ -39,6 +39,11 @@ struct receiver_params {
     float       temp          = 0.7f;
     bool        mlock         = false;
     bool        one_shot      = false;
+
+    // Debug features
+    std::string debug_prompt;       // if set: do local prefill, compare KV with remote
+    std::string debug_dump_kv;      // if set: dump received KV state to this file
+    bool        debug_kv_compare = false; // compare local vs remote KV checksums
 };
 
 static void print_usage(const char * prog) {
@@ -56,6 +61,10 @@ static void print_usage(const char * prog) {
     fprintf(stderr, "  --temp F                   Temperature (default: 0.7)\n");
     fprintf(stderr, "  --mlock                    Lock model in memory\n");
     fprintf(stderr, "  --one-shot                 Exit after first decode\n");
+    fprintf(stderr, "\nDebug:\n");
+    fprintf(stderr, "  --debug-prompt PROMPT       Local prefill + KV compare with remote\n");
+    fprintf(stderr, "  --debug-dump-kv PATH        Dump received KV state to file\n");
+    fprintf(stderr, "  --debug-kv-compare          Print per-layer KV checksums\n");
 }
 
 static bool parse_args(int argc, char ** argv, receiver_params & params) {
@@ -99,6 +108,15 @@ static bool parse_args(int argc, char ** argv, receiver_params & params) {
             params.mlock = true;
         } else if (arg == "--one-shot") {
             params.one_shot = true;
+        } else if (arg == "--debug-prompt") {
+            const char * v = next(); if (!v) return false;
+            params.debug_prompt = v;
+            params.debug_kv_compare = true;
+        } else if (arg == "--debug-dump-kv") {
+            const char * v = next(); if (!v) return false;
+            params.debug_dump_kv = v;
+        } else if (arg == "--debug-kv-compare") {
+            params.debug_kv_compare = true;
         } else if (arg == "-h" || arg == "--help") {
             print_usage(argv[0]);
             exit(0);
@@ -200,6 +218,129 @@ int main(int argc, char ** argv) {
 
         fprintf(stderr, "Artifact parsed: %u tokens, %u layers, %zu bytes payload\n",
                 meta.token_count, meta.n_layers, payload.size());
+
+        // Debug: dump received KV to file
+        if (!params.debug_dump_kv.empty() && !payload.empty()) {
+            std::ofstream dump(params.debug_dump_kv, std::ios::binary);
+            if (dump.is_open()) {
+                dump.write(reinterpret_cast<const char *>(payload.data()), (std::streamsize)payload.size());
+                fprintf(stderr, "[debug] Dumped received KV state to %s (%zu bytes)\n",
+                        params.debug_dump_kv.c_str(), payload.size());
+            }
+        }
+
+        // Debug: local prefill for KV comparison
+        std::vector<uint8_t> local_kv_state;
+        if (!params.debug_prompt.empty()) {
+            fprintf(stderr, "\n[debug] === Local prefill for KV comparison ===\n");
+            fprintf(stderr, "[debug] Prompt: \"%s\"\n", params.debug_prompt.c_str());
+
+            // Tokenize the debug prompt
+            std::vector<llama_token> tokens(params.debug_prompt.size() + 32);
+            int n_tokens = llama_tokenize(
+                model, params.debug_prompt.c_str(), (int)params.debug_prompt.size(),
+                tokens.data(), (int)tokens.size(), true, true);
+            if (n_tokens < 0) {
+                tokens.resize(-n_tokens);
+                n_tokens = llama_tokenize(
+                    model, params.debug_prompt.c_str(), (int)params.debug_prompt.size(),
+                    tokens.data(), (int)tokens.size(), true, true);
+            }
+            tokens.resize(n_tokens);
+            fprintf(stderr, "[debug] Tokenized: %d tokens\n", n_tokens);
+
+            // Local prefill
+            llama_kv_cache_clear(ctx);
+            llama_batch batch = llama_batch_get_one(tokens.data(), n_tokens, 0, 0);
+            batch.logits = nullptr;  // don't need logits for comparison
+            int rc = llama_decode(ctx, batch);
+            if (rc != 0) {
+                fprintf(stderr, "[debug] Local prefill failed: rc=%d\n", rc);
+            } else {
+                fprintf(stderr, "[debug] Local prefill succeeded: %d tokens\n", n_tokens);
+
+                // Serialize local KV state
+                size_t state_size = llama_state_get_size(ctx);
+                local_kv_state.resize(state_size);
+                size_t written = llama_state_get_data(ctx, local_kv_state.data(), state_size);
+                local_kv_state.resize(written);
+                fprintf(stderr, "[debug] Local KV state: %zu bytes\n", written);
+
+                // Compare sizes
+                fprintf(stderr, "[debug] Remote KV state: %zu bytes\n", payload.size());
+                fprintf(stderr, "[debug] Size match: %s\n",
+                        local_kv_state.size() == payload.size() ? "YES" : "NO");
+
+                // Compare content (find first difference)
+                if (!local_kv_state.empty() && !payload.empty()) {
+                    size_t min_size = std::min(local_kv_state.size(), payload.size());
+                    size_t first_diff = min_size;
+                    int diff_count = 0;
+                    for (size_t i = 0; i < min_size; i++) {
+                        if (local_kv_state[i] != payload[i]) {
+                            if (first_diff == min_size) first_diff = i;
+                            diff_count++;
+                        }
+                    }
+                    if (diff_count == 0 && local_kv_state.size() == payload.size()) {
+                        fprintf(stderr, "[debug] KV states are IDENTICAL\n");
+                    } else {
+                        fprintf(stderr, "[debug] KV states DIFFER: %d bytes different, first diff at offset %zu\n",
+                                diff_count, first_diff);
+                        // Print hex dump around first difference
+                        if (first_diff < min_size) {
+                            size_t dump_start = first_diff > 16 ? first_diff - 16 : 0;
+                            size_t dump_end = std::min(first_diff + 48, min_size);
+                            fprintf(stderr, "[debug] Local  @%zu:", dump_start);
+                            for (size_t i = dump_start; i < dump_end; i++) {
+                                if (i == first_diff) fprintf(stderr, " [");
+                                fprintf(stderr, "%02x", local_kv_state[i]);
+                                if (i == first_diff) fprintf(stderr, "]");
+                            }
+                            fprintf(stderr, "\n[debug] Remote @%zu:", dump_start);
+                            for (size_t i = dump_start; i < dump_end; i++) {
+                                if (i == first_diff) fprintf(stderr, " [");
+                                fprintf(stderr, "%02x", payload[i]);
+                                if (i == first_diff) fprintf(stderr, "]");
+                            }
+                            fprintf(stderr, "\n");
+                        }
+                    }
+
+                    // Per-64KB block checksums for coarse comparison
+                    if (params.debug_kv_compare) {
+                        const size_t block_size = 64 * 1024;
+                        fprintf(stderr, "[debug] Per-64KB block comparison (first 20 blocks):\n");
+                        int blocks_shown = 0;
+                        for (size_t off = 0; off < min_size && blocks_shown < 20; off += block_size, blocks_shown++) {
+                            size_t len = std::min(block_size, min_size - off);
+                            uint32_t local_sum = 0, remote_sum = 0;
+                            for (size_t i = 0; i < len; i++) {
+                                local_sum += local_kv_state[off + i];
+                                remote_sum += payload[off + i];
+                            }
+                            const char * status = (local_sum == remote_sum) ? "MATCH" : "DIFF";
+                            fprintf(stderr, "[debug]   block %3d (@%8zu): local_sum=%10u remote_sum=%10u %s\n",
+                                    blocks_shown, off, local_sum, remote_sum, status);
+                        }
+                    }
+                }
+            }
+
+            // Dump local KV for external comparison
+            if (!params.debug_dump_kv.empty() && !local_kv_state.empty()) {
+                std::string local_path = params.debug_dump_kv + ".local";
+                std::ofstream dump(local_path, std::ios::binary);
+                if (dump.is_open()) {
+                    dump.write(reinterpret_cast<const char *>(local_kv_state.data()),
+                               (std::streamsize)local_kv_state.size());
+                    fprintf(stderr, "[debug] Dumped local KV state to %s (%zu bytes)\n",
+                            local_path.c_str(), local_kv_state.size());
+                }
+            }
+
+            fprintf(stderr, "[debug] === End KV comparison ===\n\n");
+        }
 
         // Step 3: Import KV state into context
         // The payload is a serialized llama state (from llama_state_get_data)

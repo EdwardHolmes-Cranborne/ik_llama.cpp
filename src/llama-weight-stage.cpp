@@ -260,7 +260,16 @@ bool llama_weight_stream::allocate_gpu_buffers(ggml_backend_t backend) {
 void llama_weight_stream::remap_tensors_to_gpu() {
     if (!gpu_buf[0]) return;
 
+    // Remap tensor->buffer AND tensor->data to consistent GPU addresses.
+    // The scheduler computes device offsets as (tensor->data - buffer_base),
+    // so both must be self-consistent.
+    //
+    // We pack tensors per-layer into the GPU buffer with wrapping.
+    // The actual data content doesn't matter — real weights are uploaded
+    // per-layer in upload_layer(). This is just for scheduler routing.
+    void * gpu_base = gpu_ptr[0];
     int total_remapped = 0;
+
     for (auto & info : layer_infos) {
         size_t offset = 0;
         for (auto & entry : info.entries) {
@@ -269,18 +278,20 @@ void llama_weight_stream::remap_tensors_to_gpu() {
             entry.orig_data   = entry.tensor->data;
             if ((uintptr_t)entry.orig_data <= 1) entry.orig_data = nullptr;
 
-            // Remap to GPU buffer (wrap around for scheduler inspection)
+            // Remap to GPU buffer with consistent data pointer
             entry.tensor->buffer = gpu_buf[0];
-            entry.tensor->data = (char *)gpu_ptr[0] + (offset % gpu_buf_size);
+            entry.tensor->data = (char *)gpu_base + (offset % gpu_buf_size);
             offset += entry.nbytes;
             total_remapped++;
         }
     }
 
-    if (config.trace) {
-        fprintf(stderr, "[weight-stream] remapped %d tensors to GPU buffer for scheduler\n",
-                total_remapped);
-    }
+    // Zero the GPU buffer to prevent illegal access from stale data
+    // during graph allocation (the scheduler may try to read tensor metadata)
+    ggml_backend_buffer_clear(gpu_buf[0], 0);
+
+    fprintf(stderr, "[weight-stream] remapped %d tensors to GPU buffer for scheduler\n",
+            total_remapped);
 }
 
 void llama_weight_stream::restore_tensors_to_cpu() {
@@ -306,8 +317,19 @@ void llama_weight_stream::upload_layer(int il) {
     // then use ggml_backend_tensor_set to upload from CPU source.
     // This way ggml_backend_tensor_set knows the destination is on GPU.
     size_t offset = 0;
-    for (auto & entry : info.entries) {
+    for (size_t ei = 0; ei < info.entries.size(); ei++) {
+        auto & entry = info.entries[ei];
         void * src = entry.orig_data;
+
+        // Bounds check
+        if (offset + entry.nbytes > gpu_buf_size) {
+            fprintf(stderr, "[weight-stream] ERROR: layer %d tensor %zu '%s' overflows buffer: "
+                    "offset=%zu + nbytes=%zu > buf_size=%zu\n",
+                    il, ei, entry.tensor->name ? entry.tensor->name : "?",
+                    offset, entry.nbytes, gpu_buf_size);
+            break;
+        }
+
         void * dst = (char *)dst_base + offset;
 
         // Remap tensor to GPU buffer for compute
