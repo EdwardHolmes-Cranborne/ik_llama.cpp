@@ -3822,10 +3822,22 @@ int llama_decode_layer_major(
         ws->restore_tensors_to_cpu();
     }
 
-    // Force all compute nodes to GPU backend
+    // Force layer compute nodes to GPU backend, but leave embedding lookup
+    // and output projection on their original backends (avoids unsupported
+    // get_rows types on CUDA for some quant formats like q4_K)
     if (use_weight_stream) {
         ggml_backend_t gpu_be = ws->gpu_backend;
         for (int i = 0; i < gf->n_nodes; i++) {
+            const char * name = ggml_get_name(gf->nodes[i]);
+            // Skip embedding/input nodes and final output nodes
+            if (name) {
+                if (strstr(name, "inp_embd") ||
+                    strstr(name, "result_output") ||
+                    strstr(name, "result_embd") ||
+                    gf->nodes[i]->op == GGML_OP_GET_ROWS) {
+                    continue;  // leave on original backend
+                }
+            }
             ggml_backend_sched_set_tensor_backend(lctx.sched, gf->nodes[i], gpu_be);
         }
     }

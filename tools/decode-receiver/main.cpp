@@ -12,6 +12,8 @@
 //   ./decode-receiver -m model.gguf --kv-artifact kv_cache.bin
 
 #include "llama.h"
+#include "common.h"
+#include "sampling.h"
 
 #include "llama-kv-artifact.h"
 #include "llama-kv-import.h"
@@ -36,7 +38,11 @@ struct receiver_params {
     int         n_ctx         = 8192;
     int         n_gpu_layers  = 99;
     int         n_predict     = 2048;
-    float       temp          = 0.7f;
+    float       temp          = 0.8f;
+    int         top_k         = 40;
+    float       top_p         = 0.95f;
+    float       min_p         = 0.05f;
+    int         seed          = -1;
     bool        mlock         = false;
     bool        one_shot      = false;
 
@@ -104,6 +110,18 @@ static bool parse_args(int argc, char ** argv, receiver_params & params) {
         } else if (arg == "--temp") {
             const char * v = next(); if (!v) return false;
             params.temp = (float)std::atof(v);
+        } else if (arg == "--top-k") {
+            const char * v = next(); if (!v) return false;
+            params.top_k = std::atoi(v);
+        } else if (arg == "--top-p") {
+            const char * v = next(); if (!v) return false;
+            params.top_p = (float)std::atof(v);
+        } else if (arg == "--min-p") {
+            const char * v = next(); if (!v) return false;
+            params.min_p = (float)std::atof(v);
+        } else if (arg == "--seed" || arg == "-s") {
+            const char * v = next(); if (!v) return false;
+            params.seed = std::atoi(v);
         } else if (arg == "--mlock") {
             params.mlock = true;
         } else if (arg == "--one-shot") {
@@ -375,7 +393,24 @@ int main(int argc, char ** argv) {
             }
         }
 
-        // Simple greedy decode loop (placeholder — production would use sampling)
+        // Initialize sampler with proper temperature, top-k, top-p, min-p
+        common_params_sampling sparams;
+        sparams.temp     = params.temp;
+        sparams.top_k    = params.top_k;
+        sparams.top_p    = params.top_p;
+        sparams.min_p    = params.min_p;
+        sparams.seed     = (uint32_t)params.seed;
+
+        struct common_sampler * smpl = common_sampler_init(model, sparams);
+        if (!smpl) {
+            fprintf(stderr, "Failed to initialize sampler\n");
+            break;
+        }
+
+        fprintf(stderr, "Sampling: temp=%.2f, top_k=%d, top_p=%.2f, min_p=%.2f, seed=%d\n",
+                params.temp, params.top_k, params.top_p, params.min_p, params.seed);
+
+        // Decode loop with proper sampling (matches llama-cli behavior)
         int tokens_generated = 0;
         llama_token last_token = llama_vocab_bos(vocab);
         auto t_decode_start = std::chrono::steady_clock::now();
@@ -395,31 +430,22 @@ int main(int argc, char ** argv) {
                 break;
             }
 
-            const float * logits = llama_get_logits_ith(ctx, 0);
-            if (!logits) {
-                llama_batch_free(batch);
-                break;
-            }
+            // Sample with temperature, top-k, top-p, min-p
+            llama_token id = common_sampler_sample_legacy(smpl, ctx, nullptr, -1);
+            common_sampler_accept(smpl, ctx, id, true);
 
-            // Greedy argmax
-            llama_token best = 0;
-            float best_val = logits[0];
-            for (int v = 1; v < n_vocab; v++) {
-                if (logits[v] > best_val) { best_val = logits[v]; best = v; }
-            }
-
-            last_token = best;
+            last_token = id;
             tokens_generated++;
 
             // Get token text
             char buf[256];
-            int n = llama_token_to_piece(model, best, buf, sizeof(buf), 0, true);
+            int n = llama_token_to_piece(model, id, buf, sizeof(buf), 0, true);
             std::string text(buf, n > 0 ? n : 0);
 
             // Stream token
             if (ts_ok) {
                 llama_token_msg msg;
-                msg.token_id = best;
+                msg.token_id = id;
                 msg.text = text;
                 msg.pos = (int32_t)(meta.token_count + i);
                 ts_server.enqueue(msg);
@@ -429,12 +455,14 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "%s", text.c_str());
 
             // Check EOS
-            if (best == llama_vocab_eos(vocab)) {
+            if (llama_vocab_is_eog(vocab, id)) {
                 break;
             }
 
             llama_batch_free(batch);
         }
+
+        common_sampler_free(smpl);
 
         auto t_decode_end = std::chrono::steady_clock::now();
         double decode_ms = (double)std::chrono::duration_cast<std::chrono::microseconds>(

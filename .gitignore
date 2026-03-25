@@ -143,3 +143,6 @@ poetry.toml
 # IDE
 *.code-workspace
 .windsurf/
+
+# Sensitive docs (SSH credentials, internal infra)
+docs/remote-mac-control.md
