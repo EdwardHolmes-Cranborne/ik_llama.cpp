@@ -42,7 +42,7 @@ struct receiver_params {
     int         top_k         = 40;
     float       top_p         = 0.95f;
     float       min_p         = 0.05f;
-    int         seed          = -1;
+    int         seed          = 42;
     bool        mlock         = false;
     bool        one_shot      = false;
 
@@ -209,8 +209,10 @@ int main(int argc, char ** argv) {
                     params.kv_host.c_str(), params.kv_port);
 
             llama_kv_receiver_config rcfg;
-            rcfg.bind_host = params.kv_host;
-            rcfg.port      = params.kv_port;
+            rcfg.bind_host       = params.kv_host;
+            rcfg.port            = params.kv_port;
+            rcfg.accept_timeout_ms = 1800000;  // 30 min — RTX prefill can take 15+ min for large models
+            rcfg.recv_timeout_ms   = 600000;   // 10 min recv timeout
 
             llama_kv_receiver_result rresult;
             if (!llama_kv_receiver_accept_artifact(rcfg, artifact_data, &rresult, &err)) {
