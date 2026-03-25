@@ -1,0 +1,8 @@
+set(TARGET decode-receiver)
+add_executable(${TARGET} main.cpp)
+target_link_libraries(${TARGET} PRIVATE llama common ${CMAKE_THREAD_LIBS_INIT})
+target_include_directories(${TARGET} PRIVATE ../../src ../../include ../../common)
+target_compile_features(${TARGET} PRIVATE cxx_std_17)
+if(WIN32)
+    target_link_libraries(${TARGET} PRIVATE ws2_32)
+endif()

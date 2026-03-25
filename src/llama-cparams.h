@@ -46,6 +46,7 @@ struct llama_cparams {
     int  min_experts;
     float thresh_experts;
     bool mtp;
+    bool layer_major; // when true, use layer-major decode path with per-layer eval callbacks
 
     enum ggml_type reduce_type;
     enum llama_pooling_type pooling_type;

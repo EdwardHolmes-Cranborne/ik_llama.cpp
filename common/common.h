@@ -336,6 +336,13 @@ struct gpt_params {
     int  min_experts       = -1;
     float thresh_experts   = 0;
 
+    // Hybrid RTX+Mac streaming prefill handoff
+    bool        layer_major           = false;  // enable layer-major decode path
+    std::string handoff_kv_host;                // remote KV receiver host (e.g. "192.168.3.1")
+    int32_t     handoff_kv_port       = 9100;   // remote KV receiver port
+    std::string handoff_ts_host;                // remote token stream host (defaults to kv_host)
+    int32_t     handoff_ts_port       = 9101;   // remote token stream port
+
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
     bool ignore_eos        = false; // ignore generated EOS tokens
     bool logits_all        = false; // return logits for all tokens in the batch

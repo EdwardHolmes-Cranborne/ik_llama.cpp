@@ -57,6 +57,27 @@ add_library(llama
             llama-hparams.cpp
             llama-delta-net.h
             llama-delta-net.cpp
+            llama-layer-major.h
+            llama-kv-artifact.h
+            llama-kv-artifact.cpp
+            llama-kv-import.h
+            llama-kv-import.cpp
+            llama-kv-receiver.h
+            llama-kv-receiver.cpp
+            llama-token-stream.h
+            llama-token-stream.cpp
+            llama-prefill-strategy.h
+            llama-prefill-strategy.cpp
+            llama-tb-transport.h
+            llama-tb-transport.cpp
+            llama-kv-sync.h
+            llama-kv-sync.cpp
+            llama-decode-handoff.h
+            llama-decode-handoff.cpp
+            llama-weight-stage.h
+            llama-weight-stage.cpp
+            llama-kv-gather.h
+            llama-kv-gather.cpp
             unicode.h
             unicode.cpp
             unicode-data.cpp
@@ -67,6 +88,10 @@ target_include_directories(llama PRIVATE ../ggml/src)
 target_compile_features   (llama PUBLIC cxx_std_17)
 
 target_link_libraries(llama PUBLIC ggml)
+
+if(WIN32)
+    target_link_libraries(llama PRIVATE ws2_32)
+endif()
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)

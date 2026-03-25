@@ -9638,6 +9638,10 @@ ggml_cgraph * llm_build_context::llama_build_graph(
             ggml_set_name(cur, name);
         }
 
+        // Layer-major mode: previously forced all ops to GPU, but this breaks
+        // the scheduler's device-specific routing. Instead, let the standard
+        // scheduling logic run and only override the compute loop.
+
         if (!lctx.cparams.offload_kqv) {
             if (strcmp(name, "kqv_merged_cont") == 0) {
                 // all nodes between the KV store and the attention output are run on the CPU

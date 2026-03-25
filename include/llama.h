@@ -1015,6 +1015,35 @@ extern "C" {
     // Set abort callback
     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);
 
+    // Layer-major streaming prefill: enable per-layer callbacks for weight
+    // streaming, KV-RAM staging, or profiling.  When set, llama_decode()
+    // routes through the layer-major path automatically.
+    // pre_layer(il, n_layer, user_data) fires before each layer's compute.
+    // post_layer(il, n_layer, user_data) fires after each layer's compute.
+    // Pass NULL to disable.
+    typedef void (*llama_layer_callback)(int il, int n_layer, void * user_data);
+    LLAMA_API void llama_set_layer_callbacks(
+            struct llama_context  * ctx,
+            llama_layer_callback    pre_layer,
+            llama_layer_callback    post_layer,
+            void                  * user_data);
+
+    // Enable layer-major decode mode (without custom callbacks).
+    // When enabled, llama_decode() uses per-layer scheduling with eval
+    // callbacks for synchronization, forcing all ops to GPU.
+    LLAMA_API void llama_set_layer_major(struct llama_context * ctx, bool enabled);
+
+    // Hybrid decode handoff: after streaming prefill, export KV and send to
+    // a remote decode receiver, then relay tokens back and sync local KV.
+    // Returns 0 on success.
+    LLAMA_API int32_t llama_decode_handoff(
+            struct llama_context * ctx,
+            int32_t                token_count,
+            const char *           kv_host,
+            int32_t                kv_port,
+            const char *           token_stream_host,
+            int32_t                token_stream_port);
+
     // Wait until all computations are finished
     // This is automatically done when using one of the functions below to obtain the computation results
     // and is not necessary to call it explicitly in most cases

@@ -741,6 +741,22 @@ int main(int argc, char ** argv) {
         embd_guidance.clear();
 
         if ((int) embd_inp.size() <= n_consumed && !is_interacting) {
+            // Hybrid handoff: if configured, send KV to remote decoder instead of local decode
+            if (!params.handoff_kv_host.empty()) {
+                LOG_TEE("\n%s: prefill complete (%d tokens), handing off to %s:%d...\n",
+                        __func__, n_past, params.handoff_kv_host.c_str(), params.handoff_kv_port);
+                int32_t rc = llama_decode_handoff(ctx, n_past,
+                    params.handoff_kv_host.c_str(), params.handoff_kv_port,
+                    params.handoff_ts_host.empty() ? params.handoff_kv_host.c_str() : params.handoff_ts_host.c_str(),
+                    params.handoff_ts_port);
+                if (rc != 0) {
+                    LOG_TEE("%s: handoff failed (rc=%d)\n", __func__, rc);
+                } else {
+                    LOG_TEE("%s: handoff complete\n", __func__);
+                }
+                break;  // exit main loop — remote handles decode
+            }
+
             // optionally save the session on first sample (for faster prompt loading next time)
             if (!path_session.empty() && need_to_save_session && !params.prompt_cache_ro) {
                 need_to_save_session = false;

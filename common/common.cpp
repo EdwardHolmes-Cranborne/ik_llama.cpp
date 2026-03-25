@@ -1346,6 +1346,31 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         }
         return true;
     }
+    // Hybrid RTX+Mac streaming prefill handoff
+    if (arg == "--layer-major") {
+        params.layer_major = true;
+        return true;
+    }
+    if (arg == "--handoff-kv-host") {
+        CHECK_ARG
+        params.handoff_kv_host = argv[i];
+        return true;
+    }
+    if (arg == "--handoff-kv-port") {
+        CHECK_ARG
+        params.handoff_kv_port = std::stoi(argv[i]);
+        return true;
+    }
+    if (arg == "--handoff-ts-host") {
+        CHECK_ARG
+        params.handoff_ts_host = argv[i];
+        return true;
+    }
+    if (arg == "--handoff-ts-port") {
+        CHECK_ARG
+        params.handoff_ts_port = std::stoi(argv[i]);
+        return true;
+    }
     if (arg == "-co" || arg == "--color") {
         params.use_color = true;
         return true;
@@ -3137,6 +3162,11 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
 
     for (auto [op, on_off] : params.offload_policy) {
         llama_set_offload_policy(lctx, op, on_off);
+    }
+
+    // Enable layer-major streaming prefill if requested
+    if (params.layer_major) {
+        llama_set_layer_major(lctx, true);
     }
 
     if (!params.control_vectors.empty()) {

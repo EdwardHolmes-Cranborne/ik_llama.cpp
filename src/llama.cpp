@@ -18,6 +18,8 @@
 #include "llama-hparams.h"
 #include "llama-context.h"
 #include "llama-quantize.h"
+#include "llama-layer-major.h"
+#include "llama-decode-handoff.h"
 
 #include "unicode.h"
 
@@ -106,6 +108,8 @@
 #include <initializer_list>
 #include <locale>
 #include <map>
+#include <atomic>
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <numeric>
@@ -2665,7 +2669,6 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
     //
     // set input data
     //
-
     const auto & hparams = lctx.model.hparams;
     const auto & cparams = lctx.cparams;
     const auto & kv_self = lctx.kv_self;
@@ -2675,7 +2678,6 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
         auto tim1 = ggml_time_us();
 #endif
         const int64_t n_tokens = batch.n_tokens;
-
         ggml_backend_tensor_set(lctx.inp_tokens, batch.token, 0, n_tokens*ggml_element_size(lctx.inp_tokens));
 #if IK_PRINT_TIMING == 2
         auto tim2 = ggml_time_us();
@@ -3364,6 +3366,432 @@ static bool prepare_mtp_graph_inputs(struct llama_context & lctx) {
     return true;
 }
 
+// ============================================================================
+// Layer-major streaming prefill
+// ============================================================================
+
+// Compute an already-allocated graph with per-layer eval callbacks.
+// Scans graph node names for "-{il}" suffixes to detect layer boundaries.
+// Fires pre_layer_cb/post_layer_cb at each boundary via the scheduler's
+// eval callback mechanism — single scheduler pass, no graph splitting.
+static ggml_status llama_graph_compute_per_layer(
+        llama_context   & lctx,
+        ggml_cgraph     * gf,
+        bool              batched,
+        layer_callback_fn pre_layer_cb,
+        layer_callback_fn post_layer_cb) {
+
+    const int n_layer = (int)lctx.model.hparams.n_layer;
+    lctx.last_layer_compute_times_ms.assign(n_layer > 0 ? n_layer : 0, 0.0f);
+
+    const char * trace_env = std::getenv("LLAMA_PREFILL_LAYER_TRACE");
+    const bool   trace     = trace_env && trace_env[0] && std::strcmp(trace_env, "0") != 0;
+
+    // Threading setup
+    int n_threads = batched ? (int)lctx.cparams.n_threads_batch : (int)lctx.cparams.n_threads;
+
+    if (lctx.backend_cpu != nullptr) {
+        ggml_backend_cpu_set_n_threads(lctx.backend_cpu, n_threads);
+        ggml_backend_cpu_set_abort_callback(lctx.backend_cpu, lctx.abort_callback, lctx.abort_callback_data);
+    }
+#ifdef GGML_USE_METAL
+    if (lctx.backend_metal != nullptr) {
+        ggml_backend_metal_set_n_cb(lctx.backend_metal, n_threads);
+    }
+#endif
+#ifdef GGML_USE_BLAS
+    if (lctx.backend_blas != nullptr) {
+        ggml_backend_blas_set_n_threads(lctx.backend_blas, n_threads);
+    }
+#endif
+
+    // Parse layer suffix: find last '-' then parse integer
+    auto parse_layer_suffix = [&](const char * name) -> int {
+        if (!name) return -1;
+        const char * dash = strrchr(name, '-');
+        if (!dash || *(dash + 1) == '\0') return -1;
+        char * end = nullptr;
+        long il = strtol(dash + 1, &end, 10);
+        if (!end || *end != '\0') return -1;
+        if (il < 0 || il >= n_layer) return -1;
+        return (int)il;
+    };
+
+    // Scan graph for layer boundaries
+    std::vector<int> first_idx(n_layer, -1);
+    std::vector<int> last_idx(n_layer, -1);
+
+    for (int i = 0; i < gf->n_nodes; ++i) {
+        const int il = parse_layer_suffix(ggml_get_name(gf->nodes[i]));
+        if (il < 0) continue;
+        if (first_idx[il] < 0) first_idx[il] = i;
+        last_idx[il] = i;
+    }
+
+    for (int il = 0; il < n_layer; ++il) {
+        if (first_idx[il] < 0 || last_idx[il] < first_idx[il]) {
+            LLAMA_LOG_ERROR("%s: could not determine node range for layer %d\n", __func__, il);
+            return GGML_STATUS_FAILED;
+        }
+    }
+
+    // Build contiguous layer ranges
+    std::vector<int> layer_start_idx(n_layer, 0);
+    std::vector<int> layer_end_idx(n_layer, 0);
+    for (int il = 0; il < n_layer; ++il) {
+        const int start      = first_idx[il];
+        const int next_start = (il + 1 < n_layer) ? first_idx[il + 1] : gf->n_nodes;
+        const int end        = std::max(last_idx[il] + 1, next_start);
+
+        if (end <= start) {
+            LLAMA_LOG_ERROR("%s: invalid layer range for layer %d: [%d, %d)\n", __func__, il, start, end);
+            return GGML_STATUS_FAILED;
+        }
+        if (il + 1 < n_layer && last_idx[il] >= first_idx[il + 1]) {
+            LLAMA_LOG_ERROR("%s: interleaved layers %d/%d\n", __func__, il, il + 1);
+            return GGML_STATUS_FAILED;
+        }
+        layer_start_idx[il] = start;
+        layer_end_idx[il]   = end;
+    }
+
+    const int pre_layer_end    = std::max(0, layer_start_idx[0]);
+    const int post_layer_start = layer_end_idx[n_layer - 1];
+
+    // Assign phase to each node: -1=pre, il=layer, -2=post
+    std::vector<int> node_phase(gf->n_nodes, -3);
+    for (int i = 0; i < pre_layer_end; ++i) node_phase[i] = -1;
+    for (int il = 0; il < n_layer; ++il) {
+        for (int i = layer_start_idx[il]; i < layer_end_idx[il]; ++i) node_phase[i] = il;
+    }
+    for (int i = post_layer_start; i < gf->n_nodes; ++i) node_phase[i] = -2;
+
+    // Build node-to-index map for eval callback lookup
+    std::unordered_map<ggml_tensor *, int> node_to_index;
+    node_to_index.reserve(gf->n_nodes * 2);
+    for (int i = 0; i < gf->n_nodes; ++i) {
+        node_to_index.emplace(gf->nodes[i], i);
+    }
+
+    // Eval callback state — uses atomics for thread safety with graph split
+    // async execution where callbacks may fire from multiple backend threads.
+    std::vector<std::atomic<int>> layer_state(n_layer);  // 0=pending, 1=started, 2=completed
+    for (int i = 0; i < n_layer; i++) layer_state[i].store(0, std::memory_order_relaxed);
+    std::vector<std::chrono::high_resolution_clock::time_point> layer_start_tp(n_layer);
+
+    struct per_layer_eval_state {
+        const std::unordered_map<ggml_tensor *, int> * node_to_index;
+        const std::vector<int> * node_phase;
+        const std::vector<int> * layer_end_idx;
+        std::vector<std::atomic<int>> * layer_state;  // atomic: 0=pending, 1=started, 2=completed
+        std::vector<std::chrono::high_resolution_clock::time_point> * layer_start_tp;
+        std::vector<float> * layer_compute_ms;
+        layer_callback_fn * pre_layer_cb;
+        layer_callback_fn * post_layer_cb;
+        ggml_backend_sched_eval_callback user_cb;
+        void * user_cb_user_data;
+        int n_layer;
+        int pre_layer_last_idx;
+        int post_layer_last_idx;
+        bool trace;
+    };
+
+    per_layer_eval_state eval_state = {
+        &node_to_index,
+        &node_phase,
+        &layer_end_idx,
+        &layer_state,
+        &layer_start_tp,
+        &lctx.last_layer_compute_times_ms,
+        &pre_layer_cb,
+        &post_layer_cb,
+        lctx.cparams.cb_eval,
+        lctx.cparams.cb_eval_user_data,
+        n_layer,
+        pre_layer_end > 0 ? pre_layer_end - 1 : -1,
+        post_layer_start < gf->n_nodes ? gf->n_nodes - 1 : -1,
+        trace,
+    };
+
+    auto eval_cb = [](ggml_tensor * t, bool ask, void * user_data) -> bool {
+        auto * st = (per_layer_eval_state *)user_data;
+        auto it = st->node_to_index->find(t);
+        if (it == st->node_to_index->end()) {
+            return st->user_cb ? st->user_cb(t, ask, st->user_cb_user_data) : true;
+        }
+
+        const int node_idx = it->second;
+        const int phase    = (*(st->node_phase))[node_idx];
+
+        if (ask) {
+            // Fire pre-layer callback on first node of each layer.
+            // Uses atomic CAS to ensure exactly one thread fires the callback
+            // even with async graph split execution across multiple devices.
+            if (phase >= 0) {
+                int expected = 0;
+                if ((*(st->layer_state))[phase].compare_exchange_strong(
+                        expected, 1, std::memory_order_acq_rel)) {
+                    if (st->trace) {
+                        const char * name = ggml_get_name(t);
+                        LLAMA_LOG_INFO("%s: begin layer %d at node %d (%s)\n",
+                                       __func__, phase, node_idx, name ? name : "?");
+                    }
+                    if (st->pre_layer_cb && *st->pre_layer_cb) {
+                        (*(st->pre_layer_cb))(phase, st->n_layer);
+                    }
+                    (*(st->layer_start_tp))[phase] = std::chrono::high_resolution_clock::now();
+                }
+            }
+
+            // Return true at layer boundaries to force scheduler sync
+            bool boundary = false;
+            if (phase == -1)       boundary = (node_idx == st->pre_layer_last_idx);
+            else if (phase == -2)  boundary = (node_idx == st->post_layer_last_idx);
+            else                   boundary = (node_idx == (*(st->layer_end_idx))[phase] - 1);
+
+            bool user = st->user_cb ? st->user_cb(t, true, st->user_cb_user_data) : false;
+            return boundary || user;
+        }
+
+        // Post-compute: fire post-layer callback on last node of each layer.
+        // Atomic CAS from 1→2 ensures exactly one thread fires the post callback.
+        if (phase >= 0 && node_idx == (*(st->layer_end_idx))[phase] - 1) {
+            int expected = 1;
+            if ((*(st->layer_state))[phase].compare_exchange_strong(
+                    expected, 2, std::memory_order_acq_rel)) {
+                if (st->post_layer_cb && *st->post_layer_cb) {
+                    (*(st->post_layer_cb))(phase, st->n_layer);
+                }
+                auto t_end = std::chrono::high_resolution_clock::now();
+                float ms = std::chrono::duration<float, std::milli>(
+                    t_end - (*(st->layer_start_tp))[phase]).count();
+                (*(st->layer_compute_ms))[phase] = ms;
+                if (st->trace) {
+                    const char * name = ggml_get_name(t);
+                    LLAMA_LOG_INFO("%s: end layer %d at node %d (%s), %.2f ms\n",
+                                   __func__, phase, node_idx, name ? name : "?", ms);
+                }
+            }
+        }
+
+        return st->user_cb ? st->user_cb(t, false, st->user_cb_user_data) : true;
+    };
+
+    // Register callback, compute, restore original callback
+    ggml_backend_sched_set_eval_callback(lctx.sched, eval_cb, &eval_state);
+    const auto status = ggml_backend_sched_graph_compute_async(lctx.sched, gf);
+    ggml_backend_sched_set_eval_callback(lctx.sched, lctx.cparams.cb_eval, lctx.cparams.cb_eval_user_data);
+
+    if (status != GGML_STATUS_SUCCESS) {
+        LLAMA_LOG_ERROR("%s: per-layer compute failed\n", __func__);
+    }
+    return status;
+}
+
+// Layer-major decode: builds one graph, computes it with per-layer callbacks.
+// Single-ubatch only — processes entire batch at once (no ubatch splitting).
+int llama_decode_layer_major(
+        llama_context & lctx,
+        llama_batch     batch_all) {
+
+    lctx.is_encoding = false;
+    const uint32_t n_tokens_all = batch_all.n_tokens;
+
+    if (n_tokens_all == 0) {
+        LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
+        return -1;
+    }
+
+    const auto & model   = lctx.model;
+    const auto & hparams = model.hparams;
+    const auto & cparams = lctx.cparams;
+
+    GGML_ASSERT((!batch_all.token && batch_all.embd) || (batch_all.token && !batch_all.embd));
+
+    if (lctx.t_compute_start_us == 0) {
+        lctx.t_compute_start_us = ggml_time_us();
+    }
+    lctx.n_queued_tokens += n_tokens_all;
+
+    auto & kv_self = lctx.kv_self;
+    const int64_t n_embd  = hparams.n_embd;
+    const int64_t n_vocab = hparams.n_vocab;
+
+    // Count outputs
+    const bool embd_pooled = cparams.embeddings && cparams.pooling_type != LLAMA_POOLING_TYPE_NONE;
+    uint32_t n_outputs = 0;
+
+    if (batch_all.logits && !embd_pooled) {
+        for (uint32_t i = 0; i < n_tokens_all; ++i) {
+            n_outputs += batch_all.logits[i] != 0;
+        }
+    } else if (lctx.logits_all || embd_pooled) {
+        n_outputs = n_tokens_all;
+    } else {
+        n_outputs = 1;
+    }
+
+    // Reserve output buffer
+    if (llama_output_reserve(lctx, n_outputs) < n_outputs) {
+        LLAMA_LOG_ERROR("%s: could not reserve space for %u outputs\n", __func__, n_outputs);
+        return -2;
+    }
+
+    // Set output mappings
+    if (batch_all.logits) {
+        int32_t i_logits = 0;
+        for (uint32_t i = 0; i < n_tokens_all; ++i) {
+            if (batch_all.logits[i]) {
+                lctx.output_ids[i] = i_logits++;
+            }
+        }
+    } else {
+        for (uint32_t i = 0; i < n_outputs; ++i) {
+            lctx.output_ids[i] = i;
+        }
+    }
+
+    // Expand compact batch (from llama_batch_get_one) into full arrays.
+    // The KV cache find_slot needs pos[], n_seq_id[], seq_id[] to be non-null.
+    // These buffers must live until the function returns.
+    std::vector<llama_pos>      _pos_buf;
+    std::vector<int32_t>        _n_seq_id_buf;
+    std::vector<llama_seq_id>   _seq_id_flat;
+    std::vector<llama_seq_id *> _seq_id_ptrs;
+    std::vector<int8_t>         _logits_buf;
+
+    if (!batch_all.pos) {
+        _pos_buf.resize(n_tokens_all);
+        for (uint32_t i = 0; i < n_tokens_all; i++) {
+            _pos_buf[i] = batch_all.all_pos_0 + (llama_pos)(i * batch_all.all_pos_1);
+        }
+        batch_all.pos = _pos_buf.data();
+    }
+    if (!batch_all.n_seq_id) {
+        _n_seq_id_buf.assign(n_tokens_all, 1);
+        batch_all.n_seq_id = _n_seq_id_buf.data();
+    }
+    if (!batch_all.seq_id) {
+        _seq_id_flat.assign(n_tokens_all, batch_all.all_seq_id);
+        _seq_id_ptrs.resize(n_tokens_all);
+        for (uint32_t i = 0; i < n_tokens_all; i++) {
+            _seq_id_ptrs[i] = &_seq_id_flat[i];
+        }
+        batch_all.seq_id = _seq_id_ptrs.data();
+    }
+    if (!batch_all.logits) {
+        _logits_buf.assign(n_tokens_all, 0);
+        _logits_buf[n_tokens_all - 1] = 1;
+        batch_all.logits = _logits_buf.data();
+    }
+
+    // KV cache: find slot for the full batch
+    if (!llama_kv_cache_find_slot(kv_self, batch_all, MTP_OP_NONE)) {
+        LLAMA_LOG_ERROR("%s: could not find KV slot for batch\n", __func__);
+        return 1;  // positive = warning (try smaller batch)
+    }
+    // Pad kv_self.n for flash attention alignment (same as standard decode path)
+    if (!kv_self.recurrent) {
+        const uint32_t pad = llama_kv_cache_get_padding(cparams);
+        kv_self.n = std::min(kv_self.size, std::max(pad, GGML_PAD(kv_self.head + n_tokens_all, pad)));
+    } else {
+        kv_self.n = kv_self.head + n_tokens_all;
+    }
+    // Set n_outputs BEFORE building the graph — the graph builder reads this
+    lctx.n_outputs = n_outputs;
+
+    // Build graph for the full batch (single ubatch = full batch)
+    lctx.reset_scheduler();
+
+    // Eval callback will be overridden by graph_compute_per_layer, but set
+    // it here so the graph builder sees any user callback for tensor routing
+    ggml_backend_sched_set_eval_callback(lctx.sched, lctx.cparams.cb_eval, lctx.cparams.cb_eval_user_data);
+
+    ggml_cgraph * gf = llm_build_context::llama_build_graph(lctx, batch_all, false);
+
+    ggml_backend_sched_alloc_graph(lctx.sched, gf);
+
+    // Set inputs
+    llama_set_inputs(lctx, batch_all);
+
+    // Wrap callbacks: include user-registered per-layer callbacks
+    layer_callback_fn pre_cb = lctx.per_layer_pre_cb;
+    layer_callback_fn post_cb = lctx.per_layer_post_cb;
+
+    // Compute with per-layer callbacks
+    auto status = llama_graph_compute_per_layer(lctx, gf, true, pre_cb, post_cb);
+    if (status != GGML_STATUS_SUCCESS) {
+        LLAMA_LOG_ERROR("%s: layer-major compute failed\n", __func__);
+        return -1;
+    }
+
+    // Find result tensors
+    struct ggml_tensor * res  = gf->nodes[gf->n_nodes - 1];
+    struct ggml_tensor * embd = nullptr;
+
+    if (lctx.n_outputs == 0) {
+        res = nullptr;
+    } else {
+        if (cparams.embeddings) {
+            for (int i = gf->n_nodes - 1; i >= 0; --i) {
+                if (strcmp(gf->nodes[i]->name, "result_embd_pooled") == 0) {
+                    embd = gf->nodes[i]; break;
+                }
+                if (strcmp(gf->nodes[i]->name, "result_norm") == 0) {
+                    embd = gf->nodes[i];
+                }
+            }
+        }
+        if (cparams.embeddings && hparams.nextn_predict_layers == 0) {
+            res = nullptr;
+        } else if (!embd) {
+            GGML_ASSERT(strcmp(res->name, "result_output") == 0 && "missing result_output tensor");
+        }
+    }
+
+    // Extract logits
+    if (res) {
+        ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(lctx.sched, res);
+        GGML_ASSERT(backend_res != nullptr);
+        GGML_ASSERT(lctx.logits != nullptr);
+
+        float * logits_out = lctx.logits;
+        const int32_t n_outputs_new = lctx.n_outputs;
+        if (n_outputs_new) {
+            GGML_ASSERT((int64_t)n_outputs_new * n_vocab <= (int64_t)lctx.logits_size);
+            ggml_backend_tensor_get_async(backend_res, res, logits_out, 0, n_outputs_new * n_vocab * sizeof(float));
+        }
+    }
+
+    // Extract embeddings
+    if (embd) {
+        ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(lctx.sched, embd);
+        GGML_ASSERT(backend_embd != nullptr);
+
+        if (cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
+            GGML_ASSERT(lctx.embd != nullptr);
+            float * embd_out = lctx.embd;
+            const int32_t n_outputs_new = lctx.n_outputs;
+            if (n_outputs_new) {
+                GGML_ASSERT((int64_t)n_outputs_new * n_embd <= (int64_t)lctx.embd_size);
+                ggml_backend_tensor_get_async(backend_embd, embd, embd_out, 0, n_outputs_new * n_embd * sizeof(float));
+            }
+        }
+    }
+
+    // Update stats
+    lctx.has_evaluated_once = true;
+    lctx.t_p_eval_us += ggml_time_us() - lctx.t_compute_start_us;
+    lctx.n_p_eval += n_tokens_all;
+
+    // Sync backends
+    for (auto * backend : lctx.backends) {
+        ggml_backend_synchronize(backend);
+    }
+
+    return 0;
+}
+
 // decode a batch of tokens by evaluating the transformer
 //
 //   - lctx:      llama context
@@ -3397,6 +3825,12 @@ static int llama_decode_internal(
     GGML_ASSERT(n_tokens_all <= cparams.n_batch);
 
     GGML_ASSERT((cparams.causal_attn || cparams.n_ubatch >= n_tokens_all) && "non-causal attention requires n_ubatch >= n_tokens");
+
+    // Route to layer-major decode when enabled
+    // Only use layer-major for multi-token prefill (not single-token decode)
+    if ((lctx.has_per_layer_callbacks() || cparams.layer_major) && n_tokens_all > 1) {
+        return llama_decode_layer_major(lctx, batch_all);
+    }
 
     if (lctx.t_compute_start_us == 0) {
         lctx.t_compute_start_us = ggml_time_us();
@@ -5016,6 +5450,7 @@ struct llama_context * llama_init_from_model(
     cparams.thresh_experts   = params.thresh_experts;
     cparams.cuda_params      = params.cuda_params;
     cparams.mtp              = params.mtp;
+    cparams.layer_major      = false; // set via llama_set_layer_major() or llama_set_layer_callbacks()
 
     cparams.reduce_type      = params.type_reduce;
     cparams.pooling_type     = params.pooling_type;
@@ -7338,6 +7773,59 @@ uint32_t llama_n_threads_batch(struct llama_context * ctx) {
 void llama_set_abort_callback(struct llama_context * ctx, bool (*abort_callback)(void * data), void * abort_callback_data) {
     ctx->abort_callback      = abort_callback;
     ctx->abort_callback_data = abort_callback_data;
+}
+
+void llama_set_layer_callbacks(
+        struct llama_context  * ctx,
+        llama_layer_callback    pre_layer,
+        llama_layer_callback    post_layer,
+        void                  * user_data) {
+    if (pre_layer) {
+        ctx->set_per_layer_callbacks(
+            [pre_layer, user_data](int il, int nl) { pre_layer(il, nl, user_data); },
+            post_layer ? layer_callback_fn([post_layer, user_data](int il, int nl) { post_layer(il, nl, user_data); })
+                       : layer_callback_fn{});
+    } else {
+        ctx->set_per_layer_callbacks({}, {});
+    }
+}
+
+void llama_set_layer_major(struct llama_context * ctx, bool enabled) {
+    ctx->cparams.layer_major = enabled;
+}
+
+int32_t llama_decode_handoff(
+        struct llama_context * ctx,
+        int32_t                token_count,
+        const char *           kv_host,
+        int32_t                kv_port,
+        const char *           token_stream_host,
+        int32_t                token_stream_port) {
+
+    llama_decode_handoff_runtime runtime;
+    runtime.kv_host           = kv_host ? kv_host : "192.168.3.1";
+    runtime.kv_port           = kv_port > 0 ? kv_port : 9100;
+    runtime.token_stream_host = token_stream_host ? token_stream_host : runtime.kv_host;
+    runtime.token_stream_port = token_stream_port > 0 ? token_stream_port : 9101;
+
+    llama_decode_executor executor(runtime);
+
+    // Publish KV
+    std::string err;
+    llama_decode_publish_diag pub_diag;
+    if (!executor.publish_kv_artifact(ctx, token_count, &pub_diag, &err)) {
+        LLAMA_LOG_ERROR("decode_handoff: publish failed: %s\n", err.c_str());
+        return -1;
+    }
+
+    // Relay tokens
+    llama_decode_relay_result relay_result;
+    if (!executor.relay_tokens(ctx, &relay_result, &err)) {
+        LLAMA_LOG_ERROR("decode_handoff: relay failed: %s\n", err.c_str());
+        return -2;
+    }
+
+    return 0;
 }
 
 void llama_set_embeddings(struct llama_context * ctx, bool embeddings) {

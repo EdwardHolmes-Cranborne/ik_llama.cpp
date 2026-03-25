@@ -10,6 +10,10 @@ struct llama_model;
 #include <map>
 #include <set>
 #include <memory>
+#include <functional>
+
+// Per-layer callback type: (layer_index, total_layers)
+using layer_callback_fn = std::function<void(int, int)>;
 
 struct llama_kv_cell {
     llama_pos pos   = -1;
@@ -232,4 +236,20 @@ struct llama_context {
     bool prepare_mtp_graph_inputs(
         struct llama_context & lctx);
     void set_mtp_op_type(llama_mtp_op_type value);
+
+    // --- Layer-major streaming prefill infrastructure ---
+
+    // Per-layer dispatch callbacks (set by streaming prefill or external user)
+    layer_callback_fn per_layer_pre_cb;
+    layer_callback_fn per_layer_post_cb;
+    std::vector<float> last_layer_compute_times_ms;
+
+    void set_per_layer_callbacks(layer_callback_fn pre_cb, layer_callback_fn post_cb) {
+        per_layer_pre_cb  = std::move(pre_cb);
+        per_layer_post_cb = std::move(post_cb);
+    }
+
+    bool has_per_layer_callbacks() const { return per_layer_pre_cb || per_layer_post_cb; }
+
+    const std::vector<float> & get_last_layer_compute_times_ms() const { return last_layer_compute_times_ms; }
 };
