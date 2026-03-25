@@ -20,6 +20,7 @@
 #include "llama-quantize.h"
 #include "llama-layer-major.h"
 #include "llama-decode-handoff.h"
+#include "llama-weight-stage.h"
 
 #include "unicode.h"
 
@@ -3700,6 +3701,46 @@ int llama_decode_layer_major(
     // Set n_outputs BEFORE building the graph — the graph builder reads this
     lctx.n_outputs = n_outputs;
 
+    // ---- Weight streaming setup ----
+    // Detect if we need weight streaming: model weights on CPU, GPU available
+    bool use_weight_stream = false;
+    llama_weight_stream * ws = nullptr;
+
+    // Check if first layer's weights are on CPU (proxy for -ngl 0)
+    if (n_tokens_all > 1 && !model.layers.empty() && model.layers[0].attn_norm) {
+        ggml_backend_buffer_t first_buf = model.layers[0].attn_norm->buffer;
+        bool weights_on_cpu = first_buf && ggml_backend_buffer_is_host(first_buf);
+
+        // Find a GPU backend from the context
+        ggml_backend_t gpu_be = nullptr;
+        for (auto * be : lctx.backends) {
+            if (be != lctx.backend_cpu) {
+                gpu_be = be;
+                break;
+            }
+        }
+
+        if (weights_on_cpu && gpu_be) {
+            // Initialize weight stream if not already done
+            if (!lctx.weight_stream) {
+                lctx.weight_stream = std::make_unique<llama_weight_stream>();
+                const char * trace_env = std::getenv("LLAMA_PREFILL_LAYER_TRACE");
+                lctx.weight_stream->config.trace = trace_env && trace_env[0] && std::strcmp(trace_env, "0") != 0;
+
+                lctx.weight_stream->collect_layer_tensors(&model);
+                if (!lctx.weight_stream->allocate_gpu_buffers(gpu_be)) {
+                    LLAMA_LOG_ERROR("%s: failed to allocate weight streaming buffers\n", __func__);
+                    lctx.weight_stream.reset();
+                }
+            }
+
+            if (lctx.weight_stream) {
+                ws = lctx.weight_stream.get();
+                use_weight_stream = true;
+            }
+        }
+    }
+
     // Build graph for the full batch (single ubatch = full batch)
     lctx.reset_scheduler();
 
@@ -3707,16 +3748,43 @@ int llama_decode_layer_major(
     // it here so the graph builder sees any user callback for tensor routing
     ggml_backend_sched_set_eval_callback(lctx.sched, lctx.cparams.cb_eval, lctx.cparams.cb_eval_user_data);
 
+    // If streaming: temporarily remap tensors to GPU so scheduler routes to GPU
+    if (use_weight_stream) {
+        ws->remap_tensors_to_gpu();
+    }
+
     ggml_cgraph * gf = llm_build_context::llama_build_graph(lctx, batch_all, false);
 
     ggml_backend_sched_alloc_graph(lctx.sched, gf);
+
+    // Restore tensors to CPU after scheduler has made backend decisions
+    if (use_weight_stream) {
+        ws->restore_tensors_to_cpu();
+    }
 
     // Set inputs
     llama_set_inputs(lctx, batch_all);
 
     // Wrap callbacks: include user-registered per-layer callbacks
+    // If weight streaming is active, chain the upload/restore callbacks
     layer_callback_fn pre_cb = lctx.per_layer_pre_cb;
     layer_callback_fn post_cb = lctx.per_layer_post_cb;
+
+    if (use_weight_stream) {
+        auto ws_pre  = ws->make_pre_layer_cb();
+        auto ws_post = ws->make_post_layer_cb();
+        auto user_pre  = pre_cb;
+        auto user_post = post_cb;
+
+        pre_cb = [ws_pre, user_pre](int il, int n) {
+            ws_pre(il, n);
+            if (user_pre) user_pre(il, n);
+        };
+        post_cb = [ws_post, user_post](int il, int n) {
+            if (user_post) user_post(il, n);
+            ws_post(il, n);
+        };
+    }
 
     // Compute with per-layer callbacks
     auto status = llama_graph_compute_per_layer(lctx, gf, true, pre_cb, post_cb);

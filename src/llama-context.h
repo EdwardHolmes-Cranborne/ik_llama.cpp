@@ -5,6 +5,7 @@
 #include "llama-sampling.h"
 
 struct llama_model;
+struct llama_weight_stream;
 
 #include <vector>
 #include <map>
@@ -243,6 +244,9 @@ struct llama_context {
     layer_callback_fn per_layer_pre_cb;
     layer_callback_fn per_layer_post_cb;
     std::vector<float> last_layer_compute_times_ms;
+
+    // Weight streaming engine (for -ngl 0 with GPU compute)
+    std::unique_ptr<llama_weight_stream> weight_stream;
 
     void set_per_layer_callbacks(layer_callback_fn pre_cb, layer_callback_fn post_cb) {
         per_layer_pre_cb  = std::move(pre_cb);

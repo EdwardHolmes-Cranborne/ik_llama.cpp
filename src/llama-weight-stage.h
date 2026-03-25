@@ -1,69 +1,132 @@
 #pragma once
 
-#include "llama-context.h"
+// Weight streaming engine for layer-major prefill.
+//
+// Enables -ngl 0 with GPU compute by streaming weights from CPU/mmap
+// to GPU layer-by-layer through ping-pong staging buffers.
+//
+// Architecture:
+//   1. Model loaded with -ngl 0: all weights in CPU heap/mmap
+//   2. Allocate 2 GPU buffers sized to hold the largest layer
+//   3. Temporarily remap all weight tensor->buffer/data to GPU buffer
+//      so ggml_backend_sched routes compute to CUDA
+//   4. Restore original CPU pointers after graph allocation
+//   5. Per-layer callbacks memcpy weights from CPU -> active GPU buffer
+//   6. Ping-pong between GPU buffers A and B across layers
+//
+// DirectStorage integration: when DS is available (Windows + NVMe),
+// weights are read directly from NVMe to GPU via D3D12, bypassing CPU.
+// This is a future extension; the initial implementation uses CPU->GPU memcpy.
+
 #include "ggml.h"
 #include "ggml-backend.h"
 
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <string>
 #include <vector>
 
-// Weight staging for layer-major streaming prefill.
-// Manages double-buffered GPU staging buffers for models that don't fit
-// in VRAM. Each layer's weights are uploaded to a GPU buffer just before
-// compute, and the buffer is recycled after compute completes.
-//
-// Compatible with graph split multi-GPU: when split_mode_graph is active,
-// each device gets its own pair of staging buffers.
+// Forward declarations
+struct llama_model;
+struct llama_context;
+struct llama_layer;
 
-struct llama_weight_stage_config {
-    size_t  buffer_size     = 0;    // per-buffer size (0 = auto from max layer)
-    int     n_buffers       = 2;    // double-buffer by default
-    int     prefetch_distance = 1;  // upload N+prefetch while computing N
+// Callback type for per-layer notifications
+using layer_callback_fn = std::function<void(int il, int n_layer)>;
+
+// ============================================================================
+// Tensor remap entry — tracks original and remapped tensor state
+// ============================================================================
+
+struct wf_tensor_remap_entry {
+    struct ggml_tensor *       tensor      = nullptr;
+    ggml_backend_buffer_t      orig_buffer = nullptr;
+    void *                     orig_data   = nullptr;
+    size_t                     nbytes      = 0;
 };
 
-struct llama_weight_stage_stats {
-    int     layers_staged   = 0;
-    double  total_upload_ms = 0.0;
-    double  total_compute_ms = 0.0;
-    double  overlap_ms      = 0.0;  // time compute overlapped with upload
+// Per-layer tensor collection
+struct wf_layer_tensor_info {
+    std::vector<wf_tensor_remap_entry> entries;
+    size_t total_bytes = 0;
 };
 
-// Per-device staging state
-struct llama_weight_stage_device {
-    ggml_backend_buffer_t bufs[2] = {nullptr, nullptr};
-    void *                ptrs[2] = {nullptr, nullptr};
-    size_t                buf_size = 0;
-    int                   active_buf = 0;  // which buffer is currently in use
+// ============================================================================
+// Weight streaming context
+// ============================================================================
 
-    void * get_active()  const { return ptrs[active_buf]; }
-    void * get_staging() const { return ptrs[1 - active_buf]; }
-    void   swap()              { active_buf = 1 - active_buf; }
+struct llama_weight_stream_config {
+    int     n_buffers       = 2;     // ping-pong GPU buffers
+    bool    trace           = false; // verbose logging
+    bool    use_dstorage    = false; // future: DirectStorage path
 };
 
-// Weight staging manager
-struct llama_weight_stage {
-    llama_weight_stage_config config;
-    std::vector<llama_weight_stage_device> devices;
-    llama_weight_stage_stats stats;
-
-    // Initialize staging buffers for the given backends.
-    // max_layer_bytes: largest layer weight size across all layers.
-    bool init(const std::vector<ggml_backend_t> & backends,
-              ggml_backend_t backend_cpu,
-              size_t max_layer_bytes);
-
-    // Free all staging buffers.
-    void free();
-
-    // Get pre/post layer callbacks that manage weight staging.
-    // upload_fn(il, device_id, dst_ptr, dst_size) should upload layer il's
-    // weights for device_id to the provided GPU buffer.
-    using upload_fn_t = std::function<void(int il, int device_id, void * dst, size_t size)>;
-
-    layer_callback_fn make_pre_cb(upload_fn_t upload_fn);
-    layer_callback_fn make_post_cb();
-
-    ~llama_weight_stage() { free(); }
+struct llama_weight_stream_stats {
+    int     layers_staged      = 0;
+    double  total_upload_ms    = 0.0;
+    double  total_stall_ms     = 0.0;
+    double  total_compute_ms   = 0.0;
+    size_t  bytes_uploaded     = 0;
 };
+
+struct llama_weight_stream {
+    llama_weight_stream_config config;
+    llama_weight_stream_stats  stats;
+
+    // Per-layer tensor info (populated at init)
+    std::vector<wf_layer_tensor_info> layer_infos;
+    size_t max_layer_bytes = 0;
+
+    // GPU staging buffers (ping-pong)
+    ggml_backend_buffer_t gpu_buf[2] = {nullptr, nullptr};
+    void *                gpu_ptr[2] = {nullptr, nullptr};
+    size_t                gpu_buf_size = 0;
+    int                   active_buf = 0;
+
+    // The GPU backend that owns the staging buffers
+    ggml_backend_t        gpu_backend = nullptr;
+
+    // ---- Lifecycle ----
+
+    // Collect all per-layer tensors from the model and compute sizes.
+    void collect_layer_tensors(const llama_model * model);
+
+    // Allocate GPU staging buffers on the given backend.
+    bool allocate_gpu_buffers(ggml_backend_t backend);
+
+    // Temporarily remap ALL layer tensors to point at the GPU buffer.
+    // This makes ggml_backend_sched route compute to GPU.
+    // Call this BEFORE ggml_backend_sched_alloc_graph().
+    void remap_tensors_to_gpu();
+
+    // Restore ALL layer tensors to their original CPU pointers.
+    // Call this AFTER ggml_backend_sched_alloc_graph().
+    void restore_tensors_to_cpu();
+
+    // Upload layer `il` weights from CPU -> active GPU buffer.
+    // Remaps tensor pointers to the GPU buffer for compute.
+    void upload_layer(int il);
+
+    // Restore layer `il` tensors and swap active buffer.
+    void finish_layer(int il);
+
+    // Get pre/post layer callbacks for use with layer-major decode.
+    layer_callback_fn make_pre_layer_cb();
+    layer_callback_fn make_post_layer_cb();
+
+    // Free GPU buffers.
+    void free_buffers();
+
+    ~llama_weight_stream() { free_buffers(); }
+};
+
+// ============================================================================
+// Utility: collect all non-null tensor pointers from an ik_llama layer
+// ============================================================================
+
+void wf_collect_tensors_from_layer(const llama_layer & layer,
+                                   std::vector<wf_tensor_remap_entry> & out);
+
+// Compute the weight size of a single layer
+size_t wf_layer_weight_bytes(const llama_model * model, int layer_idx);
